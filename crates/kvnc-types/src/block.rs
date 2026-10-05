@@ -9,8 +9,11 @@ use serde::{Deserialize, Serialize};
 /// Reference to a block in the DAG (author + round + digest).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 pub struct BlockReference {
+    /// Authority index of the block author.
     pub author: AuthorityIndex,
+    /// Round number of the block.
     pub round: Round,
+    /// Digest/hash of the block.
     pub digest: Hash,
 }
 

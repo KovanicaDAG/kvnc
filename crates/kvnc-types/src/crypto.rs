@@ -10,10 +10,12 @@ use std::fmt;
 pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
+    /// Return the raw 32-byte public key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    /// Create a PublicKey from raw 32 bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -24,6 +26,7 @@ impl PublicKey {
 pub struct Signature(pub [u8; 64]);
 
 impl Signature {
+    /// Return the raw 64-byte signature.
     pub fn as_bytes(&self) -> &[u8; 64] {
         &self.0
     }

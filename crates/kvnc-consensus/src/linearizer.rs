@@ -7,6 +7,7 @@ use kvnc_types::block::StatementBlock;
 pub struct Linearizer;
 
 impl Linearizer {
+    /// Create a new linearizer.
     pub fn new() -> Self {
         Self
     }

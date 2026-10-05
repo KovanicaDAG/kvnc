@@ -16,6 +16,7 @@ impl Address {
         Self(hash.0)
     }
 
+    /// Return the address as a hex string.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }

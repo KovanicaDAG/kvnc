@@ -27,6 +27,12 @@ impl BaseCommitter {
     }
 }
 
+impl Default for BaseCommitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Universal committer that also handles indirect decisions.
 pub struct UniversalCommitter {
     // last decided round etc. will live here

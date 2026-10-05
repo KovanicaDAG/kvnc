@@ -10,19 +10,26 @@ pub type Stake = u64;
 /// Single authority (validator).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Authority {
+    /// Index of this authority in the committee.
     pub index: u16,
+    /// Ed25519 public key for block signing.
     pub public_key: PublicKey,
+    /// Account address (derived from public key).
     pub address: Address,
+    /// Stake amount in base units.
     pub stake: Stake,
-    pub network_address: String, // multiaddr or host:port
+    /// Network address (multiaddr or host:port) for P2P.
+    pub network_address: String,
 }
 
 /// Current committee (validator set).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Committee {
+    /// Epoch number for this committee.
     pub epoch: u64,
+    /// List of authorities in this committee.
     pub authorities: Vec<Authority>,
-    /// Total stake.
+    /// Total stake of all authorities.
     pub total_stake: Stake,
     /// Quorum threshold (2f+1 stake).
     pub quorum_threshold: Stake,
@@ -47,10 +54,12 @@ impl Committee {
         }
     }
 
+    /// Return the number of authorities in the committee.
     pub fn size(&self) -> usize {
         self.authorities.len()
     }
 
+    /// Look up an authority by its index.
     pub fn get_by_index(&self, index: u16) -> Option<&Authority> {
         self.authorities.iter().find(|a| a.index == index)
     }
