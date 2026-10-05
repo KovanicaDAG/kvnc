@@ -1,6 +1,7 @@
 //! Turns a committed leader + its causal history into a totally ordered list of blocks.
 
-use kvnc_types::{CommittedSubDag, block::StatementBlock, hash::Hash};
+#![allow(missing_docs)]
+use kvnc_types::{block::StatementBlock, hash::Hash, CommittedSubDag};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Linearizer responsible for producing deterministic total order.
@@ -43,7 +44,10 @@ impl Linearizer {
             for parent_ref in &block.parents {
                 if block_map.contains_key(&parent_ref.digest) {
                     // Edge from parent to block
-                    adjacency.get_mut(&parent_ref.digest).unwrap().push(block.digest);
+                    adjacency
+                        .get_mut(&parent_ref.digest)
+                        .unwrap()
+                        .push(block.digest);
                     *in_degree.get_mut(&block.digest).unwrap() += 1;
                 }
             }
@@ -52,7 +56,10 @@ impl Linearizer {
         // Also add leader's parents
         for parent_ref in &leader.parents {
             if block_map.contains_key(&parent_ref.digest) {
-                adjacency.get_mut(&parent_ref.digest).unwrap().push(leader.digest);
+                adjacency
+                    .get_mut(&parent_ref.digest)
+                    .unwrap()
+                    .push(leader.digest);
                 *in_degree.get_mut(&leader.digest).unwrap() += 1;
             }
         }

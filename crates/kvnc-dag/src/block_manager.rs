@@ -1,5 +1,6 @@
 //! Block manager for KVNC.
 //!
+#![allow(missing_docs)]
 //! Handles block proposal, validation, and broadcast.
 
 use crate::DagStore;
@@ -8,7 +9,7 @@ use kvnc_types::{
     block::{BlockReference, StatementBlock},
     hash::Hash,
     transaction::Transaction,
-    AuthorityIndex, Round, MAX_TXS_PER_BLOCK, SigningKey, Signature,
+    AuthorityIndex, Round, Signature, SigningKey, MAX_TXS_PER_BLOCK,
 };
 use parking_lot::RwLock;
 use std::collections::VecDeque;
@@ -100,7 +101,7 @@ impl BlockManager {
     pub fn propose_block(&self, round: Round) -> Result<StatementBlock, BlockManagerError> {
         // Get parent blocks from previous round
         let parents = self.dag_store.find_parents(round, MAX_TXS_PER_BLOCK)?;
-        
+
         // Get transactions
         let transactions = self.get_next_transactions();
         if transactions.is_empty() && round > 0 {
@@ -109,7 +110,7 @@ impl BlockManager {
 
         // Create the block (without signature first)
         let block = self.create_block(round, parents, transactions)?;
-        
+
         // Sign the block
         let signed_block = self.sign_block(block)?;
 
@@ -139,7 +140,7 @@ impl BlockManager {
             round,
             parents,
             transactions,
-            statements: Vec::new(), // Placeholder for votes
+            statements: Vec::new(),        // Placeholder for votes
             signature: Signature([0; 64]), // Will be filled by sign_block
             digest,
         })
@@ -147,12 +148,16 @@ impl BlockManager {
 
     /// Sign a block with our signing key.
     fn sign_block(&self, mut block: StatementBlock) -> Result<StatementBlock, BlockManagerError> {
-        let signing_key = self.signing_key.read().as_ref()
-            .ok_or_else(|| BlockManagerError::Crypto(CryptoError::InvalidSignature))?.clone();
-        
+        let signing_key = self
+            .signing_key
+            .read()
+            .as_ref()
+            .ok_or_else(|| BlockManagerError::Crypto(CryptoError::InvalidSignature))?
+            .clone();
+
         let digest_bytes = block.digest.as_ref();
         let signature = crypto::sign(&signing_key, digest_bytes);
-        
+
         block.signature = signature;
         Ok(block)
     }
@@ -161,28 +166,31 @@ impl BlockManager {
     pub fn validate_block(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
         // Verify signature - would need committee state in real implementation
         // For now, skip signature verification
-        
+
         // Verify round
         if block.round == 0 {
-            return Err(BlockManagerError::RoundMismatch { 
-                expected: 0, 
-                actual: block.round 
+            return Err(BlockManagerError::RoundMismatch {
+                expected: 0,
+                actual: block.round,
             });
         }
 
         // Verify parents exist and are from previous round
         for parent_ref in &block.parents {
             if parent_ref.round + 1 != block.round {
-                return Err(BlockManagerError::ParentValidation(
-                    format!("Parent round {} is not previous round {}", parent_ref.round, block.round - 1)
-                ));
+                return Err(BlockManagerError::ParentValidation(format!(
+                    "Parent round {} is not previous round {}",
+                    parent_ref.round,
+                    block.round - 1
+                )));
             }
-            
+
             // Check parent exists
             if !self.dag_store.has_block(&parent_ref.digest)? {
-                return Err(BlockManagerError::ParentValidation(
-                    format!("Parent block {} not found", parent_ref.digest)
-                ));
+                return Err(BlockManagerError::ParentValidation(format!(
+                    "Parent block {} not found",
+                    parent_ref.digest
+                )));
             }
         }
 
@@ -193,15 +201,19 @@ impl BlockManager {
             &block.parents,
             &block.transactions,
         );
-        
+
         if computed_digest != block.digest {
-            return Err(BlockManagerError::InvalidBlock("Digest mismatch".to_string()));
+            return Err(BlockManagerError::InvalidBlock(
+                "Digest mismatch".to_string(),
+            ));
         }
 
         // Verify transaction hashes (basic check)
         for tx in &block.transactions {
             if tx.hash() != tx.hash {
-                return Err(BlockManagerError::InvalidBlock("Transaction hash mismatch".to_string()));
+                return Err(BlockManagerError::InvalidBlock(
+                    "Transaction hash mismatch".to_string(),
+                ));
             }
         }
 

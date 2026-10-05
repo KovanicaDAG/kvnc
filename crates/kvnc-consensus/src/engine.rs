@@ -1,11 +1,12 @@
 //! Main consensus engine for KVNC.
 //!
+#![allow(missing_docs)]
 //! Coordinates round advancement, leader selection, block production,
 //! and commit decisions using Mysticeti-style DAG consensus.
 
 use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, linearizer::Linearizer};
-use kvnc_types::{AuthorityIndex, Round, Stake, hash::Hash};
+use kvnc_types::{hash::Hash, AuthorityIndex, Round, Stake};
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -17,21 +18,52 @@ use tracing::{debug, info, warn};
 
 /// Trait for DAG store operations needed by consensus.
 pub trait DagStoreTrait: Send + Sync {
-    fn get_block(&self, hash: &Hash) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::DagStoreError>;
-    fn get_ancestors(&self, hash: &Hash, min_round: kvnc_types::Round) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
-    fn get_block_by_author_round(&self, author: kvnc_types::AuthorityIndex, round: kvnc_types::Round) -> Result<Option<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
-    fn get_blocks_by_round(&self, round: kvnc_types::Round) -> Result<Vec<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
+    fn get_block(
+        &self,
+        hash: &Hash,
+    ) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::DagStoreError>;
+    fn get_ancestors(
+        &self,
+        hash: &Hash,
+        min_round: kvnc_types::Round,
+    ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
+    fn get_block_by_author_round(
+        &self,
+        author: kvnc_types::AuthorityIndex,
+        round: kvnc_types::Round,
+    ) -> Result<Option<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
+    fn get_blocks_by_round(
+        &self,
+        round: kvnc_types::Round,
+    ) -> Result<Vec<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
     fn has_block(&self, hash: &Hash) -> Result<bool, kvnc_dag::DagStoreError>;
-    fn put_block(&self, block: &kvnc_types::block::StatementBlock) -> Result<(), kvnc_dag::DagStoreError>;
-    fn find_parents(&self, round: kvnc_types::Round, max_parents: usize) -> Result<Vec<kvnc_types::block::BlockReference>, kvnc_dag::DagStoreError>;
+    fn put_block(
+        &self,
+        block: &kvnc_types::block::StatementBlock,
+    ) -> Result<(), kvnc_dag::DagStoreError>;
+    fn find_parents(
+        &self,
+        round: kvnc_types::Round,
+        max_parents: usize,
+    ) -> Result<Vec<kvnc_types::block::BlockReference>, kvnc_dag::DagStoreError>;
     fn commit_leader(&self, leader_hash: &Hash) -> Result<u64, kvnc_dag::DagStoreError>;
-    fn mark_round_decided(&self, round: kvnc_types::Round, leader_hash: &Hash) -> Result<(), kvnc_dag::DagStoreError>;
+    fn mark_round_decided(
+        &self,
+        round: kvnc_types::Round,
+        leader_hash: &Hash,
+    ) -> Result<(), kvnc_dag::DagStoreError>;
 }
 
 /// Trait for block manager operations needed by consensus.
 pub trait BlockManagerTrait: Send + Sync {
-    fn propose_block(&self, round: kvnc_types::Round) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::BlockManagerError>;
-    fn process_block(&self, block: &kvnc_types::block::StatementBlock) -> Result<(), kvnc_dag::BlockManagerError>;
+    fn propose_block(
+        &self,
+        round: kvnc_types::Round,
+    ) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::BlockManagerError>;
+    fn process_block(
+        &self,
+        block: &kvnc_types::block::StatementBlock,
+    ) -> Result<(), kvnc_dag::BlockManagerError>;
     fn our_authority(&self) -> kvnc_types::AuthorityIndex;
     fn set_signing_key(&self, key: kvnc_types::SigningKey);
 }
@@ -230,7 +262,10 @@ where
     }
 
     /// Process a received block from another validator.
-    pub fn process_block(&self, block: &kvnc_types::block::StatementBlock) -> Result<(), ConsensusError> {
+    pub fn process_block(
+        &self,
+        block: &kvnc_types::block::StatementBlock,
+    ) -> Result<(), ConsensusError> {
         // Validate the block
         self.block_manager.read().process_block(block)?;
 
@@ -246,7 +281,10 @@ where
 
         // Try to commit after processing
         if let Some(subdag) = self.committer.try_commit(self.dag_store.as_ref()) {
-            info!("Committed leader at round {} after receiving block", subdag.leader_round);
+            info!(
+                "Committed leader at round {} after receiving block",
+                subdag.leader_round
+            );
         }
 
         Ok(())

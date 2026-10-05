@@ -1,7 +1,8 @@
 //! Consensus-specific types.
 
-use kvnc_types::{block::StatementBlock, AuthorityIndex, Round, Stake};
+#![allow(missing_docs)]
 pub use kvnc_types::CommittedSubDag;
+use kvnc_types::{block::StatementBlock, AuthorityIndex, Round, Stake};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

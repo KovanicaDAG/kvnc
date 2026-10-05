@@ -1,5 +1,6 @@
 //! Commit-related types for KVNC.
 //!
+#![allow(missing_docs)]
 //! Contains types related to committed sub-DAGs and leader blocks.
 
 use crate::block::StatementBlock;

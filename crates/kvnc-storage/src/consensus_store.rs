@@ -6,10 +6,9 @@ use crate::{hash_to_bytes, BincodeSerialize, StorageError};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
     hash::Hash,
-    AuthorityIndex, Round,
-    CommittedSubDag,
+    AuthorityIndex, CommittedSubDag, Round,
 };
-use redb::{WriteTransaction, ReadTransaction, ReadableTable};
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use thiserror::Error;
 
 /// Errors specific to consensus store operations.
@@ -124,8 +123,9 @@ impl ConsensusStore {
     ) -> Result<StatementBlock, ConsensusStoreError> {
         let key = hash_to_bytes(hash);
         let table = txn.open_table(crate::tables::DAG_BLOCKS)?;
-        let value = table.get(key)?
-            .ok_or_else(|| ConsensusStoreError::NotFound(format!("dag block {}", hex::encode(key))))?;
+        let value = table.get(key)?.ok_or_else(|| {
+            ConsensusStoreError::NotFound(format!("dag block {}", hex::encode(key)))
+        })?;
         Ok(StatementBlock::from_bytes(&value.value())?)
     }
 
@@ -137,8 +137,9 @@ impl ConsensusStore {
     ) -> Result<Vec<Hash>, ConsensusStoreError> {
         let key = hash_to_bytes(hash);
         let table = txn.open_table(crate::tables::DAG_PARENTS)?;
-        let value = table.get(key)?
-            .ok_or_else(|| ConsensusStoreError::NotFound(format!("parents for {}", hex::encode(key))))?;
+        let value = table.get(key)?.ok_or_else(|| {
+            ConsensusStoreError::NotFound(format!("parents for {}", hex::encode(key)))
+        })?;
         let parent_hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&value.value())?;
         Ok(parent_hashes.into_iter().map(Hash).collect())
     }
@@ -163,7 +164,11 @@ impl ConsensusStore {
         hash: &Hash,
     ) -> Result<Vec<Hash>, ConsensusStoreError> {
         let key = hash_to_bytes(hash);
-        Ok(self.get_children_internal(txn, &key)?.into_iter().map(Hash).collect())
+        Ok(self
+            .get_children_internal(txn, &key)?
+            .into_iter()
+            .map(Hash)
+            .collect())
     }
 
     /// Get all blocks for a given round.
@@ -208,7 +213,11 @@ impl ConsensusStore {
     }
 
     /// Check if a DAG block exists.
-    pub fn has_dag_block(&self, txn: &ReadTransaction, hash: &Hash) -> Result<bool, ConsensusStoreError> {
+    pub fn has_dag_block(
+        &self,
+        txn: &ReadTransaction,
+        hash: &Hash,
+    ) -> Result<bool, ConsensusStoreError> {
         let key = hash_to_bytes(hash);
         let table = txn.open_table(crate::tables::DAG_BLOCKS)?;
         Ok(table.get(key)?.is_some())
@@ -312,7 +321,8 @@ impl ConsensusStore {
         Ok(table
             .get(round)?
             .map(|v| {
-                let hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&v.value()).unwrap_or_default();
+                let hashes: Vec<[u8; 32]> =
+                    BincodeSerialize::from_bytes(&v.value()).unwrap_or_default();
                 hashes.into_iter().map(Hash).collect()
             })
             .unwrap_or_default())
@@ -338,7 +348,11 @@ impl ConsensusStore {
     // ============================================================
 
     /// Prune DAG blocks below a certain round (keep only recent history).
-    pub fn prune_dag_below(&self, txn: &WriteTransaction, min_round: Round) -> Result<u64, ConsensusStoreError> {
+    pub fn prune_dag_below(
+        &self,
+        txn: &WriteTransaction,
+        min_round: Round,
+    ) -> Result<u64, ConsensusStoreError> {
         let table = txn.open_table(crate::tables::DAG_BY_ROUND)?;
         let mut pruned = 0;
 

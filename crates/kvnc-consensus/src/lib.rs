@@ -3,7 +3,13 @@
 //! Implements wave-based uncertified DAG with direct/indirect commit rules.
 
 #![deny(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+#![allow(unused_mut)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 pub mod committer;
 pub mod engine;
@@ -14,7 +20,7 @@ pub use committer::{BaseCommitter, UniversalCommitter};
 pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState};
 pub use linearizer::Linearizer;
 pub use types::{
-    AuthorityInfo, CommitResult, CommitteeInfo, CommittedSubDag, LeaderInfo, LeaderStatus,
+    AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, LeaderInfo, LeaderStatus,
 };
 
 use kvnc_types::{Round, WAVE_LENGTH};

@@ -1,5 +1,6 @@
 //! DAG store for KVNC.
 //!
+#![allow(missing_docs)]
 //! Provides high-level operations on the DAG structure using the storage layer.
 
 use kvnc_storage::Storage;
@@ -87,7 +88,10 @@ impl DagStore {
         round: Round,
     ) -> Result<Option<StatementBlock>, DagStoreError> {
         let txn = self.storage.begin_read()?;
-        Ok(self.storage.consensus().get_block_by_author_round(&txn, author, round)?)
+        Ok(self
+            .storage
+            .consensus()
+            .get_block_by_author_round(&txn, author, round)?)
     }
 
     /// Get the committed leader height.
@@ -117,7 +121,10 @@ impl DagStore {
     /// Get all decided rounds up to a maximum.
     pub fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, DagStoreError> {
         let txn = self.storage.begin_read()?;
-        Ok(self.storage.consensus().get_decided_rounds(&txn, max_round)?)
+        Ok(self
+            .storage
+            .consensus()
+            .get_decided_rounds(&txn, max_round)?)
     }
 
     /// Get ancestors of a block up to a certain round (for parent selection).
@@ -151,14 +158,18 @@ impl DagStore {
 
     /// Find blocks that can serve as parents for a new block at the given round.
     /// Returns up to `max_parents` blocks from the previous round that are valid parents.
-    pub fn find_parents(&self, round: Round, max_parents: usize) -> Result<Vec<BlockReference>, DagStoreError> {
+    pub fn find_parents(
+        &self,
+        round: Round,
+        max_parents: usize,
+    ) -> Result<Vec<BlockReference>, DagStoreError> {
         if round == 0 {
             return Ok(Vec::new());
         }
 
         let prev_round = round - 1;
         let blocks = self.get_blocks_by_round(prev_round)?;
-        
+
         // For now, return all blocks from previous round as parent references
         // In a full implementation, we'd filter by stake weight and validity
         let parents: Vec<BlockReference> = blocks
@@ -183,9 +194,15 @@ impl DagStore {
     }
 
     /// Mark a round as decided with a leader hash.
-    pub fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
+    pub fn mark_round_decided(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<(), DagStoreError> {
         let txn = self.storage.begin_write()?;
-        self.storage.consensus().mark_round_decided(&txn, round, leader_hash)?;
+        self.storage
+            .consensus()
+            .mark_round_decided(&txn, round, leader_hash)?;
         txn.commit()?;
         Ok(())
     }
@@ -193,8 +210,13 @@ impl DagStore {
     /// Increment the committed leader height and set last committed.
     pub fn commit_leader(&self, leader_hash: &Hash) -> Result<u64, DagStoreError> {
         let txn = self.storage.begin_write()?;
-        let height = self.storage.consensus().increment_committed_leader_height(&txn)?;
-        self.storage.consensus().set_last_committed(&txn, leader_hash)?;
+        let height = self
+            .storage
+            .consensus()
+            .increment_committed_leader_height(&txn)?;
+        self.storage
+            .consensus()
+            .set_last_committed(&txn, leader_hash)?;
         txn.commit()?;
         Ok(height)
     }

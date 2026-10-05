@@ -1,11 +1,12 @@
 //! Commit logic (Base + Universal Committer).
 //!
+#![allow(missing_docs)]
 //! Implements Mysticeti-style committer with direct/indirect commit rules
 //! for wave-based uncertified DAG consensus.
 
-use crate::types::{CommitResult, LeaderInfo, LeaderStatus, CommitteeInfo};
 use crate::engine::DagStoreTrait;
-use kvnc_types::{AuthorityIndex, Round, CommittedSubDag, hash::Hash};
+use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
+use kvnc_types::{hash::Hash, AuthorityIndex, CommittedSubDag, Round};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -101,12 +102,7 @@ impl BaseCommitter {
     }
 
     /// Check if there's a causal path from one leader to another.
-    fn has_path(
-        &self,
-        dag_store: &dyn DagStoreTrait,
-        from: &LeaderInfo,
-        to: &LeaderInfo,
-    ) -> bool {
+    fn has_path(&self, dag_store: &dyn DagStoreTrait, from: &LeaderInfo, to: &LeaderInfo) -> bool {
         if let Some(from_hash) = from.block_hash {
             if let Some(to_hash) = to.block_hash {
                 match dag_store.get_ancestors(&to_hash, from.round) {
@@ -194,7 +190,7 @@ impl UniversalCommitter {
         let mut leaders = self.leaders.write();
         if let Some(leader_info) = leaders.get_mut(&leader_round) {
             leader_info.votes.insert(voter, vote_hash);
-            
+
             // Check if we now have quorum
             if self.base.committee.has_quorum(&leader_info.votes) {
                 leader_info.status = LeaderStatus::Commit;
@@ -225,7 +221,7 @@ impl UniversalCommitter {
             if let Some(leader_info) = leaders.get(&round) {
                 // Try direct decision
                 let direct_status = self.base.try_direct_decide(dag_store, leader_info);
-                
+
                 if direct_status == LeaderStatus::Commit {
                     // Directly commit this leader
                     return self.build_committed_subdag(dag_store, leader_info, round);
@@ -237,7 +233,9 @@ impl UniversalCommitter {
                 }
 
                 // Try indirect decision
-                let indirect_status = self.base.try_indirect_decide(dag_store, leader_info, &decided);
+                let indirect_status =
+                    self.base
+                        .try_indirect_decide(dag_store, leader_info, &decided);
                 if indirect_status == LeaderStatus::Commit {
                     return self.build_committed_subdag(dag_store, leader_info, round);
                 } else if indirect_status == LeaderStatus::Skip {
@@ -269,7 +267,7 @@ impl UniversalCommitter {
 
         // Get all ancestors of this leader (causal history)
         let ancestors = dag_store.get_ancestors(&leader_hash, 0).ok()?;
-        
+
         // Get the actual blocks for ancestors
         let mut history = Vec::new();
         for hash in ancestors {

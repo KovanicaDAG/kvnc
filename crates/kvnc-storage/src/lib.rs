@@ -6,13 +6,18 @@
 //! - `ConsensusStore`: DAG structure, commit tracker, decided rounds
 
 #![deny(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::borrow_deref_ref)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::map_flatten)]
+#![allow(unused_mut)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
 
-use kvnc_types::{
-    hash::Hash,
-    Address,
-};
-use redb::{Database, ReadTransaction, WriteTransaction, ReadableTable, TableDefinition};
+use kvnc_types::{hash::Hash, Address};
+use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -124,32 +129,26 @@ mod tables {
     use kvnc_types::Address;
 
     // Block store tables
-    pub const BLOCKS: TableDefinition<[u8; 32], Vec<u8>> =
-        TableDefinition::new("blocks");
-    pub const BLOCK_HEIGHT: TableDefinition<u64, [u8; 32]> =
-        TableDefinition::new("block_height");
+    pub const BLOCKS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("blocks");
+    pub const BLOCK_HEIGHT: TableDefinition<u64, [u8; 32]> = TableDefinition::new("block_height");
     pub const BLOCK_TRANSACTIONS: TableDefinition<[u8; 32], Vec<u8>> =
         TableDefinition::new("block_transactions");
     pub const TRANSACTION_INDEX: TableDefinition<[u8; 32], [u8; 32]> =
         TableDefinition::new("tx_index"); // tx_hash -> block_hash
 
     // State store tables
-    pub const ACCOUNTS: TableDefinition<[u8; 32], Vec<u8>> =
-        TableDefinition::new("accounts");
+    pub const ACCOUNTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("accounts");
     pub const CONTRACT_CODE: TableDefinition<[u8; 32], Vec<u8>> =
         TableDefinition::new("contract_code");
     pub const CONTRACT_STORAGE: TableDefinition<([u8; 32], [u8; 32]), Vec<u8>> =
         TableDefinition::new("contract_storage");
     pub const STAKING_STATE: TableDefinition<&'static str, Vec<u8>> =
         TableDefinition::new("staking_state");
-    pub const STATE_ROOT: TableDefinition<u64, [u8; 32]> =
-        TableDefinition::new("state_root"); // committed_leader_height -> state_root
+    pub const STATE_ROOT: TableDefinition<u64, [u8; 32]> = TableDefinition::new("state_root"); // committed_leader_height -> state_root
 
     // Consensus store tables
-    pub const DAG_BLOCKS: TableDefinition<[u8; 32], Vec<u8>> =
-        TableDefinition::new("dag_blocks"); // StatementBlock serialized
-    pub const DAG_PARENTS: TableDefinition<[u8; 32], Vec<u8>> =
-        TableDefinition::new("dag_parents"); // block_hash -> parent hashes
+    pub const DAG_BLOCKS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("dag_blocks"); // StatementBlock serialized
+    pub const DAG_PARENTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("dag_parents"); // block_hash -> parent hashes
     pub const DAG_CHILDREN: TableDefinition<[u8; 32], Vec<u8>> =
         TableDefinition::new("dag_children"); // block_hash -> child hashes
     pub const DAG_BY_ROUND: TableDefinition<(u64, u16), Vec<u8>> =

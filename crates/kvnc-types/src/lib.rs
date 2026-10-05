@@ -8,8 +8,8 @@
 
 pub mod address;
 pub mod block;
-pub mod committee;
 pub mod commit;
+pub mod committee;
 pub mod crypto;
 pub mod error;
 pub mod hash;
@@ -19,7 +19,7 @@ pub use address::Address;
 pub use block::{Block, BlockReference, StatementBlock};
 pub use commit::CommittedSubDag;
 pub use committee::{Authority, Committee, Stake};
-pub use crypto::{PublicKey, SigningKey, Signature};
+pub use crypto::{PublicKey, Signature, SigningKey};
 pub use error::TypesError;
 pub use hash::Hash;
 pub use transaction::{Transaction, TransactionKind};

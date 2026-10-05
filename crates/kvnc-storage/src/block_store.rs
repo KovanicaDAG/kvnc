@@ -9,7 +9,7 @@ use kvnc_types::{
     transaction::Transaction,
     Round,
 };
-use redb::{WriteTransaction, ReadTransaction, ReadableTable};
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use thiserror::Error;
 
 /// Errors specific to block store operations.
@@ -96,16 +96,25 @@ impl BlockStore {
     }
 
     /// Get a block by its hash.
-    pub fn get_block(&self, txn: &ReadTransaction, hash: &Hash) -> Result<StatementBlock, BlockStoreError> {
+    pub fn get_block(
+        &self,
+        txn: &ReadTransaction,
+        hash: &Hash,
+    ) -> Result<StatementBlock, BlockStoreError> {
         let block_hash = hash_to_bytes(hash);
         let table = txn.open_table(crate::tables::BLOCKS)?;
-        let value = table.get(block_hash)?
-            .ok_or_else(|| BlockStoreError::NotFound(format!("block {}", hex::encode(block_hash))))?;
+        let value = table.get(block_hash)?.ok_or_else(|| {
+            BlockStoreError::NotFound(format!("block {}", hex::encode(block_hash)))
+        })?;
         Ok(StatementBlock::from_bytes(&value.value())?)
     }
 
     /// Get a block by round (height).
-    pub fn get_block_by_height(&self, txn: &ReadTransaction, round: Round) -> Result<Option<StatementBlock>, BlockStoreError> {
+    pub fn get_block_by_height(
+        &self,
+        txn: &ReadTransaction,
+        round: Round,
+    ) -> Result<Option<StatementBlock>, BlockStoreError> {
         let table = txn.open_table(crate::tables::BLOCK_HEIGHT)?;
         let block_hash = match table.get(&round)? {
             Some(v) => v.value(),
@@ -140,8 +149,9 @@ impl BlockStore {
     ) -> Result<Vec<Hash>, BlockStoreError> {
         let key = hash_to_bytes(block_hash);
         let table = txn.open_table(crate::tables::BLOCK_TRANSACTIONS)?;
-        let value = table.get(key)?
-            .ok_or_else(|| BlockStoreError::NotFound(format!("transactions for block {}", hex::encode(key))))?;
+        let value = table.get(key)?.ok_or_else(|| {
+            BlockStoreError::NotFound(format!("transactions for block {}", hex::encode(key)))
+        })?;
         let tx_hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&value.value())?;
         Ok(tx_hashes.into_iter().map(Hash).collect())
     }
@@ -158,7 +168,10 @@ impl BlockStore {
     }
 
     /// Get the latest block (highest round).
-    pub fn get_latest_block(&self, txn: &ReadTransaction) -> Result<Option<StatementBlock>, BlockStoreError> {
+    pub fn get_latest_block(
+        &self,
+        txn: &ReadTransaction,
+    ) -> Result<Option<StatementBlock>, BlockStoreError> {
         let table = txn.open_table(crate::tables::BLOCK_HEIGHT)?;
         let mut latest_round = 0;
         let mut latest_hash = None;
@@ -185,7 +198,11 @@ impl BlockStore {
     }
 
     /// Delete blocks below a certain round (pruning).
-    pub fn prune_below(&self, txn: &WriteTransaction, min_round: Round) -> Result<u64, BlockStoreError> {
+    pub fn prune_below(
+        &self,
+        txn: &WriteTransaction,
+        min_round: Round,
+    ) -> Result<u64, BlockStoreError> {
         let table = txn.open_table(crate::tables::BLOCK_HEIGHT)?;
         let mut pruned = 0;
 
@@ -212,7 +229,8 @@ impl BlockStore {
             {
                 let mut tx_table = txn.open_table(crate::tables::BLOCK_TRANSACTIONS)?;
                 if let Some(tx_hashes_bytes) = tx_table.get(block_hash)? {
-                    let tx_hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&tx_hashes_bytes.value())?;
+                    let tx_hashes: Vec<[u8; 32]> =
+                        BincodeSerialize::from_bytes(&tx_hashes_bytes.value())?;
                     let mut tx_index = txn.open_table(crate::tables::TRANSACTION_INDEX)?;
                     for tx_hash in tx_hashes {
                         tx_index.remove(tx_hash)?;

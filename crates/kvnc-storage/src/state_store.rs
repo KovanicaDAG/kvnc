@@ -3,9 +3,9 @@
 //! Stores account balances, nonces, contract code/storage, and staking state.
 
 use crate::{address_to_bytes, BincodeSerialize, StorageError};
+use kvnc_staking::{Delegation, StakingState, TreasuryState, ValidatorInfo};
 use kvnc_types::{Address, Stake};
-use kvnc_staking::{StakingState, TreasuryState, ValidatorInfo, Delegation};
-use redb::{WriteTransaction, ReadTransaction, ReadableTable};
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -70,7 +70,8 @@ impl StateStore {
     ) -> Result<Account, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let value = table.get(key)?
+        let value = table
+            .get(key)?
             .ok_or_else(|| StateStoreError::NotFound(format!("account {}", address)))?;
         Ok(Account::from_bytes(&value.value())?)
     }
@@ -111,7 +112,8 @@ impl StateStore {
     ) -> Result<u64, StateStoreError> {
         let read_txn = txn.open_table(crate::tables::ACCOUNTS)?;
         let key = address_to_bytes(address);
-        let mut account = read_txn.get(key)?
+        let mut account = read_txn
+            .get(key)?
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
         drop(read_txn);
@@ -129,7 +131,8 @@ impl StateStore {
     ) -> Result<u64, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table.get(key)?
+        let mut account = table
+            .get(key)?
             .ok_or_else(|| StateStoreError::NotFound(format!("account {}", address)))?;
         let mut account = Account::from_bytes(&account.value())?;
         account.balance = account.balance.saturating_sub(amount);
@@ -145,7 +148,8 @@ impl StateStore {
     ) -> Result<u64, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table.get(key)?
+        let mut account = table
+            .get(key)?
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
         account.nonce = account.nonce.saturating_add(1);
@@ -162,7 +166,8 @@ impl StateStore {
     ) -> Result<(), StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table.get(key)?
+        let mut account = table
+            .get(key)?
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
         account.nonce = nonce;
@@ -194,7 +199,8 @@ impl StateStore {
         // Update account
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table.get(key)?
+        let mut account = table
+            .get(key)?
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
         account.code_hash = code_hash_bytes;
@@ -263,7 +269,8 @@ impl StateStore {
         txn: &ReadTransaction,
     ) -> Result<StakingState, StateStoreError> {
         let table = txn.open_table(crate::tables::STAKING_STATE)?;
-        let value = table.get("staking")?
+        let value = table
+            .get("staking")?
             .ok_or_else(|| StateStoreError::NotFound("staking state".to_string()))?;
         Ok(StakingState::from_bytes(&value.value())?)
     }

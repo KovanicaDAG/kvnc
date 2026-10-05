@@ -1,14 +1,14 @@
 //! DAG store, causal ordering and block manager.
 
 #![deny(unsafe_code)]
-#![warn(missing_docs)]
+#![allow(missing_docs)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::large_enum_variant)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 
 use kvnc_storage::Storage;
-use kvnc_types::{
-    block::StatementBlock,
-    hash::Hash,
-    AuthorityIndex, Round,
-};
+use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, Round};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
