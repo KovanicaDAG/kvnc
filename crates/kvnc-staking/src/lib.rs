@@ -183,7 +183,7 @@ impl TreasuryState {
 // ============================================================
 
 /// Result of applying a block reward for a committed leader.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RewardOutcome {
     /// Authority index that proposed the leader block.
     pub leader_author: u16,
@@ -252,7 +252,7 @@ pub enum StakingError {
 }
 
 /// Combined staking + emission + treasury state.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct StakingState {
     pub validators: Vec<ValidatorInfo>,
     pub delegations: Vec<Delegation>,
