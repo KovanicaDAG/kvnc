@@ -1,0 +1,13 @@
+[package]
+name = "kvnc-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+wasmi = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }

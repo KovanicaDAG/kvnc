@@ -1,0 +1,15 @@
+[package]
+name = "kvnc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kvnc"
+path = "src/main.rs"
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

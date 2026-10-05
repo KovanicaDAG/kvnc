@@ -1,0 +1,14 @@
+[package]
+name = "kvnc-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+kvnc-runtime = { path = "../kvnc-runtime" }
+kvnc-staking = { path = "../kvnc-staking" }
+kvnc-consensus = { path = "../kvnc-consensus" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

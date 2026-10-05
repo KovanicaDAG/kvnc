@@ -1,0 +1,20 @@
+[package]
+name = "kvnc-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kvnc-node"
+path = "src/main.rs"
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+kvnc-consensus = { path = "../kvnc-consensus" }
+kvnc-runtime = { path = "../kvnc-runtime" }
+kvnc-staking = { path = "../kvnc-staking" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
