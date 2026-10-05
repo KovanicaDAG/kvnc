@@ -6,12 +6,16 @@
 #![warn(missing_docs)]
 
 pub mod committer;
+pub mod engine;
 pub mod linearizer;
 pub mod types;
 
 pub use committer::{BaseCommitter, UniversalCommitter};
+pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState};
 pub use linearizer::Linearizer;
-pub use types::{CommittedSubDag, LeaderStatus};
+pub use types::{
+    AuthorityInfo, CommitResult, CommitteeInfo, CommittedSubDag, LeaderInfo, LeaderStatus,
+};
 
 use kvnc_types::{Round, WAVE_LENGTH};
 

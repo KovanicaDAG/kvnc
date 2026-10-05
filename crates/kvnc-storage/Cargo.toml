@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 kvnc-types = { path = "../kvnc-types" }
 kvnc-staking = { path = "../kvnc-staking" }
-kvnc-consensus = { path = "../kvnc-consensus" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

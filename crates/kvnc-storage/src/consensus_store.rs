@@ -7,8 +7,8 @@ use kvnc_types::{
     block::{BlockReference, StatementBlock},
     hash::Hash,
     AuthorityIndex, Round,
+    CommittedSubDag,
 };
-use kvnc_consensus::types::CommittedSubDag;
 use redb::{WriteTransaction, ReadTransaction, ReadableTable};
 use thiserror::Error;
 

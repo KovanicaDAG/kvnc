@@ -34,15 +34,14 @@ pub enum BlockManagerError {
 }
 
 /// Block manager for proposing and validating blocks.
-#[derive(Clone)]
 pub struct BlockManager {
     dag_store: Arc<DagStore>,
     /// Pending transactions waiting to be included in blocks.
     pending_txs: Arc<RwLock<VecDeque<Transaction>>>,
     /// The authority index of this validator.
-    our_authority: AuthorityIndex,
+    our_authority: RwLock<AuthorityIndex>,
     /// Our signing key for block signing.
-    signing_key: Option<SigningKey>,
+    signing_key: RwLock<Option<SigningKey>>,
 }
 
 impl BlockManager {
@@ -51,19 +50,24 @@ impl BlockManager {
         Self {
             dag_store,
             pending_txs: Arc::new(RwLock::new(VecDeque::new())),
-            our_authority: 0, // Will be set when validator joins
-            signing_key: None,
+            our_authority: RwLock::new(0), // Will be set when validator joins
+            signing_key: RwLock::new(None),
         }
     }
 
     /// Set our authority index.
-    pub fn set_authority(&mut self, authority: AuthorityIndex) {
-        self.our_authority = authority;
+    pub fn set_authority(&self, authority: AuthorityIndex) {
+        *self.our_authority.write() = authority;
     }
 
     /// Set our signing key.
-    pub fn set_signing_key(&mut self, key: SigningKey) {
-        self.signing_key = Some(key);
+    pub fn set_signing_key(&self, key: SigningKey) {
+        *self.signing_key.write() = Some(key);
+    }
+
+    /// Get our authority index.
+    pub fn our_authority(&self) -> AuthorityIndex {
+        *self.our_authority.read()
     }
 
     /// Add a transaction to the pending pool.
@@ -124,14 +128,14 @@ impl BlockManager {
     ) -> Result<StatementBlock, BlockManagerError> {
         // Compute digest
         let digest = StatementBlock::compute_digest(
-            self.our_authority,
+            *self.our_authority.read(),
             round,
             &parents,
             &transactions,
         );
 
         Ok(StatementBlock {
-            author: self.our_authority,
+            author: *self.our_authority.read(),
             round,
             parents,
             transactions,
@@ -143,11 +147,11 @@ impl BlockManager {
 
     /// Sign a block with our signing key.
     fn sign_block(&self, mut block: StatementBlock) -> Result<StatementBlock, BlockManagerError> {
-        let signing_key = self.signing_key.as_ref()
-            .ok_or_else(|| BlockManagerError::Crypto(CryptoError::InvalidSignature))?;
+        let signing_key = self.signing_key.read().as_ref()
+            .ok_or_else(|| BlockManagerError::Crypto(CryptoError::InvalidSignature))?.clone();
         
         let digest_bytes = block.digest.as_ref();
-        let signature = crypto::sign(signing_key, digest_bytes);
+        let signature = crypto::sign(&signing_key, digest_bytes);
         
         block.signature = signature;
         Ok(block)

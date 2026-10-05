@@ -7,8 +7,12 @@ license.workspace = true
 [dependencies]
 kvnc-types = { path = "../kvnc-types" }
 kvnc-crypto = { path = "../kvnc-crypto" }
+kvnc-dag = { path = "../kvnc-dag" }
+kvnc-storage = { path = "../kvnc-storage" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
