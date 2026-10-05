@@ -17,7 +17,7 @@ pub mod transaction;
 pub use address::Address;
 pub use block::{Block, BlockReference, StatementBlock};
 pub use committee::{Authority, Committee, Stake};
-pub use crypto::{PublicKey, Signature};
+pub use crypto::{PublicKey, SigningKey, Signature};
 pub use error::TypesError;
 pub use hash::Hash;
 pub use transaction::{Transaction, TransactionKind};

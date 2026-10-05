@@ -5,6 +5,9 @@ use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+/// Ed25519 signing key wrapper (re-export from ed25519_dalek).
+pub type SigningKey = ed25519_dalek::SigningKey;
+
 /// Ed25519 public key wrapper.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
 pub struct PublicKey(pub [u8; 32]);
