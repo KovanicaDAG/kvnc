@@ -60,6 +60,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use kvnc_common::events::{VAULT_CANCELLED, VAULT_CLAIMED, VAULT_CREATED};
 use kvnc_common::{hash, Address, Amount, ContractError, ContractResult, Height, Host, Timestamp};
 
 pub type VaultId = [u8; 32];
@@ -169,7 +170,7 @@ impl Vault {
         host.transfer(&creator, &escrow, amount)?;
         Self::store(host, &id, &vault)?;
 
-        host.emit_event(b"vault_created", &id);
+        host.emit_event(VAULT_CREATED, &id);
         Ok(id)
     }
 
@@ -197,7 +198,7 @@ impl Vault {
 
         vault.claimed = vault.claimed.saturating_add(claimable);
         Self::store(host, &id, &vault)?;
-        host.emit_event(b"vault_claimed", &id);
+        host.emit_event(VAULT_CLAIMED, &id);
         Ok(claimable)
     }
 
@@ -219,7 +220,7 @@ impl Vault {
             host.transfer(&escrow, &vault.creator, remaining)?;
         }
         Self::store(host, &id, &vault)?;
-        host.emit_event(b"vault_cancelled", &id);
+        host.emit_event(VAULT_CANCELLED, &id);
         Ok(())
     }
 

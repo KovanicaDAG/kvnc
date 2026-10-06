@@ -45,6 +45,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 
+use kvnc_common::events::{TOKEN_APPROVAL, TOKEN_BURN, TOKEN_CREATED, TOKEN_MINT, TOKEN_TRANSFER};
 use kvnc_common::{Address, Amount, ContractError, ContractResult, Host};
 
 /// Singleton state key (FIXED): one token instance per contract address.
@@ -106,7 +107,7 @@ impl Token {
         };
 
         Self::store(host, &token)?;
-        host.emit_event(b"token_created", &[]);
+        host.emit_event(TOKEN_CREATED, &[]);
         Ok(())
     }
 
@@ -120,7 +121,7 @@ impl Token {
         let from = host.caller();
         Self::move_balance(&mut token, &from, &to, amount)?;
         Self::store(host, &token)?;
-        host.emit_event(b"transfer", &[]);
+        host.emit_event(TOKEN_TRANSFER, &[]);
         Ok(())
     }
 
@@ -130,7 +131,7 @@ impl Token {
         let owner = host.caller();
         token.allowances.insert((owner, spender), amount);
         Self::store(host, &token)?;
-        host.emit_event(b"approval", &[]);
+        host.emit_event(TOKEN_APPROVAL, &[]);
         Ok(())
     }
 
@@ -159,7 +160,7 @@ impl Token {
 
         Self::move_balance(&mut token, &from, &to, amount)?;
         Self::store(host, &token)?;
-        host.emit_event(b"transfer", &[]);
+        host.emit_event(TOKEN_TRANSFER, &[]);
         Ok(())
     }
 
@@ -183,7 +184,7 @@ impl Token {
         *bal = bal.checked_add(amount).ok_or(ContractError::Overflow)?;
 
         Self::store(host, &token)?;
-        host.emit_event(b"mint", &[]);
+        host.emit_event(TOKEN_MINT, &[]);
         Ok(())
     }
 
@@ -198,7 +199,7 @@ impl Token {
         token.balances.insert(from, bal - amount);
         token.total_supply = token.total_supply.saturating_sub(amount);
         Self::store(host, &token)?;
-        host.emit_event(b"burn", &[]);
+        host.emit_event(TOKEN_BURN, &[]);
         Ok(())
     }
 

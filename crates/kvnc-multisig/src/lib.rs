@@ -58,6 +58,9 @@ extern crate alloc;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
+use kvnc_common::events::{
+    MULTISIG_CONFIRMED, MULTISIG_CREATED, MULTISIG_EXECUTED, MULTISIG_PROPOSED,
+};
 use kvnc_common::{hash, Address, Amount, ContractError, ContractResult, Host};
 
 pub type MultisigId = [u8; 32];
@@ -127,7 +130,7 @@ impl Multisig {
 
         let id = Self::compute_id(&ms);
         Self::store(host, &ms)?;
-        host.emit_event(b"multisig_created", &id);
+        host.emit_event(MULTISIG_CREATED, &id);
         Ok(id)
     }
 
@@ -164,7 +167,7 @@ impl Multisig {
         Self::store_tx(host, &tx)?;
         Self::store(host, &ms)?;
 
-        host.emit_event(b"multisig_proposed", &tx_id.to_le_bytes());
+        host.emit_event(MULTISIG_PROPOSED, &tx_id.to_le_bytes());
         Ok(tx_id)
     }
 
@@ -187,7 +190,7 @@ impl Multisig {
         }
         Self::store_tx(host, &tx)?;
 
-        host.emit_event(b"multisig_confirmed", &tx_id.to_le_bytes());
+        host.emit_event(MULTISIG_CONFIRMED, &tx_id.to_le_bytes());
         Ok(())
     }
 
@@ -213,7 +216,7 @@ impl Multisig {
         tx.executed = true;
         Self::store_tx(host, &tx)?;
 
-        host.emit_event(b"multisig_executed", &tx_id.to_le_bytes());
+        host.emit_event(MULTISIG_EXECUTED, &tx_id.to_le_bytes());
         Ok(())
     }
 

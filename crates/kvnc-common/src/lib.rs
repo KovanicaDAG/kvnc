@@ -23,6 +23,7 @@ extern crate alloc;
 
 use core::fmt;
 
+pub mod events;
 mod mem;
 #[cfg(target_arch = "wasm32")]
 mod wasm;

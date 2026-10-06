@@ -23,6 +23,9 @@ native call over the same storage are byte-for-byte interchangeable
 > vesting) live in [`docs/TOKENOMICS.md`](TOKENOMICS.md) §7.1 and
 > `crates/kvnc-staking/src/lib.rs`. This document does not duplicate them.
 
+Worked CLI flows for all four contracts live in
+[`docs/EXAMPLES.md`](EXAMPLES.md).
+
 ---
 
 ## 1. Core types (`kvnc-common`)
@@ -290,3 +293,32 @@ This requires the `wasm32-unknown-unknown` target
 `ContractRunner` keeps a `HashMap<blake3(wasm), Module>` so a wasm module is
 compiled once per runner. The cache is in-memory only — persisting it across
 process restarts is a `TODO` (see `contracts.rs`).
+
+## 9. Event topics
+
+All contracts emit events through `Host::emit_event(topic, data)`. The
+canonical topics are the byte-string constants in `kvnc_common::events`
+(`crates/kvnc-common/src/events.rs`) — the indexer must match on these exact
+bytes, and the emitted bytes must never change.
+
+| Topic | Emitted by | Data payload |
+|-------|------------|--------------|
+| `htlc_created` | `Htlc::create` | 32-byte swap id |
+| `htlc_claimed` | `Htlc::claim` | 32-byte swap id |
+| `htlc_refunded` | `Htlc::refund` | 32-byte swap id |
+| `vault_created` | `Vault::create` | 32-byte vault id |
+| `vault_claimed` | `Vault::claim` | 32-byte vault id |
+| `vault_cancelled` | `Vault::cancel` | 32-byte vault id |
+| `multisig_created` | `Multisig::create` | 32-byte config-fingerprint id |
+| `multisig_proposed` | `Multisig::propose` | 8-byte tx id, little-endian |
+| `multisig_confirmed` | `Multisig::confirm` | 8-byte tx id, little-endian |
+| `multisig_executed` | `Multisig::execute` | 8-byte tx id, little-endian |
+| `token_created` | `Token::create` | empty |
+| `transfer` | `Token::transfer` / `Token::transfer_from` | empty |
+| `approval` | `Token::approve` | empty |
+| `mint` | `Token::mint` | empty |
+| `burn` | `Token::burn` | empty |
+
+The contract crates reference these constants directly (no byte-string
+literals at the call sites), and `kvnc-common` has a unit test guarding each
+constant against typos.

@@ -61,6 +61,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use kvnc_common::events::{HTLC_CLAIMED, HTLC_CREATED, HTLC_REFUNDED};
 use kvnc_common::{hash, Address, Amount, ContractError, ContractResult, Hash, Host, Timestamp};
 
 /// Unique swap identifier (BLAKE3-256 of the encoded create parameters).
@@ -140,7 +141,7 @@ impl Htlc {
 
         Self::store(host, &id, &swap)?;
 
-        host.emit_event(b"htlc_created", &id);
+        host.emit_event(HTLC_CREATED, &id);
         Ok(id)
     }
 
@@ -173,7 +174,7 @@ impl Htlc {
         swap.claimed = true;
         Self::store(host, &id, &swap)?;
 
-        host.emit_event(b"htlc_claimed", &id);
+        host.emit_event(HTLC_CLAIMED, &id);
         Ok(())
     }
 
@@ -193,7 +194,7 @@ impl Htlc {
         swap.refunded = true;
         Self::store(host, &id, &swap)?;
 
-        host.emit_event(b"htlc_refunded", &id);
+        host.emit_event(HTLC_REFUNDED, &id);
         Ok(())
     }
 
