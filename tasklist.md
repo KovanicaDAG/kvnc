@@ -177,46 +177,34 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ---
 
-## Phase 8.4: Tokenomics Live Path (from AGENT_PROMPT.md item 4)
-- [ ] **Wire `on_committed_leader` into real execution**: Called from linearizer / execution entry point
-- [ ] **Reward credited**: Leader's payout address actually receives block reward
-- [ ] **Treasury claim path**: Exists and protected (only treasury key)
-- [ ] **Persist state**: `total_mining_issued` and `committed_leader_height` persisted
-- [ ] **Constants match**: 90.2M, 10 KVNC, 2,050,000 era, ×¾ decay, linear treasury
+## Phase 8.4: Tokenomics Live Path (from AGENT_PROMPT.md item 4) — DONE
+- [x] **Wire `on_committed_leader` into real execution**: `execute_committed_subdag` persists StakingState + credits leader payout
+- [x] **Reward credited**: Leader's payout address receives block reward via balance table
+- [x] **Treasury claim path**: `claim_treasury` with double-claim protection + treasury-only check
+- [x] **Persist state**: `total_mining_issued` and `committed_leader_height` persisted via save_staking_state
+- [x] **Constants match**: 90.2M, 10 KVNC, 2,050,000 era, ×¾ decay, linear treasury
 
 ---
 
-## Phase 8.5: Contract Tests (from AGENT_PROMPT.md item 2)
-- [ ] **HTLC tests**: create_claim_happy_path, refund_after_expiry, claim_wrong_preimage_fails
-- [ ] **Vault tests**: linear_vesting_claim, absolute_unlock
-- [ ] **Multisig tests**: threshold_execution (2-of-3)
-- [ ] **Token tests**: mint_transfer_burn
+## Phase 8.5: Contract Tests (from AGENT_PROMPT.md item 2) — DONE
+- [x] **HTLC tests**: 13 tests (create_claim_happy_path, refund_after_expiry, claim_wrong_preimage_fails, persistence)
+- [x] **Vault tests**: 12 tests (linear_vesting_claim, absolute_unlock, cancel, persistence)
+- [x] **Multisig tests**: 12 tests (threshold_execution 2-of-3, propose→confirm×2→execute, persistence)
+- [x] **Token tests**: 11 tests (mint_transfer_burn, persistence, allowances)
+
+## Phase 8.6: RPC + CLI Exposure (from AGENT_PROMPT.md item 3) — DONE
+- [x] **RPC methods added** (kvnc-rpc): axum JSON-RPC 2.0 server, 16 contract methods
+- [x] **CLI subcommands added** (kvnc-cli): htlc/vault/multisig/token subcommands + --rpc-url/--json
+
+## Phase 8.7: Documentation (from AGENT_PROMPT.md item 5) — DONE
+- [x] **CONTRACTS.md**: Created with 4 contracts, methods, events, storage layout, Host trait, wasm ABI
+- [x] **Tokenomics constants visible**: docs/TOKENOMICS.md §7.1 + kvnc-staking doc annotations
 
 ---
 
-## Phase 8.6: RPC + CLI Exposure (from AGENT_PROMPT.md item 3)
-- [ ] **RPC methods added** (kvnc-rpc):
-  - [ ] htlc_create / htlc_claim / htlc_refund
-  - [ ] vault_create / vault_claim / vault_cancel
-  - [ ] multisig_create / multisig_propose / multisig_confirm / multisig_execute
-  - [ ] token_create / token_transfer / token_mint / token_burn / token_balance
-- [ ] **CLI subcommands added** (kvnc-cli):
-  - [ ] htlc {create, claim, refund}
-  - [ ] vault {create, claim, cancel}
-  - [ ] multisig {create, propose, confirm, execute}
-  - [ ] token {create, transfer, mint, burn, balance}
-
----
-
-## Phase 8.7: Documentation (from AGENT_PROMPT.md item 5)
-- [ ] **CONTRACTS.md**: Updated with 4 contracts, methods, events, storage layout, Host trait, wasm ABI
-- [ ] **Tokenomics constants visible** in docs/TOKENOMICS.md and CONTRACTS.md
-
----
-
-## Phase 8.8: Examples + Indexer Hooks (from AGENT_PROMPT.md item 6)
-- [ ] **Example HTLC flow** in docs (06-examples-indexer/example_htlc_flow.md)
-- [ ] **Event topics registered**: htlc_created/claimed/refunded, vault_created/claimed/cancelled, multisig_created/proposed/confirmed/executed, token_created/transfer/approval/mint/burn
+## Phase 8.8: Examples + Indexer Hooks (from AGENT_PROMPT.md item 6) — DONE
+- [x] **Example HTLC flow** in docs/EXAMPLES.md (adapted to real CLI surface)
+- [x] **Event topics registered**: kvnc-common/src/events.rs — 15 canonical constants, contracts use them (bytes unchanged)
 
 ---
 
