@@ -14,6 +14,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use kvnc_consensus::CommitteeInfo;
+use kvnc_mempool::Mempool;
+use kvnc_staking::StakingState;
+use kvnc_storage::Storage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -86,56 +90,118 @@ type RpcHandler = Arc<
         + Sync,
 >;
 
+/// Shared state for RPC handlers providing access to node internals.
+#[derive(Clone)]
+pub struct RpcState {
+    pub storage: Arc<Storage>,
+    pub mempool: Arc<Mempool>,
+    pub staking: Arc<RwLock<StakingState>>,
+    pub committee: CommitteeInfo,
+}
+
 #[derive(Clone)]
 pub struct RpcServer {
     methods: Arc<RwLock<HashMap<String, RpcHandler>>>,
     addr: SocketAddr,
+    state: RpcState,
 }
 
 impl RpcServer {
-    pub async fn new(addr: SocketAddr) -> Self {
+    pub async fn new(addr: SocketAddr, state: RpcState) -> Self {
         let mut server = Self {
             methods: Arc::new(RwLock::new(HashMap::new())),
             addr,
+            state,
         };
         server.register_default_methods().await;
         server
     }
 
     async fn register_default_methods(&mut self) {
+        let state = self.state.clone();
+
         // HTLC methods
-        self.register_method("htlc_create", handle_htlc_create)
+        self.register_method("htlc_create", move |params| handle_htlc_create(params, state.clone()))
             .await;
-        self.register_method("htlc_claim", handle_htlc_claim).await;
-        self.register_method("htlc_refund", handle_htlc_refund)
+        self.register_method("htlc_claim", move |params| handle_htlc_claim(params, state.clone()))
+            .await;
+        self.register_method("htlc_refund", move |params| handle_htlc_refund(params, state.clone()))
             .await;
 
         // Vault methods
-        self.register_method("vault_create", handle_vault_create)
+        self.register_method("vault_create", move |params| handle_vault_create(params, state.clone()))
             .await;
-        self.register_method("vault_claim", handle_vault_claim)
+        self.register_method("vault_claim", move |params| handle_vault_claim(params, state.clone()))
             .await;
-        self.register_method("vault_cancel", handle_vault_cancel)
+        self.register_method("vault_cancel", move |params| handle_vault_cancel(params, state.clone()))
             .await;
 
         // Multisig methods
-        self.register_method("multisig_create", handle_multisig_create)
+        self.register_method("multisig_create", move |params| handle_multisig_create(params, state.clone()))
             .await;
-        self.register_method("multisig_propose", handle_multisig_propose)
+        self.register_method("multisig_propose", move |params| handle_multisig_propose(params, state.clone()))
             .await;
-        self.register_method("multisig_confirm", handle_multisig_confirm)
+        self.register_method("multisig_confirm", move |params| handle_multisig_confirm(params, state.clone()))
             .await;
-        self.register_method("multisig_execute", handle_multisig_execute)
+        self.register_method("multisig_execute", move |params| handle_multisig_execute(params, state.clone()))
             .await;
 
         // Token methods
-        self.register_method("token_create", handle_token_create)
+        self.register_method("token_create", move |params| handle_token_create(params, state.clone()))
             .await;
-        self.register_method("token_transfer", handle_token_transfer)
+        self.register_method("token_transfer", move |params| handle_token_transfer(params, state.clone()))
             .await;
-        self.register_method("token_mint", handle_token_mint).await;
-        self.register_method("token_burn", handle_token_burn).await;
-        self.register_method("token_balance", handle_token_balance)
+        self.register_method("token_mint", move |params| handle_token_mint(params, state.clone()))
+            .await;
+        self.register_method("token_burn", move |params| handle_token_burn(params, state.clone()))
+            .await;
+        self.register_method("token_balance", move |params| handle_token_balance(params, state.clone()))
+            .await;
+
+        // Chain methods
+        self.register_method("kvnc_blockNumber", move |params| handle_block_number(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getBlockByHash", move |params| handle_get_block_by_hash(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getBlockByNumber", move |params| handle_get_block_by_number(params, state.clone()))
+            .await;
+
+        // Transaction methods
+        self.register_method("kvnc_sendRawTransaction", move |params| handle_send_raw_transaction(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getTransactionReceipt", move |params| handle_get_transaction_receipt(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getTransactionByHash", move |params| handle_get_transaction_by_hash(params, state.clone()))
+            .await;
+
+        // Account methods
+        self.register_method("kvnc_getBalance", move |params| handle_get_balance(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getNonce", move |params| handle_get_nonce(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getCode", move |params| handle_get_code(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getStorageAt", move |params| handle_get_storage_at(params, state.clone()))
+            .await;
+
+        // Staking methods
+        self.register_method("kvnc_getValidators", move |params| handle_get_validators(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getStake", move |params| handle_get_stake(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getRewards", move |params| handle_get_rewards(params, state.clone()))
+            .await;
+
+        // Mempool methods
+        self.register_method("kvnc_getPendingTransactions", move |params| handle_get_pending_transactions(params, state.clone()))
+            .await;
+        self.register_method("kvnc_estimateFee", move |params| handle_estimate_fee(params, state.clone()))
+            .await;
+
+        // Consensus methods
+        self.register_method("kvnc_getLeaderSchedule", move |params| handle_get_leader_schedule(params, state.clone()))
+            .await;
+        self.register_method("kvnc_getCommittee", move |params| handle_get_committee(params, state.clone()))
             .await;
     }
 
