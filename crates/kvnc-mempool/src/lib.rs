@@ -330,3 +330,124 @@ pub enum MempoolError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvnc_storage::Storage;
+    use kvnc_types::{Address, Signature};
+    use std::{fs, path::PathBuf};
+
+    const STRESS_TX_COUNT: usize = 10_000;
+
+    fn stress_transaction(index: usize) -> Transaction {
+        let mut hash = [0; 32];
+        hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
+
+        let mut recipient = [0; 32];
+        recipient[..8].copy_from_slice(&(index as u64).to_be_bytes());
+
+        let mut tx = Transaction {
+            sender: Address([1; 32]),
+            nonce: index as u64,
+            kind: TransactionKind::Transfer {
+                to: Address(recipient),
+                amount: index as u64 + 1,
+            },
+            fee: 1,
+            signature: Signature([0; 64]),
+            hash: Hash(hash),
+        };
+
+        // Keep the fee rate in ten deterministic buckets while ensuring every
+        // transaction has a nonzero fee and the same serialized size.
+        let size = bincode::serialize(&tx)
+            .expect("serialize stress transaction")
+            .len();
+        tx.fee = size as u64 * (1 + (index % 10) as u64);
+        tx
+    }
+
+    fn stress_storage_path() -> PathBuf {
+        std::env::temp_dir().join(format!("kvnc-mempool-stress-{}.redb", std::process::id()))
+    }
+
+    #[test]
+    fn stress_admits_10k_pending_transactions() {
+        let db_path = stress_storage_path();
+        // A previous interrupted run may have left its process-specific DB behind.
+        let _ = fs::remove_file(&db_path);
+        let storage = Arc::new(Storage::new(&db_path).expect("create test storage"));
+
+        let config = MempoolConfig {
+            // 64 MiB is deliberately much larger than the serialized 10k set.
+            max_mempool_size: 64 * 1024 * 1024,
+            max_tx_size: 1024 * 1024,
+            ..MempoolConfig::default()
+        };
+        let pool = Mempool::new(config.clone(), storage.clone());
+        let transactions: Vec<_> = (0..STRESS_TX_COUNT).map(stress_transaction).collect();
+        let expected_total_size: usize = transactions
+            .iter()
+            .map(|tx| {
+                bincode::serialize(tx)
+                    .expect("serialize expected transaction")
+                    .len()
+            })
+            .sum();
+
+        assert!(pool.is_empty());
+        for tx in &transactions {
+            pool.add_transaction(tx.clone())
+                .expect("admit valid stress transaction");
+        }
+
+        assert_eq!(pool.len(), STRESS_TX_COUNT);
+        assert!(!pool.is_empty());
+        assert!(expected_total_size < config.max_mempool_size);
+
+        for expected in &transactions {
+            assert!(pool.contains(&expected.hash), "missing {}", expected.hash);
+            let actual = pool
+                .get(&expected.hash)
+                .expect("lookup inserted transaction");
+            assert_eq!(
+                bincode::serialize(&actual).expect("serialize lookup"),
+                bincode::serialize(expected).expect("serialize expected")
+            );
+        }
+
+        let stats = pool.stats();
+        assert_eq!(stats.tx_count, STRESS_TX_COUNT);
+        assert_eq!(stats.total_size, expected_total_size);
+        assert!(stats.total_size <= config.max_mempool_size);
+        assert_eq!(
+            stats
+                .fee_rates
+                .iter()
+                .map(|(_, count)| count)
+                .sum::<usize>(),
+            STRESS_TX_COUNT
+        );
+
+        // This consumes the fee-priority queue, so keep it after the lookup and
+        // accounting assertions. The returned transactions must be the full set.
+        let next = pool.get_next_transactions(STRESS_TX_COUNT);
+        assert_eq!(next.len(), STRESS_TX_COUNT);
+        let returned: HashMap<_, _> = next.into_iter().map(|tx| (tx.hash, tx)).collect();
+        assert_eq!(returned.len(), STRESS_TX_COUNT);
+        for expected in &transactions {
+            let actual = returned
+                .get(&expected.hash)
+                .expect("proposal queue returned every inserted hash");
+            assert_eq!(
+                bincode::serialize(actual).expect("serialize queued transaction"),
+                bincode::serialize(expected).expect("serialize expected")
+            );
+        }
+
+        drop(pool);
+        drop(storage);
+        fs::remove_file(db_path).expect("remove test storage");
+    }
+}

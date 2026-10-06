@@ -286,7 +286,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ### [ ] 12.4 Load/Stress Tests
 - [ ] **TPS benchmark**: Target 100+ TPS on 2GB RAM
-- [ ] **Mempool stress**: 10k+ pending txs
+- [x] **Mempool stress**: 10k+ pending txs (10,000 admitted/retrieved under 64 MiB cap; `kvnc-mempool` stress test)
 - [ ] **DAG growth**: Long-running node memory stability
 
 ---
