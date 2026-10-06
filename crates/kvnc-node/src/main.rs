@@ -40,7 +40,7 @@ use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
-use kvnc_rpc::RpcServer;
+use kvnc_rpc::{RpcServer, RpcState};
 use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
@@ -153,6 +153,20 @@ where
     let validator_address = Address::from_public_key(&public_key);
     info!(validator = %validator_address, "validator identity ready");
 
+    // Load the staking state and build the committee up front so both the RPC
+    // server and the consensus engine can share them.
+    let staking_state = {
+        let read = state_storage.begin_read()?;
+        match state_storage.state().load_staking_state(&read) {
+            Ok(state) => state,
+            Err(e) => {
+                warn!(error = %e, "could not load staking state for RPC; using empty state");
+                StakingState::new()
+            }
+        }
+    };
+    let committee = build_committee(&public_key, &validator_address, &config.listen_addr);
+
     // ------------------------------------------------------------------
     // 4. Networking
     // ------------------------------------------------------------------
@@ -165,8 +179,19 @@ where
     // ------------------------------------------------------------------
     // 5. JSON-RPC server
     // ------------------------------------------------------------------
+    // NOTE: the node keeps the DAG/consensus store (`dag_store`) and the
+    // account/staking store (`state_storage`) in separate redb files, so the
+    // read-only storage handed to the RPC server is `state_storage`. Block and
+    // consensus queries therefore observe the state database; wiring them to the
+    // DAG database requires exposing `DagStore`'s inner `Arc<Storage>`.
     let rpc_socket = config.rpc_socket_addr()?;
-    let rpc_server = RpcServer::new(rpc_socket).await;
+    let rpc_state = RpcState {
+        storage: state_storage.clone(),
+        mempool: mempool.clone(),
+        staking: Arc::new(tokio::sync::RwLock::new(staking_state)),
+        committee: committee.clone(),
+    };
+    let rpc_server = RpcServer::new(rpc_socket, rpc_state).await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
 
     // ------------------------------------------------------------------
@@ -179,7 +204,6 @@ where
     let block_manager = Arc::new(BlockManager::new(dag_store.clone()));
     block_manager.set_authority(0);
     block_manager.set_signing_key(signing_key.clone());
-    let committee = build_committee(&public_key, &validator_address, &config.listen_addr);
     let engine = Arc::new(ConsensusEngine::new(
         ConsensusConfig {
             round_duration_ms: config.round_duration_ms,

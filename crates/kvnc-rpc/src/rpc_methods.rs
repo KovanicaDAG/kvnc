@@ -1,6 +1,6 @@
 //! RPC method definitions and handlers for KVNC contract entry points.
 
-use crate::{execute_contract_call, RpcError};
+use crate::{execute_contract_call, RpcError, RpcState};
 use kvnc_common::{Address, Amount, Hash, Height, Timestamp};
 use kvnc_vault::VestingSchedule;
 use serde::{Deserialize, Serialize};
@@ -45,7 +45,7 @@ pub struct HtlcRefundResult {
     pub ok: bool,
 }
 
-pub async fn handle_htlc_create(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_htlc_create(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: HtlcCreateParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("htlc_create: {}", e)))?;
 
@@ -68,7 +68,7 @@ pub async fn handle_htlc_create(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "swap_id": swap_id }))
 }
 
-pub async fn handle_htlc_claim(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_htlc_claim(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: HtlcClaimParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("htlc_claim: {}", e)))?;
 
@@ -85,7 +85,7 @@ pub async fn handle_htlc_claim(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true }))
 }
 
-pub async fn handle_htlc_refund(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_htlc_refund(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: HtlcRefundParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("htlc_refund: {}", e)))?;
 
@@ -138,7 +138,7 @@ pub struct VaultCancelResult {
     pub ok: bool,
 }
 
-pub async fn handle_vault_create(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_vault_create(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: VaultCreateParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("vault_create: {}", e)))?;
 
@@ -159,7 +159,7 @@ pub async fn handle_vault_create(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "vault_id": vault_id }))
 }
 
-pub async fn handle_vault_claim(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_vault_claim(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: VaultClaimParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("vault_claim: {}", e)))?;
 
@@ -180,7 +180,7 @@ pub async fn handle_vault_claim(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "amount_claimed": amount_claimed }))
 }
 
-pub async fn handle_vault_cancel(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_vault_cancel(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: VaultCancelParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("vault_cancel: {}", e)))?;
 
@@ -247,7 +247,7 @@ pub struct MultisigExecuteResult {
     pub ok: bool,
 }
 
-pub async fn handle_multisig_create(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_multisig_create(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: MultisigCreateParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("multisig_create: {}", e)))?;
 
@@ -275,7 +275,7 @@ pub async fn handle_multisig_create(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "multisig_id": multisig_id }))
 }
 
-pub async fn handle_multisig_propose(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_multisig_propose(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: MultisigProposeParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("multisig_propose: {}", e)))?;
 
@@ -303,7 +303,7 @@ pub async fn handle_multisig_propose(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "tx_id": tx_id }))
 }
 
-pub async fn handle_multisig_confirm(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_multisig_confirm(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: MultisigConfirmParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("multisig_confirm: {}", e)))?;
 
@@ -328,7 +328,7 @@ pub async fn handle_multisig_confirm(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true }))
 }
 
-pub async fn handle_multisig_execute(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_multisig_execute(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: MultisigExecuteParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("multisig_execute: {}", e)))?;
 
@@ -412,7 +412,7 @@ pub struct TokenBalanceResult {
     pub amount: Amount,
 }
 
-pub async fn handle_token_create(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_token_create(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: TokenCreateParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("token_create: {}", e)))?;
 
@@ -429,7 +429,7 @@ pub async fn handle_token_create(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "contract_address": contract }))
 }
 
-pub async fn handle_token_transfer(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_token_transfer(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: TokenTransferParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("token_transfer: {}", e)))?;
 
@@ -446,7 +446,7 @@ pub async fn handle_token_transfer(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true }))
 }
 
-pub async fn handle_token_mint(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_token_mint(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: TokenMintParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("token_mint: {}", e)))?;
 
@@ -463,7 +463,7 @@ pub async fn handle_token_mint(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true }))
 }
 
-pub async fn handle_token_burn(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_token_burn(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let p: TokenBurnParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("token_burn: {}", e)))?;
 
@@ -480,7 +480,7 @@ pub async fn handle_token_burn(params: Value) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true }))
 }
 
-pub async fn handle_token_balance(params: Value) -> Result<Value, RpcError> {
+pub async fn handle_token_balance(params: Value, _state: RpcState) -> Result<Value, RpcError> {
     let _p: TokenBalanceParams = serde_json::from_value(params)
         .map_err(|e| RpcError::InvalidParams(format!("token_balance: {}", e)))?;
 
