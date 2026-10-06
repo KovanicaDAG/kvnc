@@ -192,6 +192,11 @@ impl TreasuryState {
         self.claimed = self.claimed.saturating_add(claimed);
         Ok(claimed)
     }
+
+    /// Check how much is currently claimable from the treasury.
+    pub fn claimable(&self) -> u64 {
+        self.available()
+    }
 }
 
 // ============================================================
@@ -363,6 +368,27 @@ impl StakingState {
             .saturating_add(self.total_mining_issued)
             .saturating_add(treasury_vested)
             .min(TOTAL_SUPPLY)
+    }
+
+    /// Claim available treasury funds.
+    /// Returns the amount actually claimed (may be less than requested if not enough vested).
+    pub fn claim_treasury(&mut self, amount: u64) -> Result<u64, StakingError> {
+        let treasury = self
+            .treasury
+            .as_mut()
+            .ok_or(StakingError::TreasuryInsufficient)?;
+        let claimed = treasury.claim(amount)?;
+        Ok(claimed)
+    }
+
+    /// Check how much treasury is currently claimable.
+    pub fn treasury_claimable(&self) -> u64 {
+        self.treasury.as_ref().map(|t| t.claimable()).unwrap_or(0)
+    }
+
+    /// Get the treasury address if configured.
+    pub fn treasury_address(&self) -> Option<Address> {
+        self.treasury.as_ref().map(|t| t.treasury_address)
     }
 }
 

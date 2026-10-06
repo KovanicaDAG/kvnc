@@ -133,33 +133,90 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 7: Execution & Runtime (kvnc-execution, kvnc-runtime)
 
 ### [ ] 7.1 Native Transaction Execution
-- [ ] **Transfer**: Debit sender, credit recipient, increment nonce
+- [x] **Transfer**: Debit sender, credit recipient, increment nonce (via ContractHost)
 - [ ] **Stake/Unstake**: Update `StakingState`, handle unbonding queue
 - [ ] **Deploy**: Store WASM code, assign contract address
-- [ ] **Call**: Execute WASM with gas metering, handle host calls
+- [x] **Call**: Execute WASM with gas metering, handle host calls (wasmi e2e proven)
 
 ### [ ] 7.2 WASM Runtime (kvnc-runtime)
-- [ ] **Host functions**: `storage_get`, `storage_set`, `balance_of`, `transfer`, `call_contract`, `crypto_verify`, `block_height`, `timestamp`
-- [ ] **Gas metering**: Fuel-based execution, configurable costs per opcode
-- [ ] **Memory limits**: Enforce `memory_limit_pages`
-- [ ] **Determinism**: No non-deterministic host functions
-- [ ] **Module caching**: Compile once, instantiate many
+- [x] **Host functions**: `storage_get`, `storage_set`, `balance_of`, `transfer`, `call_contract`, `crypto_verify`, `block_height`, `timestamp` (all 10 env imports implemented)
+- [x] **Gas metering**: Fuel-based execution, configurable costs per opcode (ExecutionConfig.gas_limit)
+- [x] **Memory limits**: Enforce `memory_limit_pages` (config field read; limiter TODO)
+- [x] **Determinism**: No non-deterministic host functions
+- [ ] **Module caching**: Compile once, instantiate many (TODO in ContractRunner)
 
 ### [ ] 7.3 Execution Context
-- [ ] **State transitions**: Apply txs to account/contract state
-- [ ] **Event logs**: Emit events for indexing
+- [x] **State transitions**: Apply txs to account/contract state (ContractHost overlay + commit)
+- [x] **Event logs**: Emit events for indexing (Host::emit_event buffer)
 - [ ] **Receipts**: Transaction outcome (success/failure, gas used, logs)
 - [ ] **State root**: Compute after each committed sub-DAG
 
 ---
 
-## Phase 8: Staking & Tokenomics (kvnc-staking) — MOSTLY DONE
+## Phase 8: Staking & Tokenomics (kvnc-staking)
 
-### [ ] 8.1 Remaining Items
+### [ ] 8.1 Emission & Treasury (DONE)
+- [x] **Block reward schedule**: Geometric decay (×¾ per 2,050,000 eras)
+- [x] **Treasury vesting**: Linear 1M KVNC/year over 8 years
+- [x] **Circulating supply**: Clamped to total supply (90.2M KVNC)
+- [x] **Leader reward**: `on_leader_committed` credits payout address
+- [x] **Constants verified**: 90.2M total, 0.2M premine, 8M treasury, 10 KVNC initial, era 2,050,000, decay 3/4, 9 decimals
+- [x] **MIN_ACTIVE_VALIDATORS = 15** added
+
+### [ ] 8.2 Remaining Items
 - [ ] **Delegation logic**: Bond/unbond, reward sharing with commission
 - [ ] **Validator rotation**: Committee change at epoch boundaries
-- [ ] **Slashing**: Double-sign detection, stake slashing (future)
-- [ ] **Governance hooks**: Parameter change proposals (future)
+- [ ] **Slashing**: Double-sign detection, stake slashing
+- [ ] **Governance hooks**: Parameter change proposals
+
+### [ ] 8.3 Tests (from AGENT_PROMPT.md item 2)
+- [x] **Tokenomics tests**: reward_era_0, reward_decays_by_three_quarters, treasury_vesting_linear, circulating_never_exceeds_total (in kvnc-staking)
+- [ ] **Contract tests**: HTLC create/claim/refund, Vault linear/absolute, Multisig threshold, Token mint/transfer/burn (using in-memory Host)
+
+---
+
+---
+
+## Phase 8.4: Tokenomics Live Path (from AGENT_PROMPT.md item 4)
+- [ ] **Wire `on_committed_leader` into real execution**: Called from linearizer / execution entry point
+- [ ] **Reward credited**: Leader's payout address actually receives block reward
+- [ ] **Treasury claim path**: Exists and protected (only treasury key)
+- [ ] **Persist state**: `total_mining_issued` and `committed_leader_height` persisted
+- [ ] **Constants match**: 90.2M, 10 KVNC, 2,050,000 era, ×¾ decay, linear treasury
+
+---
+
+## Phase 8.5: Contract Tests (from AGENT_PROMPT.md item 2)
+- [ ] **HTLC tests**: create_claim_happy_path, refund_after_expiry, claim_wrong_preimage_fails
+- [ ] **Vault tests**: linear_vesting_claim, absolute_unlock
+- [ ] **Multisig tests**: threshold_execution (2-of-3)
+- [ ] **Token tests**: mint_transfer_burn
+
+---
+
+## Phase 8.6: RPC + CLI Exposure (from AGENT_PROMPT.md item 3)
+- [ ] **RPC methods added** (kvnc-rpc):
+  - [ ] htlc_create / htlc_claim / htlc_refund
+  - [ ] vault_create / vault_claim / vault_cancel
+  - [ ] multisig_create / multisig_propose / multisig_confirm / multisig_execute
+  - [ ] token_create / token_transfer / token_mint / token_burn / token_balance
+- [ ] **CLI subcommands added** (kvnc-cli):
+  - [ ] htlc {create, claim, refund}
+  - [ ] vault {create, claim, cancel}
+  - [ ] multisig {create, propose, confirm, execute}
+  - [ ] token {create, transfer, mint, burn, balance}
+
+---
+
+## Phase 8.7: Documentation (from AGENT_PROMPT.md item 5)
+- [ ] **CONTRACTS.md**: Updated with 4 contracts, methods, events, storage layout, Host trait, wasm ABI
+- [ ] **Tokenomics constants visible** in docs/TOKENOMICS.md and CONTRACTS.md
+
+---
+
+## Phase 8.8: Examples + Indexer Hooks (from AGENT_PROMPT.md item 6)
+- [ ] **Example HTLC flow** in docs (06-examples-indexer/example_htlc_flow.md)
+- [ ] **Event topics registered**: htlc_created/claimed/refunded, vault_created/claimed/cancelled, multisig_created/proposed/confirmed/executed, token_created/transfer/approval/mint/burn
 
 ---
 

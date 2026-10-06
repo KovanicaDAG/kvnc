@@ -101,11 +101,8 @@ impl ExecutionContext {
     /// - The storage write transaction is opened *before* the staking
     ///   accounting: if `on_leader_committed` fails (unknown authority) the
     ///   transaction is dropped and storage is untouched.
-    /// - TODO: the in-memory staking counters advance before the storage
-    ///   commit; a storage commit failure would leave them one height ahead
-    ///   of the ledger. Closing that window requires persisting
-    ///   `StakingState` inside the same transaction (blocked on moving
-    ///   staking state into kvnc-storage).
+    /// - The staking state (committed_leader_height, total_mining_issued,
+    ///   treasury vesting) is persisted in the same transaction.
     pub fn execute_committed_subdag(
         &mut self,
         subdag: &CommittedSubDag,
@@ -124,6 +121,8 @@ impl ExecutionContext {
         storage
             .state()
             .add_balance(&txn, &reward.recipient, reward.amount)?;
+        // Persist staking state (height, total_mining_issued, treasury vesting)
+        storage.state().save_staking_state(&txn, &self.staking)?;
         txn.commit().map_err(StorageError::Commit)?;
 
         info!(
@@ -148,6 +147,55 @@ impl ExecutionContext {
             txs_applied,
             circulating_supply: self.staking.circulating_supply(),
         })
+    }
+
+    /// Claim available treasury funds and credit them to the treasury address.
+    ///
+    /// This can be called by an operator / governance process to move vested
+    /// treasury funds into circulation. The treasury address must have been
+    /// configured at genesis via `init_treasury`.
+    ///
+    /// Returns the amount actually claimed (may be less than requested if
+    /// not enough has vested).
+    pub fn claim_treasury(
+        &mut self,
+        amount: u64,
+        storage: &Storage,
+    ) -> Result<u64, ExecutionError> {
+        let treasury_address = self
+            .staking
+            .treasury_address()
+            .ok_or_else(|| ExecutionError::Other("treasury not configured".into()))?;
+
+        let claimable = self.staking.treasury_claimable();
+        if claimable == 0 {
+            return Ok(0);
+        }
+
+        let to_claim = amount.min(claimable);
+        let claimed = self.staking.claim_treasury(to_claim)?;
+
+        if claimed == 0 {
+            return Ok(0);
+        }
+
+        // Credit the treasury address balance
+        let txn = storage.begin_write()?;
+        storage
+            .state()
+            .add_balance(&txn, &treasury_address, claimed)?;
+        // Persist updated staking state (claimed counter)
+        storage.state().save_staking_state(&txn, &self.staking)?;
+        txn.commit().map_err(StorageError::Commit)?;
+
+        info!(
+            target: "kvnc-execution",
+            "Treasury claim: {} KVNC credited to {:?}",
+            claimed / kvnc_staking::ONE_KVNC,
+            treasury_address
+        );
+
+        Ok(claimed)
     }
 }
 
@@ -259,5 +307,76 @@ mod tests {
             reward.amount + reward2.amount,
             "failed commit credits nothing"
         );
+    }
+
+    #[test]
+    fn treasury_claim_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+
+        let mut ctx = ExecutionContext::new();
+        let treasury_addr = Address([8u8; 32]);
+        ctx.init_treasury(treasury_addr);
+
+        // Register a validator to be the leader
+        let validator = Address([1u8; 32]);
+        let payout = Address([9u8; 32]);
+        ctx.staking
+            .join_validator(
+                validator,
+                kvnc_staking::MIN_VALIDATOR_STAKE,
+                0,
+                Some(payout),
+            )
+            .expect("join validator");
+
+        // Manually advance treasury vesting for testing (simulate 2 years elapsed)
+        // by directly setting vested amount on the treasury state.
+        if let Some(ref mut treasury) = ctx.staking.treasury {
+            treasury.vested = 2 * kvnc_staking::TREASURY_ANNUAL;
+        }
+
+        // Treasury should have 2M KVNC vested and claimable
+        let claimable = ctx.staking.treasury_claimable();
+        assert_eq!(claimable, 2 * kvnc_staking::TREASURY_ANNUAL);
+
+        // Claim 1M KVNC
+        let claimed = ctx
+            .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
+            .expect("claim treasury");
+        assert_eq!(claimed, kvnc_staking::TREASURY_ANNUAL);
+
+        // Verify treasury address was credited
+        assert_eq!(read_balance(&storage, &treasury_addr), claimed);
+
+        // Verify staking state updated
+        assert_eq!(ctx.staking.treasury.as_ref().unwrap().claimed, claimed);
+        assert_eq!(
+            ctx.staking.treasury_claimable(),
+            kvnc_staking::TREASURY_ANNUAL
+        );
+
+        // Claim the rest
+        let claimed2 = ctx
+            .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
+            .expect("claim treasury again");
+        assert_eq!(claimed2, kvnc_staking::TREASURY_ANNUAL);
+        assert_eq!(
+            read_balance(&storage, &treasury_addr),
+            2 * kvnc_staking::TREASURY_ANNUAL
+        );
+
+        // Double claim beyond vested amount returns 0
+        let claimed3 = ctx
+            .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
+            .expect("claim treasury third time");
+        assert_eq!(claimed3, 0);
+
+        // Claim without treasury configured fails
+        let mut ctx2 = ExecutionContext::new();
+        let err = ctx2
+            .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
+            .expect_err("claim without treasury must fail");
+        assert!(matches!(err, ExecutionError::Other(_)));
     }
 }
