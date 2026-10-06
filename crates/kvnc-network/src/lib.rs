@@ -1,23 +1,28 @@
 //! P2P networking layer (libp2p).
+//!
+//! The crate runs a [`libp2p::Swarm`] composed of gossipsub (topics `blocks`,
+//! `transactions`, `votes` and `sync`), Kademlia peer discovery, ping-based
+//! liveness and identify, wrapped in [`NetworkService`]. Swarm activity is
+//! translated into a stream of [`NetworkEvent`]s for the rest of the node.
 
 #![deny(unsafe_code)]
 #![allow(missing_docs)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::large_enum_variant)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-#![allow(unused_mut)]
 
-use kvnc_dag::DagStore;
-use kvnc_mempool::Mempool;
+mod behaviour;
+mod error;
+mod service;
+mod sync;
+pub mod topics;
+
+pub use error::NetworkError;
+pub use service::NetworkService;
+pub use sync::SyncRequest;
+
 use kvnc_types::{block::StatementBlock, transaction::Transaction, Round};
 use libp2p::{Multiaddr, PeerId};
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::info;
 
 /// Network event emitted by the networking layer.
 #[derive(Debug, Clone)]
@@ -58,110 +63,57 @@ pub struct NetworkConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
+        // NOTE: the `/p2p/` component must carry the seed's real libp2p peer id.
+        // The value below is a syntactically valid placeholder until the seed
+        // publishes one; a mismatching peer id only fails the dial, which the
+        // event loop tolerates.
         Self {
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/9000".parse().unwrap()],
-            bootstrap_nodes: vec![
-                "/dns4/seed.kovanica.online/tcp/9000/p2p/12D3KooWBootstrapNode"
-                    .parse()
-                    .unwrap(),
-            ],
+            listen_addrs: vec!["/ip4/0.0.0.0/tcp/9000"
+                .parse()
+                .expect("valid listen multiaddr")],
+            bootstrap_nodes: vec!["/dns4/seed.kovanica.online/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                .parse()
+                .expect("valid bootstrap multiaddr")],
             max_peers: 50,
             ping_interval: Duration::from_secs(10),
         }
     }
 }
 
-/// Errors that can occur in network operations.
-#[derive(Debug, thiserror::Error)]
-pub enum NetworkError {
-    /// Transport-level error.
-    #[error("Transport error: {0}")]
-    Transport(String),
-    /// Swarm-level error.
-    #[error("Swarm error: {0}")]
-    Swarm(String),
-    /// Gossipsub error.
-    #[error("Gossipsub error: {0}")]
-    Gossipsub(String),
-    /// Kademlia error.
-    #[error("Kademlia error: {0}")]
-    Kademlia(String),
-    /// Peer not found.
-    #[error("Peer not found: {0}")]
-    PeerNotFound(PeerId),
-    /// Serialization error.
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
-    /// DAG store error.
-    #[error("DAG store error: {0}")]
-    DagStore(#[from] kvnc_dag::DagStoreError),
-    /// Mempool error.
-    #[error("Mempool error: {0}")]
-    Mempool(#[from] kvnc_mempool::MempoolError),
-    /// IO error.
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Main network service (simplified skeleton).
-pub struct NetworkService {
-    config: NetworkConfig,
-    dag_store: Arc<DagStore>,
-    mempool: Arc<Mempool>,
-    event_tx: mpsc::UnboundedSender<NetworkEvent>,
-    connected_peers: HashSet<PeerId>,
-}
-
-impl NetworkService {
-    /// Create a new network service (skeleton).
-    pub fn new(
-        config: NetworkConfig,
-        dag_store: Arc<DagStore>,
-        mempool: Arc<Mempool>,
-    ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkEvent>), NetworkError> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-        Ok((
-            Self {
-                config,
-                dag_store,
-                mempool,
-                event_tx,
-                connected_peers: HashSet::new(),
-            },
-            event_rx,
-        ))
-    }
-
-    /// Start the network service (skeleton - not fully implemented yet).
-    pub async fn start(&mut self) -> Result<(), NetworkError> {
-        info!(
-            "Network service skeleton started, listening on {:?}",
-            self.config.listen_addrs
+    #[test]
+    fn default_config_parses_without_panicking() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.listen_addrs.len(), 1);
+        assert_eq!(config.listen_addrs[0].to_string(), "/ip4/0.0.0.0/tcp/9000");
+        assert_eq!(config.bootstrap_nodes.len(), 1);
+        assert!(
+            config.bootstrap_nodes[0]
+                .to_string()
+                .contains("/dns4/seed.kovanica.online/tcp/9000/p2p/"),
+            "unexpected default bootstrap: {}",
+            config.bootstrap_nodes[0]
         );
-        // TODO: Implement full libp2p swarm with gossipsub, Kademlia, etc.
-        Ok(())
+        assert_eq!(config.max_peers, 50);
+        assert_eq!(config.ping_interval, Duration::from_secs(10));
     }
 
-    /// Broadcast a block to all peers (skeleton).
-    pub fn broadcast_block(&self, _block: &StatementBlock) -> Result<(), NetworkError> {
-        // TODO: Implement gossip broadcast
-        Ok(())
-    }
-
-    /// Broadcast a transaction to all peers (skeleton).
-    pub fn broadcast_transaction(&self, _tx: &Transaction) -> Result<(), NetworkError> {
-        // TODO: Implement gossip broadcast
-        Ok(())
-    }
-
-    /// Get connected peers.
-    pub fn connected_peers(&self) -> HashSet<PeerId> {
-        self.connected_peers.clone()
-    }
-
-    /// Get peer count.
-    pub fn peer_count(&self) -> usize {
-        self.connected_peers.len()
+    #[test]
+    fn network_events_carry_their_payloads() {
+        let peer = PeerId::random();
+        let event = NetworkEvent::PeerDiscovered(
+            peer,
+            "/ip4/127.0.0.1/tcp/9000".parse().expect("valid multiaddr"),
+        );
+        match event {
+            NetworkEvent::PeerDiscovered(seen, addr) => {
+                assert_eq!(seen, peer);
+                assert_eq!(addr.to_string(), "/ip4/127.0.0.1/tcp/9000");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
