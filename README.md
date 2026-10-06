@@ -1,8 +1,8 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/kovanica/brand-assets/main/logo/kvnc-logo-light.svg" width="180">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/kovanica/brand-assets/main/logo/kvnc-logo-dark.svg" width="180">
-    <img alt="KVNC Logo" src="https://raw.githubusercontent.com/kovanica/brand-assets/main/logo/kvnc-logo-dark.svg" width="180">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/KovanicaDAG/kvnc/main/KVNCa-logo.JPG" width="180">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/KovanicaDAG/kvnc/main/KVNCa-logo.JPG" width="180">
+    <img alt="KVNC Logo" src="https://raw.githubusercontent.com/KovanicaDAG/kvnc/main/KVNCa-logo.JPG" width="180">
   </picture>
 </p>
 
