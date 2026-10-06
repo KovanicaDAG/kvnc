@@ -172,7 +172,7 @@ impl NetworkService {
             .publish(topics::ident(topic), payload)
         {
             Ok(_) => Ok(()),
-            Err(gossipsub::PublishError::InsufficientPeers) => {
+            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
                 // Nobody is subscribed yet (fresh node, no peers): the message
                 // has nothing to propagate to, which is not an error for us.
                 debug!(topic, "no peers to gossip to; broadcast skipped");
@@ -263,6 +263,12 @@ impl NetworkService {
             }
             gossipsub::Event::GossipsubNotSupported { peer_id } => {
                 warn!(%peer_id, "peer does not support gossipsub");
+                Ok(())
+            }
+            // libp2p-gossipsub >= 0.48 reports peers that lag behind on message
+            // delivery. We have no backpressure hook for this yet, so just log.
+            gossipsub::Event::SlowPeer { peer_id, .. } => {
+                debug!(%peer_id, "gossipsub slow peer");
                 Ok(())
             }
         }
