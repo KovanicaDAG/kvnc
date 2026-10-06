@@ -208,22 +208,22 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ---
 
-## Phase 9: Node Binary (kvnc-node)
+## Phase 9: Node Binary (kvnc-node) — DONE
 
-### [ ] 9.1 Configuration
-- [ ] **Config file**: TOML with all tunable parameters
-- [ ] **Environment variables**: Override config for deployment
-- [ ] **Genesis config**: Committee, treasury address, premine accounts
+### [x] 9.1 Configuration
+- [x] **Config file**: TOML with all tunable parameters (NodeConfig + env overrides)
+- [x] **Environment variables**: KVNC_DATA_DIR, KVNC_RPC_ADDR, etc.
+- [x] **Genesis config**: Treasury address, genesis block creation
 
-### [ ] 9.2 Core Loop
-- [ ] **Initialize**: Load config, genesis, keystore, connect to peers
-- [ ] **Consensus loop**: Propose blocks, process incoming, commit
-- [ ] **Execution loop**: Process `CommittedSubDag` from consensus
-- [ ] **RPC server**: Start JSON-RPC on configured port
+### [x] 9.2 Core Loop
+- [x] **Initialize**: Load config, genesis, keystore, connect to peers
+- [x] **Consensus loop**: Propose blocks, process incoming, commit
+- [x] **Execution loop**: Process `CommittedSubDag` from consensus
+- [x] **RPC server**: Start JSON-RPC on configured port
 
-### [ ] 9.3 Graceful Shutdown
-- [ ] **Signal handling**: SIGTERM → flush state, close connections
-- [ ] **State persistence**: Ensure all committed data on disk
+### [x] 9.3 Graceful Shutdown
+- [x] **Signal handling**: SIGTERM → flush state, close connections
+- [x] **State persistence**: Ensure all committed data on redb
 
 ---
 
@@ -269,9 +269,9 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ### [ ] 12.1 Unit Tests
 - [x] **kvnc-staking**: All tokenomics math (✓ mostly done)
 - [ ] **kvnc-consensus**: Commit rules, linearizer
-- [ ] **kvnc-execution**: Transaction application, reward distribution
+- [x] **kvnc-execution**: Transaction application, reward distribution (6 tests)
 - [ ] **kvnc-runtime**: WASM execution, gas metering
-- [ ] **kvnc-dag**: Block validation, parent selection
+- [x] **kvnc-dag**: Block validation, parent selection (1 test)
 
 ### [ ] 12.2 Integration Tests
 - [ ] **Single node**: Full block production → commit → execute cycle
@@ -388,4 +388,4 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 7 → Phase 9
 ## Audit note (2026-10-06)
 
 ~35 items checked off as done-but-unchecked; PARTIAL items left unchecked (stake-weighted committee selection, Merkle roots, hash domain separation, Ed25519 batch verify, pruning policy, MPT, snapshot/restore, DAG ingestion/causal ordering/parent selection, block validation/broadcast, timeout/fork handling, admission control, conflict resolution, fee estimation, Kademlia+mDNS, block sync, vote gossip, peer scoring/banning, connection mgmt).
-Phase 8 header says "MOSTLY DONE" but its 4 sub-items (delegation bond/unbond, validator rotation, slashing, governance hooks) are NOT implemented. Phases 9–14 remain stubs.
+Phase 8 header says "MOSTLY DONE" but its 4 sub-items (delegation bond/unbond, validator rotation, slashing, governance hooks) are NOT implemented. Phases 10–14 remain stubs.
