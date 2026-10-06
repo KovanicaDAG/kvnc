@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 kvnc-types = { path = "../kvnc-types" }
+kvnc-crypto = { path = "../kvnc-crypto" }
 kvnc-common = { path = "../kvnc-common" }
 kvnc-htlc = { path = "../kvnc-htlc" }
 kvnc-vault = { path = "../kvnc-vault" }
@@ -22,3 +23,5 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
