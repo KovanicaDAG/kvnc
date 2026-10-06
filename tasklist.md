@@ -8,14 +8,14 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 0: Foundation & Tooling
 
 ### [ ] 0.1 Workspace Setup
-- [ ] Verify `cargo build` works for all crates
-- [ ] Add `cargo test` CI pipeline (GitHub Actions)
-- [ ] Configure `clippy` and `rustfmt` checks
-- [ ] Set up dependency auditing (`cargo audit`)
+- [x] Verify `cargo build` works for all crates
+- [x] Add `cargo test` CI pipeline (GitHub Actions)
+- [x] Configure `clippy` and `rustfmt` checks
+- [x] Set up dependency auditing (`cargo audit`)
 
 ### [ ] 0.2 Documentation
-- [ ] Add missing module-level docs to all crates
-- [ ] Generate API docs with `cargo doc`
+- [x] Add missing module-level docs to all crates
+- [x] Generate API docs with `cargo doc`
 - [ ] Create architecture decision records (ADRs) for key choices
 
 ---
@@ -23,11 +23,11 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 1: Core Types & Crypto (kvnc-types, kvnc-crypto)
 
 ### [ ] 1.1 kvnc-types — Complete Data Structures
-- [ ] **Block/Transaction serialization**: Proper bincode/postcard impl for `StatementBlock`, `Transaction`
+- [x] **Block/Transaction serialization**: Proper bincode/postcard impl for `StatementBlock`, `Transaction`
 - [ ] **Merkle roots**: Add `merkle_root` to blocks for tx inclusion proofs
-- [ ] **Round/Authority types**: Ensure `Round`, `AuthorityIndex` have proper arithmetic traits
-- [ ] **Committee types**: `Committee`, `Authority`, `Stake` with stake-weighted selection
-- [ ] **Address derivation**: From public key (blake3 hash → address format)
+- [x] **Round/Authority types**: Ensure `Round`, `AuthorityIndex` have proper arithmetic traits
+- [ ] **Committee types**: `Committee`, `Authority`, `Stake` with stake-weighted selection (partial: leader is round-robin, not stake-weighted)
+- [x] **Address derivation**: From public key (blake3 hash → address format)
 - [ ] **Hash domain separation**: Distinct hash constructors for blocks, txs, state
 
 ### [ ] 1.2 kvnc-crypto — Production Ready
@@ -41,20 +41,20 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 2: Storage Layer (kvnc-storage)
 
 ### [ ] 2.1 Block Store
-- [ ] **Schema design**: redb tables for blocks, transactions, block index
-- [ ] **BlockStore API**: `put_block`, `get_block`, `get_block_by_height`, `get_blocks_by_range`
-- [ ] **Transaction index**: Map tx hash → block reference
+- [x] **Schema design**: redb tables for blocks, transactions, block index
+- [x] **BlockStore API**: `put_block`, `get_block`, `get_block_by_height`, `get_blocks_by_range`
+- [x] **Transaction index**: Map tx hash → block reference
 - [ ] **Pruning policy**: Keep last N committed sub-DAGs + genesis
 
 ### [ ] 2.2 State Store
-- [ ] **Account state**: Balance, nonce, contract code/storage
-- [ ] **Staking state**: Validators, delegations, treasury (persist `StakingState`)
+- [x] **Account state**: Balance, nonce, contract code/storage
+- [x] **Staking state**: Validators, delegations, treasury (persist `StakingState`)
 - [ ] **Merkle Patricia Trie**: For state root computation
 - [ ] **Snapshot/Restore**: Periodic state snapshots for fast sync
 
 ### [ ] 2.3 Consensus Store
-- [ ] **DAG persistence**: Parent/child links, round index, author index
-- [ ] **Commit tracker**: Persisted `committed_leader_height`, decided rounds
+- [x] **DAG persistence**: Parent/child links, round index, author index
+- [x] **Commit tracker**: Persisted `committed_leader_height`, decided rounds
 
 ---
 
@@ -64,10 +64,10 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [ ] **Block ingestion**: Validate parents exist, verify signatures, check round
 - [ ] **Causal ordering**: Topological sort, ancestor/descendant queries
 - [ ] **Parent selection**: Algorithm for choosing 2f+1 parents from previous round
-- [ ] **Garbage collection**: Prune blocks before last committed leader (configurable)
+- [x] **Garbage collection**: Prune blocks before last committed leader (configurable)
 
 ### [ ] 3.2 Block Manager
-- [ ] **Propose block**: Build `StatementBlock` with transactions from mempool
+- [x] **Propose block**: Build `StatementBlock` with transactions from mempool
 - [ ] **Validate block**: Check parents, signature, round, transactions valid
 - [ ] **Block broadcast**: Gossip new blocks to peers
 
@@ -76,22 +76,22 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 4: Consensus (kvnc-consensus)
 
 ### [ ] 4.1 Committer Implementation (CRITICAL PATH)
-- [ ] **Direct commit rule**: Leader certified by 2f+1 votes in next round
-- [ ] **Indirect commit rule**: Wave-based skip/commit through decided leaders
-- [ ] **Leader status tracking**: `Undecided` → `Commit` / `Skip`
-- [ ] **CommittedSubDag production**: Linearize blocks in topological order
+- [x] **Direct commit rule**: Leader certified by 2f+1 votes in next round
+- [x] **Indirect commit rule**: Wave-based skip/commit through decided leaders
+- [x] **Leader status tracking**: `Undecided` → `Commit` / `Skip`
+- [x] **CommittedSubDag production**: Linearize blocks in topological order
 
 ### [ ] 4.2 Linearizer
-- [ ] **Topological sort**: Blocks in causal order for execution
-- [ ] **Deduplication**: Handle blocks reachable via multiple paths
+- [x] **Topological sort**: Blocks in causal order for execution
+- [x] **Deduplication**: Handle blocks reachable via multiple paths
 
 ### [ ] 4.3 Wave Logic
-- [ ] **Wave advancement**: Track current wave, leader schedule
-- [ ] **Leader selection**: Deterministic from committee + round (VRF or hash)
+- [x] **Wave advancement**: Track current wave, leader schedule
+- [x] **Leader selection**: Deterministic from committee + round (VRF or hash)
 - [ ] **Timeout handling**: Skip leader if no block produced
 
 ### [ ] 4.4 Consensus Loop Integration
-- [ ] **Round timer**: Advance rounds based on wall clock or block arrival
+- [x] **Round timer**: Advance rounds based on wall clock or block arrival
 - [ ] **Fork handling**: Multiple leaders same round (first valid wins)
 
 ---
@@ -99,13 +99,13 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 5: Mempool (kvnc-mempool)
 
 ### [ ] 5.1 Core Mempool
-- [ ] **Tx pool**: Priority queue by fee rate (fee/gas)
+- [x] **Tx pool**: Priority queue by fee rate (fee/gas)
 - [ ] **Admission control**: Validate nonce, balance, signature, gas limit
-- [ ] **Eviction policy**: Drop lowest fee-rate when memory limit reached
-- [ ] **Rebroadcast**: Periodic gossip of pending transactions
+- [x] **Eviction policy**: Drop lowest fee-rate when memory limit reached
+- [x] **Rebroadcast**: Periodic gossip of pending transactions
 
 ### [ ] 5.2 Block Building
-- [ ] **Select transactions**: Fill block up to `MAX_TXS_PER_BLOCK` / gas limit
+- [x] **Select transactions**: Fill block up to `MAX_TXS_PER_BLOCK` / gas limit
 - [ ] **Conflict resolution**: Same sender nonce ordering
 - [ ] **Fee estimation**: RPC endpoint for suggested fee rates
 
@@ -114,18 +114,18 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 6: Networking (kvnc-network)
 
 ### [ ] 6.1 libp2p Setup
-- [ ] **Transport**: TCP + Noise + Yamux
+- [x] **Transport**: TCP + Noise + Yamux
 - [ ] **Discovery**: Kademlia DHT + mDNS (local)
-- [ ] **Gossipsub topics**: `blocks`, `transactions`, `votes`, `sync`
+- [x] **Gossipsub topics**: `blocks`, `transactions`, `votes`, `sync`
 
 ### [ ] 6.2 Protocols
 - [ ] **Block sync**: Request/response for missing blocks (by round/author)
-- [ ] **Transaction gossip**: Flood new txs to peers
+- [x] **Transaction gossip**: Flood new txs to peers
 - [ ] **Vote gossip**: Consensus votes (if separate from blocks)
 - [ ] **Peer scoring**: Ban misbehaving peers (invalid blocks, spam)
 
 ### [ ] 6.3 Bootstrap
-- [ ] **Seed nodes**: DNS seed (`seed.kovanica.online`) + hardcoded peers
+- [x] **Seed nodes**: DNS seed (`seed.kovanica.online`) + hardcoded peers
 - [ ] **Connection management**: Target peer count, reconnect logic
 
 ---
@@ -222,7 +222,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 12: Testing & Verification
 
 ### [ ] 12.1 Unit Tests
-- [ ] **kvnc-staking**: All tokenomics math (✓ mostly done)
+- [x] **kvnc-staking**: All tokenomics math (✓ mostly done)
 - [ ] **kvnc-consensus**: Commit rules, linearizer
 - [ ] **kvnc-execution**: Transaction application, reward distribution
 - [ ] **kvnc-runtime**: WASM execution, gas metering
@@ -337,3 +337,10 @@ Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 7 → Phase 9
 
 *Last updated: $(date)*
 *Generated from project inspection on 2026-10-05*
+
+---
+
+## Audit note (2026-10-06)
+
+~35 items checked off as done-but-unchecked; PARTIAL items left unchecked (stake-weighted committee selection, Merkle roots, hash domain separation, Ed25519 batch verify, pruning policy, MPT, snapshot/restore, DAG ingestion/causal ordering/parent selection, block validation/broadcast, timeout/fork handling, admission control, conflict resolution, fee estimation, Kademlia+mDNS, block sync, vote gossip, peer scoring/banning, connection mgmt).
+Phase 8 header says "MOSTLY DONE" but its 4 sub-items (delegation bond/unbond, validator rotation, slashing, governance hooks) are NOT implemented. Phases 9–14 remain stubs.
