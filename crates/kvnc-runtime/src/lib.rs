@@ -533,3 +533,331 @@ fn build_linker<'a>(engine: &Engine) -> Result<Linker<ExecState<'a>>, RuntimeErr
 
     Ok(linker)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestHost {
+        caller: Address,
+    }
+
+    impl Host for TestHost {
+        fn caller(&self) -> Address {
+            self.caller
+        }
+
+        fn contract_address(&self) -> Address {
+            [0xCD; 32]
+        }
+
+        fn block_height(&self) -> u64 {
+            42
+        }
+
+        fn timestamp(&self) -> u64 {
+            1234
+        }
+
+        fn balance_of(&self, _addr: &Address) -> u128 {
+            0
+        }
+
+        fn transfer(
+            &mut self,
+            _from: &Address,
+            _to: &Address,
+            _amount: u128,
+        ) -> kvnc_common::ContractResult<()> {
+            Ok(())
+        }
+
+        fn emit_event(&mut self, _topic: &[u8], _data: &[u8]) {}
+
+        fn storage_get(&self, _key: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn storage_set(&mut self, _key: &[u8], _value: &[u8]) {}
+    }
+
+    #[derive(Clone, Copy)]
+    struct ModuleOptions {
+        memory: bool,
+        alloc_export: bool,
+        dealloc_export: bool,
+        entry_export: bool,
+        caller_import: bool,
+        initial_pages: u32,
+    }
+
+    impl Default for ModuleOptions {
+        fn default() -> Self {
+            Self {
+                memory: true,
+                alloc_export: true,
+                dealloc_export: true,
+                entry_export: true,
+                caller_import: false,
+                initial_pages: 1,
+            }
+        }
+    }
+
+    /// Build a minimal module using the runtime's `(i32, i32) -> i64` entry
+    /// ABI. Defined function indices are alloc, dealloc, and entry, after any
+    /// optional imported host function.
+    fn test_module(entry_body: &[u8], options: ModuleOptions) -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+
+        // Types: entry, alloc, dealloc, and kvnc_caller.
+        let mut types = vec![4];
+        types.extend([0x60, 2, 0x7f, 0x7f, 1, 0x7e]);
+        types.extend([0x60, 1, 0x7f, 1, 0x7f]);
+        types.extend([0x60, 2, 0x7f, 0x7f, 0]);
+        types.extend([0x60, 1, 0x7f, 0]);
+        append_section(&mut wasm, 1, &types);
+
+        if options.caller_import {
+            let mut imports = vec![1];
+            append_name(&mut imports, "env");
+            append_name(&mut imports, "kvnc_caller");
+            imports.extend([0, 3]); // function import, type index 3
+            append_section(&mut wasm, 2, &imports);
+        }
+
+        append_section(&mut wasm, 3, &[3, 1, 2, 0]);
+
+        if options.memory {
+            let mut memory = vec![1, 0]; // one memory, limits with minimum only
+            append_u32(&mut memory, options.initial_pages);
+            append_section(&mut wasm, 5, &memory);
+        }
+
+        let imported_functions = u32::from(options.caller_import);
+        let mut exports = Vec::new();
+        let mut export_count = 0;
+        if options.memory {
+            append_name(&mut exports, "memory");
+            exports.extend([2, 0]);
+            export_count += 1;
+        }
+        if options.alloc_export {
+            append_name(&mut exports, "kvnc_alloc");
+            exports.push(0);
+            append_u32(&mut exports, imported_functions);
+            export_count += 1;
+        }
+        if options.dealloc_export {
+            append_name(&mut exports, "kvnc_dealloc");
+            exports.push(0);
+            append_u32(&mut exports, imported_functions + 1);
+            export_count += 1;
+        }
+        if options.entry_export {
+            append_name(&mut exports, "entry");
+            exports.push(0);
+            append_u32(&mut exports, imported_functions + 2);
+            export_count += 1;
+        }
+        if export_count > 0 {
+            let mut section = Vec::new();
+            append_u32(&mut section, export_count);
+            section.extend(exports);
+            append_section(&mut wasm, 7, &section);
+        }
+
+        let mut alloc_body = vec![0, 0x41]; // i32.const 64; end
+        append_i32(&mut alloc_body, 64);
+        alloc_body.push(0x0b);
+        let dealloc_body = [0, 0x0b]; // end
+        let mut code = vec![3];
+        for body in [&alloc_body[..], &dealloc_body[..], entry_body] {
+            append_u32(&mut code, body.len() as u32);
+            code.extend(body);
+        }
+        append_section(&mut wasm, 10, &code);
+        wasm
+    }
+
+    fn append_section(wasm: &mut Vec<u8>, id: u8, payload: &[u8]) {
+        wasm.push(id);
+        append_u32(wasm, payload.len() as u32);
+        wasm.extend(payload);
+    }
+
+    fn append_name(out: &mut Vec<u8>, name: &str) {
+        append_u32(out, name.len() as u32);
+        out.extend(name.as_bytes());
+    }
+
+    fn append_u32(out: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn append_i64(out: &mut Vec<u8>, mut value: i64) {
+        loop {
+            let byte = (value as u8) & 0x7f;
+            value >>= 7;
+            let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+            out.push(if done { byte } else { byte | 0x80 });
+            if done {
+                break;
+            }
+        }
+    }
+
+    fn append_i32(out: &mut Vec<u8>, mut value: i32) {
+        loop {
+            let byte = (value as u8) & 0x7f;
+            value >>= 7;
+            let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+            out.push(if done { byte } else { byte | 0x80 });
+            if done {
+                break;
+            }
+        }
+    }
+
+    fn execute(
+        wasm: &[u8],
+        args: &[u8],
+        config: &ExecutionConfig,
+        host: &mut TestHost,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let runtime = Runtime::new();
+        let module = runtime.compile(wasm)?;
+        runtime.execute(&module, "entry", args, config, host)
+    }
+
+    fn generous_config() -> ExecutionConfig {
+        ExecutionConfig {
+            gas_limit: 100_000,
+            memory_limit_pages: 2,
+        }
+    }
+
+    #[test]
+    fn packed_success_returns_guest_bytes_and_receives_argument_bytes() {
+        // Return `(args_ptr << 32) | args_len` from the guest.
+        let body = [0, 0x20, 0, 0xad, 0x42, 32, 0x86, 0x20, 1, 0xad, 0x84, 0x0b];
+        let wasm = test_module(&body, ModuleOptions::default());
+        let args = b"argument bytes are copied into guest memory";
+        let result = execute(&wasm, args, &generous_config(), &mut TestHost::default())
+            .expect("guest should return its argument buffer");
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn packed_contract_error_codes_are_decoded() {
+        for ret in (-12..=-1).rev() {
+            let mut body = vec![0, 0x42]; // no locals; i64.const
+            append_i64(&mut body, ret);
+            body.push(0x0b);
+            let wasm = test_module(&body, ModuleOptions::default());
+            let error = execute(&wasm, &[], &generous_config(), &mut TestHost::default())
+                .expect_err("negative ABI error return must reject the call");
+            assert!(
+                matches!(error, RuntimeError::Contract(code) if code == (-1 - ret) as i32),
+                "return {ret} decoded incorrectly: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn low_gas_rejects_an_infinite_guest_loop() {
+        let body = [0, 0x03, 0x40, 0x0c, 0, 0x0b, 0x42, 0, 0x0b];
+        let wasm = test_module(&body, ModuleOptions::default());
+        let config = ExecutionConfig {
+            gas_limit: 100,
+            memory_limit_pages: 1,
+        };
+        let error = execute(&wasm, &[], &config, &mut TestHost::default())
+            .expect_err("the loop must exhaust its fuel");
+        assert!(matches!(error, RuntimeError::OutOfGas), "{error:?}");
+    }
+
+    #[test]
+    fn required_exports_are_reported_as_missing() {
+        let body = [0, 0x42, 0, 0x0b];
+        let options = ModuleOptions {
+            entry_export: false,
+            ..ModuleOptions::default()
+        };
+        let wasm = test_module(&body, options);
+        let error = execute(&wasm, &[], &generous_config(), &mut TestHost::default())
+            .expect_err("missing entry point must be rejected");
+        assert!(matches!(error, RuntimeError::MissingExport(name) if name == "entry"));
+
+        let options = ModuleOptions {
+            memory: false,
+            ..ModuleOptions::default()
+        };
+        let wasm = test_module(&body, options);
+        let error = execute(&wasm, &[], &generous_config(), &mut TestHost::default())
+            .expect_err("missing memory must be rejected");
+        assert!(matches!(error, RuntimeError::MissingExport(name) if name == "memory"));
+
+        let options = ModuleOptions {
+            alloc_export: false,
+            ..ModuleOptions::default()
+        };
+        let wasm = test_module(&body, options);
+        let error = execute(
+            &wasm,
+            b"non-empty",
+            &generous_config(),
+            &mut TestHost::default(),
+        )
+        .expect_err("missing allocator must be rejected for non-empty arguments");
+        assert!(matches!(error, RuntimeError::MissingExport(name) if name == "kvnc_alloc"));
+    }
+
+    #[test]
+    fn guest_can_call_host_caller_import() {
+        let mut body = vec![0, 0x41];
+        append_i32(&mut body, 128);
+        body.extend([0x10, 0]); // caller(128)
+        body.push(0x42);
+        append_i64(&mut body, (128_i64 << 32) | 32);
+        body.push(0x0b);
+        let options = ModuleOptions {
+            caller_import: true,
+            ..ModuleOptions::default()
+        };
+        let wasm = test_module(&body, options);
+        let mut host = TestHost { caller: [0xAB; 32] };
+        let result = execute(&wasm, &[], &generous_config(), &mut host)
+            .expect("kvnc_caller should be linked and callable");
+        assert_eq!(result, [0xAB; 32]);
+    }
+
+    #[test]
+    fn memory_grow_is_limited_by_configured_page_cap() {
+        // Request one additional page from a module that starts with one page;
+        // the store is configured with a one-page maximum.
+        let body = [0, 0x41, 1, 0x40, 0, 0x1a, 0x42, 0, 0x0b];
+        let wasm = test_module(&body, ModuleOptions::default());
+        let config = ExecutionConfig {
+            gas_limit: 10_000,
+            memory_limit_pages: 1,
+        };
+        let error = execute(&wasm, &[], &config, &mut TestHost::default())
+            .expect_err("memory.grow past the configured page cap must trap");
+        assert!(
+            matches!(error, RuntimeError::Execution(_)),
+            "memory limiter should reject growth as an execution trap: {error:?}"
+        );
+    }
+}

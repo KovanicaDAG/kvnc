@@ -229,13 +229,14 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 10: RPC API (kvnc-rpc)
 
-### [ ] 10.1 JSON-RPC Methods (Standard + KVNC-specific)
-- [ ] **Chain**: `kvnc_blockNumber`, `kvnc_getBlockByHash`, `kvnc_getBlockByNumber`
-- [ ] **Transactions**: `kvnc_sendRawTransaction`, `kvnc_getTransactionReceipt`, `kvnc_getTransactionByHash`
-- [ ] **Accounts**: `kvnc_getBalance`, `kvnc_getNonce`, `kvnc_getCode`, `kvnc_getStorageAt`
-- [ ] **Staking**: `kvnc_getValidators`, `kvnc_getStake`, `kvnc_getRewards`
-- [ ] **Mempool**: `kvnc_getPendingTransactions`, `kvnc_estimateFee`
-- [ ] **Consensus**: `kvnc_getLeaderSchedule`, `kvnc_getCommittee`
+### [x] 10.1 JSON-RPC Methods (Standard + KVNC-specific)
+- [x] **Chain**: `kvnc_blockNumber`, `kvnc_getBlockByHash`, `kvnc_getBlockByNumber`
+- [x] **Transactions**: `kvnc_sendRawTransaction`, `kvnc_getTransactionReceipt`, `kvnc_getTransactionByHash`
+- [x] **Accounts**: `kvnc_getBalance`, `kvnc_getNonce`, `kvnc_getCode`, `kvnc_getStorageAt`
+- [x] **Staking**: `kvnc_getValidators`, `kvnc_getStake`, `kvnc_getRewards`
+- [x] **Mempool**: `kvnc_getPendingTransactions`, `kvnc_estimateFee`
+- [x] **Consensus**: `kvnc_getLeaderSchedule`, `kvnc_getCommittee`
+- [x] **Contracts**: 16 contract methods (htlc/vault/multisig/token)
 
 ### [ ] 10.2 WebSocket Support
 - [ ] **Subscriptions**: `newHeads`, `logs`, `pendingTransactions`, `newCommittedLeader`
@@ -249,18 +250,18 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 11: CLI (kvnc-cli)
 
 ### [ ] 11.1 Wallet Operations
-- [ ] **Keygen**: Generate + save encrypted keystore
-- [ ] **Import/Export**: Private key, mnemonic
-- [ ] **Sign**: Offline transaction signing
+- [ ] **Keygen**: Generate + save encrypted keystore (partial: passphrase XOR obfuscation is not secure encryption; replace with AEAD)
+- [ ] **Import/Export**: Private key, mnemonic (partial: private-key import/export implemented; mnemonic support absent)
+- [x] **Sign**: Offline transaction signing
 
 ### [ ] 11.2 Node Operations
-- [ ] **Status**: Sync status, peer count, latest block
+- [ ] **Status**: Sync status, peer count, latest block (partial: latest block/committee; sync and peer count absent)
 - [ ] **Staking**: `stake`, `unstake`, `delegate`, `claim-rewards`
 - [ ] **Governance**: `propose`, `vote` (future)
 
-### [ ] 11.3 Output Formats
-- [ ] **JSON output**: `--json` flag for all commands
-- [ ] **Table output**: Human-readable default
+### [x] 11.3 Output Formats
+- [x] **JSON output**: `--json` flag for all commands
+- [x] **Table output**: Human-readable default
 
 ---
 
@@ -270,7 +271,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [x] **kvnc-staking**: All tokenomics math (✓ mostly done)
 - [ ] **kvnc-consensus**: Commit rules, linearizer
 - [x] **kvnc-execution**: Transaction application, reward distribution (6 tests)
-- [ ] **kvnc-runtime**: WASM execution, gas metering
+- [x] **kvnc-runtime**: WASM execution, gas metering (6 tests: ABI, errors, fuel, exports, host import, memory limits)
 - [x] **kvnc-dag**: Block validation, parent selection (1 test)
 
 ### [ ] 12.2 Integration Tests
@@ -280,7 +281,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ### [ ] 12.3 Property-Based Tests
 - [ ] **Consensus invariants**: Safety (no conflicting commits), liveness (progress)
-- [ ] **Tokenomics invariants**: Supply ≤ cap, rewards match schedule
+- [x] **Tokenomics invariants**: Supply ≤ cap, rewards match schedule (3 proptests, 256 cases each)
 - [ ] **State transitions**: Deterministic replay from genesis
 
 ### [ ] 12.4 Load/Stress Tests

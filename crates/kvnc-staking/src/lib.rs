@@ -395,6 +395,7 @@ impl StakingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn initial_reward_is_10_kvnc() {
@@ -475,6 +476,90 @@ mod tests {
         let years = committed_leader_height / BLOCKS_PER_YEAR;
         let vested = years.saturating_mul(TREASURY_ANNUAL);
         vested.min(TREASURY_TOTAL)
+    }
+
+    /// Independent schedule oracle: each era applies the rational decay to the
+    /// preceding integer reward and rounds down to whole atoms at that era.
+    /// The property bounds the era count, so this u128 calculation cannot
+    /// overflow and does not rely on the production constants or function.
+    fn reference_block_reward(era: u64) -> u64 {
+        let mut reward = 10_000_000_000u128;
+        for _ in 0..era {
+            reward = reward * 3 / 4;
+        }
+        reward as u64
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn block_reward_matches_independent_geometric_schedule(
+            era in 0u64..=100,
+            offset in 0u64..SUBSIDY_ERA_BLOCKS,
+        ) {
+            let height = era * SUBSIDY_ERA_BLOCKS + offset;
+
+            prop_assert_eq!(block_reward(height), reference_block_reward(era));
+        }
+
+        #[test]
+        fn cumulative_issuance_is_bounded_for_every_u64_height(height in any::<u64>()) {
+            prop_assert!(
+                cumulative_mining_issuance(height) <= MINING_SUBSIDY_BUDGET,
+                "height {height}"
+            );
+        }
+
+        #[test]
+        fn committed_leader_rewards_keep_circulating_supply_under_cap(
+            start_height in prop_oneof![
+                Just(0u64),
+                Just(SUBSIDY_ERA_BLOCKS - 1),
+                Just(8 * BLOCKS_PER_YEAR),
+                Just(100 * SUBSIDY_ERA_BLOCKS),
+                0u64..=(100 * SUBSIDY_ERA_BLOCKS),
+            ],
+            validator_count in 1usize..=4,
+            payout_seed in any::<u8>(),
+            authors in prop::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let mut state = StakingState::new();
+            state.init_treasury(Address([payout_seed; 32]));
+
+            for index in 0..validator_count {
+                let address_byte = payout_seed.wrapping_add(index as u8);
+                let validator = Address([address_byte; 32]);
+                let payout = Address([address_byte.wrapping_add(128); 32]);
+                state
+                    .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout))
+                    .expect("generated validator setup is valid");
+            }
+
+            // Seed a schedule-consistent state at an arbitrary height. The
+            // exact 100-era case exercises supply close to the cap after the
+            // treasury has fully vested.
+            state.committed_leader_height = start_height;
+            state.total_mining_issued = cumulative_mining_issuance(start_height);
+            state
+                .treasury
+                .as_mut()
+                .expect("treasury was initialized")
+                .advance(start_height);
+            prop_assert!(state.circulating_supply() <= TOTAL_SUPPLY);
+
+            for author in authors {
+                let authority_index = (author as usize % validator_count) as u16;
+                state
+                    .on_leader_committed(authority_index)
+                    .expect("generated authority index exists");
+                prop_assert!(
+                    state.circulating_supply() <= TOTAL_SUPPLY,
+                    "height {}",
+                    state.committed_leader_height
+                );
+            }
+        }
     }
 
     #[test]
