@@ -9,6 +9,17 @@ kvnc-types = { path = "../kvnc-types" }
 kvnc-runtime = { path = "../kvnc-runtime" }
 kvnc-staking = { path = "../kvnc-staking" }
 kvnc-consensus = { path = "../kvnc-consensus" }
+kvnc-storage = { path = "../kvnc-storage" }
+kvnc-common = { path = "../kvnc-common" }
+kvnc-htlc = { path = "../kvnc-htlc" }
+kvnc-vault = { path = "../kvnc-vault" }
+kvnc-multisig = { path = "../kvnc-multisig" }
+kvnc-token = { path = "../kvnc-token" }
+bincode = { workspace = true }
+redb = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"

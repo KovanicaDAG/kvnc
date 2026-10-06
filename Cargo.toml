@@ -14,6 +14,11 @@ members = [
     "crates/kvnc-node",
     "crates/kvnc-cli",
     "crates/kvnc-rpc",
+    "crates/kvnc-common",
+    "crates/kvnc-htlc",
+    "crates/kvnc-vault",
+    "crates/kvnc-multisig",
+    "crates/kvnc-token",
 ]
 
 [workspace.package]

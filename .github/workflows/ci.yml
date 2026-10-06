@@ -35,6 +35,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Required by the wasmi contract e2e test (kvnc-execution), which
+          # builds kvnc-token for wasm32-unknown-unknown; without the target
+          # the test skips and the wasm path is never exercised in CI.
+          targets: wasm32-unknown-unknown
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Run tests

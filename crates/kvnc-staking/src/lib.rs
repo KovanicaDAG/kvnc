@@ -8,6 +8,10 @@
 //! - Initial block reward: 10 KVNC (paid to the author of a committed leader block)
 //! - Decay: × 3/4 every 2_050_000 blocks
 //! - Active validators: 15–21
+//!
+//! All canonical numbers above are shared with the tokenomics skeleton
+//! (`kvnc-skeleton/staking/src/lib.rs`); this crate keeps them as `u64`
+//! (the storage wire format). Cross-checked by the unit tests in this file.
 
 #![deny(unsafe_code)]
 
@@ -43,9 +47,13 @@ pub const BLOCKS_PER_YEAR: u64 = 15_768_000;
 pub const MINING_SUBSIDY_BUDGET: u64 = TOTAL_SUPPLY - FOUNDER_PREMINE - TREASURY_TOTAL; // ~82M
 
 /// Initial block reward: 10 KVNC.
+///
+/// (Skeleton name: `INITIAL_REWARD` — same value.)
 pub const INITIAL_BLOCK_REWARD: u64 = 10 * ONE_KVNC;
 
 /// Subsidy era length in blocks (chosen so cumulative issuance ≈ 82M).
+///
+/// (Skeleton name: `ERA_LENGTH` — same value: 2_050_000.)
 pub const SUBSIDY_ERA_BLOCKS: u64 = 2_050_000;
 
 /// Decay factor numerator / denominator = 3/4.
@@ -59,10 +67,18 @@ pub const DECAY_DEN: u64 = 4;
 /// Minimum stake required to become a validator (in base units).
 pub const MIN_VALIDATOR_STAKE: Stake = 50_000 * ONE_KVNC; // 50 000 KVNC
 
+/// Minimum number of active validators (target range 15–21).
+///
+/// The set is considered under-provisioned below this size; new validators
+/// should be admitted while active count < `MAX_ACTIVE_VALIDATORS`.
+pub const MIN_ACTIVE_VALIDATORS: u32 = 15;
+
 /// Maximum number of active validators (target range 15-21).
 pub const MAX_ACTIVE_VALIDATORS: usize = 21;
 
 /// Unbonding period in rounds (approximate – will be mapped to time later).
+///
+/// (Skeleton name: `UNBONDING_PERIOD` — same value: 100_000 rounds.)
 pub const UNBONDING_ROUNDS: u64 = 100_000;
 
 // ============================================================
@@ -407,5 +423,154 @@ mod tests {
         let claimed = treasury.claim(TREASURY_ANNUAL).unwrap();
         assert_eq!(claimed, TREASURY_ANNUAL);
         assert_eq!(treasury.available(), TREASURY_ANNUAL);
+    }
+
+    // ------------------------------------------------------------
+    // Skeleton parity (`kvnc-skeleton/staking/src/lib.rs`)
+    // ------------------------------------------------------------
+
+    /// Reference copy of the skeleton's `block_reward`, computed in `u128`.
+    /// The canonical `block_reward` above is `u64`; they must agree.
+    fn skeleton_block_reward(committed_leader_height: u64) -> u64 {
+        let era = committed_leader_height / SUBSIDY_ERA_BLOCKS;
+        let mut reward: u128 = 10 * 1_000_000_000;
+        for _ in 0..era {
+            reward = reward.saturating_mul(3) / 4;
+            if reward == 0 {
+                break;
+            }
+        }
+        reward as u64
+    }
+
+    /// Reference copy of the skeleton's `treasury_vested(h)`:
+    /// linear 1M KVNC/year over 8 years, measured from height 0.
+    fn skeleton_treasury_vested(committed_leader_height: u64) -> u64 {
+        let years = committed_leader_height / BLOCKS_PER_YEAR;
+        let vested = years.saturating_mul(TREASURY_ANNUAL);
+        vested.min(TREASURY_TOTAL)
+    }
+
+    #[test]
+    fn canonical_values_match_skeleton() {
+        assert_eq!(DECIMALS, 9);
+        assert_eq!(ONE_KVNC, 1_000_000_000);
+        assert_eq!(TOTAL_SUPPLY, 90_200_000 * ONE_KVNC);
+        assert_eq!(FOUNDER_PREMINE, 200_000 * ONE_KVNC);
+        assert_eq!(TREASURY_TOTAL, 8_000_000 * ONE_KVNC);
+        assert_eq!(TREASURY_ANNUAL, 1_000_000 * ONE_KVNC);
+        assert_eq!(MINING_SUBSIDY_BUDGET, 82_000_000 * ONE_KVNC);
+        assert_eq!(INITIAL_BLOCK_REWARD, 10 * ONE_KVNC); // skeleton INITIAL_REWARD
+        assert_eq!(SUBSIDY_ERA_BLOCKS, 2_050_000); // skeleton ERA_LENGTH
+        assert_eq!((DECAY_NUM, DECAY_DEN), (3, 4));
+        assert_eq!(BLOCKS_PER_YEAR, 15_768_000);
+        assert_eq!(MIN_VALIDATOR_STAKE, 50_000 * ONE_KVNC);
+        assert_eq!(MIN_ACTIVE_VALIDATORS, 15);
+        assert_eq!(MAX_ACTIVE_VALIDATORS, 21);
+        assert_eq!(UNBONDING_ROUNDS, 100_000); // skeleton UNBONDING_PERIOD
+    }
+
+    #[test]
+    fn reward_schedule_matches_skeleton() {
+        // Era 0 → 10 KVNC, boundary of era 0 → 10 KVNC,
+        // era 1 → 7.5 KVNC after the 3/4 decay, plus later eras.
+        let heights = [
+            0u64,
+            SUBSIDY_ERA_BLOCKS - 1,
+            SUBSIDY_ERA_BLOCKS,
+            2 * SUBSIDY_ERA_BLOCKS,
+            3 * SUBSIDY_ERA_BLOCKS + 12_345,
+        ];
+        for h in heights {
+            assert_eq!(block_reward(h), skeleton_block_reward(h), "height {h}");
+        }
+        assert_eq!(block_reward(0), 10 * ONE_KVNC);
+        assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS), 7_500_000_000); // 7.5 KVNC
+    }
+
+    #[test]
+    fn treasury_vesting_matches_skeleton() {
+        let treasury = TreasuryState::new(Address::default(), 0);
+        let heights = [
+            0u64,
+            BLOCKS_PER_YEAR - 1,
+            BLOCKS_PER_YEAR,
+            BLOCKS_PER_YEAR + 1,
+            7 * BLOCKS_PER_YEAR + BLOCKS_PER_YEAR / 2,
+            8 * BLOCKS_PER_YEAR,
+            9 * BLOCKS_PER_YEAR,
+            100 * BLOCKS_PER_YEAR,
+        ];
+        for h in heights {
+            assert_eq!(
+                treasury.expected_vested(h),
+                skeleton_treasury_vested(h),
+                "height {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_issuance_never_exceeds_budget() {
+        // Naive per-height sum of block_reward over the first 3 full eras
+        // must agree with cumulative_mining_issuance and stay in budget.
+        let three_eras = 3 * SUBSIDY_ERA_BLOCKS;
+        let naive: u64 = (0..three_eras).map(block_reward).sum();
+        assert_eq!(naive, cumulative_mining_issuance(three_eras));
+        assert!(naive <= MINING_SUBSIDY_BUDGET);
+
+        // Full schedule: sum each era's reward until it decays to zero.
+        // The geometric series 10 KVNC × 2_050_000 × 1/(1 − 3/4) equals
+        // exactly 82M KVNC; floor-truncation keeps the real sum just below.
+        let mut naive_full = 0u64;
+        let mut era = 0u64;
+        loop {
+            let reward = block_reward(era * SUBSIDY_ERA_BLOCKS);
+            if reward == 0 {
+                break;
+            }
+            naive_full = naive_full.saturating_add(reward.saturating_mul(SUBSIDY_ERA_BLOCKS));
+            era += 1;
+        }
+        assert!(naive_full <= MINING_SUBSIDY_BUDGET);
+        assert!(naive_full > MINING_SUBSIDY_BUDGET * 99 / 100);
+
+        // Spot checks at various heights, including a pathological one.
+        for h in [
+            0u64,
+            SUBSIDY_ERA_BLOCKS,
+            40 * SUBSIDY_ERA_BLOCKS,
+            200 * SUBSIDY_ERA_BLOCKS,
+            u64::MAX,
+        ] {
+            assert!(
+                cumulative_mining_issuance(h) <= MINING_SUBSIDY_BUDGET,
+                "height {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn leader_reward_goes_to_payout_address() {
+        let mut state = StakingState::new();
+        let validator = Address([1u8; 32]);
+        let payout = Address([2u8; 32]);
+        state
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .unwrap();
+
+        let outcome = state.on_leader_committed(0).unwrap();
+        assert_eq!(outcome.recipient, payout);
+        assert_ne!(outcome.recipient, validator);
+        assert_eq!(outcome.amount, block_reward(0));
+        assert_eq!(outcome.height, 0);
+        assert_eq!(state.total_mining_issued, outcome.amount);
+        assert_eq!(state.committed_leader_height, 1);
+
+        // Unknown authority index must not mint.
+        assert!(matches!(
+            state.on_leader_committed(9),
+            Err(StakingError::NotValidator)
+        ));
     }
 }

@@ -103,6 +103,26 @@ Capped at `TOTAL_SUPPLY`.
 | Reward application on commit| `kvnc-execution::ExecutionContext`      |
 | CommittedSubDag             | `kvnc-consensus`                        |
 
+### 7.1 Canonical constants (`crates/kvnc-staking/src/lib.rs`)
+
+| Constant | Canonical value |
+|----------|-----------------|
+| `DECIMALS` / `ONE_KVNC` | 9 decimals, 1 KVNC = 1 000 000 000 base units |
+| `TOTAL_SUPPLY` | 90 200 000 KVNC (hard cap) |
+| `FOUNDER_PREMINE` | 200 000 KVNC |
+| `TREASURY_TOTAL` / `TREASURY_ANNUAL` / `TREASURY_YEARS` | 8 000 000 KVNC / 1 000 000 KVNC per year / 8 years (linear) |
+| `MINING_SUBSIDY_BUDGET` | 82 000 000 KVNC |
+| `INITIAL_BLOCK_REWARD` (s₀) | 10 KVNC per committed leader |
+| `SUBSIDY_ERA_BLOCKS` | 2 050 000 committed leaders per era |
+| `DECAY_NUM` / `DECAY_DEN` | × ¾ per era |
+| `BLOCKS_PER_YEAR` | 15 768 000 (treasury vesting conversion only) |
+| `MIN_VALIDATOR_STAKE` | 50 000 KVNC |
+| `MIN_ACTIVE_VALIDATORS` / `MAX_ACTIVE_VALIDATORS` | 15 / 21 |
+| `UNBONDING_ROUNDS` | 100 000 rounds |
+
+These values are cross-checked against the tokenomics skeleton
+(`kvnc-skeleton/staking/src/lib.rs`) by the unit tests in `kvnc-staking`.
+
 ---
 
 ## 8. Future Governance Hooks
