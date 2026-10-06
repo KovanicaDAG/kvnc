@@ -6,7 +6,15 @@ license.workspace = true
 
 [dependencies]
 kvnc-types = { path = "../kvnc-types" }
+kvnc-dag = { path = "../kvnc-dag" }
+kvnc-mempool = { path = "../kvnc-mempool" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+libp2p = { version = "0.54", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "ping"] }
+multiaddr = "0.12"
+futures = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+bincode = { workspace = true }
