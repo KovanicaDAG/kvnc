@@ -6,9 +6,16 @@ license.workspace = true
 
 [dependencies]
 kvnc-types = { path = "../kvnc-types" }
+kvnc-common = { path = "../kvnc-common" }
+kvnc-htlc = { path = "../kvnc-htlc" }
+kvnc-vault = { path = "../kvnc-vault" }
+kvnc-multisig = { path = "../kvnc-multisig" }
+kvnc-token = { path = "../kvnc-token" }
+kvnc-execution = { path = "../kvnc-execution" }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+bincode = { workspace = true }
