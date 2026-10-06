@@ -282,7 +282,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ### [ ] 12.3 Property-Based Tests
 - [ ] **Consensus invariants**: Safety (no conflicting commits), liveness (progress)
 - [x] **Tokenomics invariants**: Supply ≤ cap, rewards match schedule (3 proptests, 256 cases each)
-- [ ] **State transitions**: Deterministic replay from genesis
+- [x] **State transitions**: Deterministic replay from genesis (staking/reward execution; account/contract replay not covered)
 
 ### [ ] 12.4 Load/Stress Tests
 - [ ] **TPS benchmark**: Target 100+ TPS on 2GB RAM

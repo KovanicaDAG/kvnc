@@ -211,15 +211,66 @@ mod tests {
     use kvnc_types::{Signature, StatementBlock};
 
     fn sample_block(author: u16) -> StatementBlock {
+        sample_block_at(author, 1)
+    }
+
+    fn sample_block_at(author: u16, round: u64) -> StatementBlock {
         StatementBlock {
             author,
-            round: 1,
+            round,
             parents: Vec::new(),
             transactions: Vec::new(),
             statements: Vec::new(),
             signature: Signature([0u8; 64]),
             digest: kvnc_types::Hash::zero(),
         }
+    }
+
+    fn sample_committed_subdag(round: u64, author: u16) -> CommittedSubDag {
+        let leader = sample_block_at(author, round);
+        CommittedSubDag {
+            blocks: vec![leader.clone()],
+            leader,
+            leader_round: round,
+            leader_author: author,
+        }
+    }
+
+    fn genesis_staking_state() -> StakingState {
+        let mut state = StakingState::new();
+        state.init_treasury(Address([42u8; 32]));
+        for i in 0..3u8 {
+            state
+                .join_validator(
+                    Address([i + 1; 32]),
+                    kvnc_staking::MIN_VALIDATOR_STAKE,
+                    0,
+                    Some(Address([i + 11; 32])),
+                )
+                .expect("genesis validator");
+        }
+        state
+    }
+
+    fn staking_state_bytes(state: &StakingState) -> Vec<u8> {
+        bincode::serialize(state).expect("serialize staking state")
+    }
+
+    fn load_staking_state(storage: &Storage) -> StakingState {
+        let txn = storage.begin_read().expect("read txn");
+        storage
+            .state()
+            .load_staking_state(&txn)
+            .expect("persisted staking state")
+    }
+
+    fn persist_initial_staking_state(storage: &Storage, state: &StakingState) {
+        let txn = storage.begin_write().expect("write txn");
+        storage
+            .state()
+            .save_staking_state(&txn, state)
+            .expect("save initial staking state");
+        txn.commit().expect("commit initial staking state");
     }
 
     fn read_balance(storage: &Storage, address: &Address) -> u64 {
@@ -306,6 +357,158 @@ mod tests {
             read_balance(&storage, &payout),
             reward.amount + reward2.amount,
             "failed commit credits nothing"
+        );
+    }
+
+    #[test]
+    fn committed_leader_replay_is_deterministic_from_genesis() {
+        // This exercises the implemented staking/reward transition only. Native
+        // transactions and WASM calls remain placeholders in execution, so this
+        // is not a claim of full account or contract state replay.
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        let storage_a = Storage::new(dir_a.path().join("replay.redb")).expect("storage a");
+        let storage_b = Storage::new(dir_b.path().join("replay.redb")).expect("storage b");
+
+        let genesis = genesis_staking_state();
+        let genesis_bytes = staking_state_bytes(&genesis);
+        let mut context_a = ExecutionContext {
+            staking: bincode::deserialize(&genesis_bytes).expect("genesis state a"),
+        };
+        let mut context_b = ExecutionContext {
+            staking: bincode::deserialize(&genesis_bytes).expect("genesis state b"),
+        };
+        persist_initial_staking_state(&storage_a, &context_a.staking);
+        persist_initial_staking_state(&storage_b, &context_b.staking);
+
+        // These minimal committed-subdag fixtures provide execution with the
+        // committed leader authors/rounds; they do not run or model consensus.
+        let replay = [
+            sample_committed_subdag(1, 0),
+            sample_committed_subdag(2, 1),
+            sample_committed_subdag(3, 2),
+            sample_committed_subdag(4, 1),
+            sample_committed_subdag(5, 0),
+        ];
+        let payout_addresses = [
+            Address([11u8; 32]),
+            Address([12u8; 32]),
+            Address([13u8; 32]),
+        ];
+        let mut rewards_a = Vec::new();
+        let mut rewards_b = Vec::new();
+
+        for subdag in &replay {
+            let result_a = context_a
+                .execute_committed_subdag(subdag, &storage_a)
+                .expect("replay on context a");
+            let result_b = context_b
+                .execute_committed_subdag(subdag, &storage_b)
+                .expect("replay on context b");
+
+            let reward_a = result_a.reward.expect("reward a");
+            let reward_b = result_b.reward.expect("reward b");
+            assert_eq!(
+                (
+                    reward_a.leader_author,
+                    reward_a.recipient,
+                    reward_a.amount,
+                    reward_a.height
+                ),
+                (
+                    reward_b.leader_author,
+                    reward_b.recipient,
+                    reward_b.amount,
+                    reward_b.height
+                ),
+                "reward outcome must match after every committed leader"
+            );
+            assert_eq!(result_a.circulating_supply, result_b.circulating_supply);
+            assert_eq!(
+                context_a.staking.committed_leader_height,
+                context_b.staking.committed_leader_height
+            );
+            assert_eq!(
+                context_a.staking.total_mining_issued,
+                context_b.staking.total_mining_issued
+            );
+            assert_eq!(
+                context_a.staking.circulating_supply(),
+                context_b.staking.circulating_supply()
+            );
+            assert_eq!(
+                staking_state_bytes(&context_a.staking),
+                staking_state_bytes(&context_b.staking),
+                "in-memory staking states must match after every committed leader"
+            );
+
+            // Reload the committed states on both sides to include the available
+            // storage persistence path in the deterministic replay check.
+            context_a.staking = load_staking_state(&storage_a);
+            context_b.staking = load_staking_state(&storage_b);
+            assert_eq!(
+                staking_state_bytes(&context_a.staking),
+                staking_state_bytes(&context_b.staking),
+                "reloaded staking states must match after every committed leader"
+            );
+            assert_eq!(
+                (
+                    context_a.staking.committed_leader_height,
+                    context_a.staking.total_mining_issued
+                ),
+                (
+                    context_b.staking.committed_leader_height,
+                    context_b.staking.total_mining_issued
+                )
+            );
+            assert_eq!(
+                context_a.staking.circulating_supply(),
+                context_b.staking.circulating_supply()
+            );
+            assert_eq!(
+                read_balance(&storage_a, &reward_a.recipient),
+                read_balance(&storage_b, &reward_b.recipient),
+                "matching reward recipients must have matching persisted payouts"
+            );
+            for address in payout_addresses {
+                assert_eq!(
+                    read_balance(&storage_a, &address),
+                    read_balance(&storage_b, &address),
+                    "all validator payout balances must match"
+                );
+            }
+
+            rewards_a.push((
+                reward_a.leader_author,
+                reward_a.recipient,
+                reward_a.amount,
+                reward_a.height,
+            ));
+            rewards_b.push((
+                reward_b.leader_author,
+                reward_b.recipient,
+                reward_b.amount,
+                reward_b.height,
+            ));
+        }
+
+        assert_eq!(rewards_a, rewards_b, "final reward sequence must match");
+        assert_eq!(
+            staking_state_bytes(&context_a.staking),
+            staking_state_bytes(&context_b.staking),
+            "final persisted staking states must be byte-identical"
+        );
+        assert_eq!(
+            context_a.staking.committed_leader_height,
+            replay.len() as u64
+        );
+        assert_eq!(
+            context_a.staking.total_mining_issued,
+            rewards_a.iter().map(|(_, _, amount, _)| amount).sum()
+        );
+        assert_eq!(
+            context_a.staking.circulating_supply(),
+            context_b.staking.circulating_supply()
         );
     }
 
