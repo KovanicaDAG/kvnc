@@ -1,0 +1,44 @@
+# KVNC node configuration example.
+#
+# Copy this file to `config.toml` (or pass a path with `--config <file>`) and
+# adjust as needed. Any value can be overridden by an environment variable, which
+# is the recommended approach for containers:
+#
+#   data_dir          -> KVNC_DATA_DIR
+#   listen_addr       -> KVNC_LISTEN_ADDR
+#   rpc_addr          -> KVNC_RPC_ADDR
+#   rpc_port          -> KVNC_RPC_PORT
+#   bootnodes         -> KVNC_BOOTNODES        (comma-separated list)
+#   validator_key     -> KVNC_VALIDATOR_KEY
+#   round_duration_ms -> KVNC_ROUND_DURATION_MS
+#   max_peers         -> KVNC_MAX_PEERS
+#   treasury_address  -> KVNC_TREASURY_ADDRESS
+
+# Directory where chain data is stored (consensus.redb + state.redb).
+data_dir = "./data"
+
+# P2P listen address: either `host:port` or a full libp2p multiaddr.
+listen_addr = "0.0.0.0:9000"
+
+# JSON-RPC bind address and port.
+rpc_addr = "127.0.0.1"
+rpc_port = 8545
+
+# Bootstrap peers. A DNS seed name is preferred; never point these at a
+# Cloudflare-proxied (orange-cloud) hostname for TCP.
+bootnodes = ["seed.kovanica.online:9000"]
+
+# Path to a validator signing key file containing a 32-byte hex seed.
+# When omitted, the node generates an ephemeral key (not suitable for
+# production, since block rewards are paid to a throwaway identity).
+# validator_key = "/etc/kvnc/validator.key"
+
+# Target consensus round duration in milliseconds (2s block time).
+round_duration_ms = 2000
+
+# Maximum number of connected peers.
+max_peers = 50
+
+# Genesis treasury address as 32 bytes of hex. When omitted, the zero address is
+# used. Only read the first time the database is created (fresh genesis).
+# treasury_address = "<64 hex characters>"
