@@ -24,6 +24,7 @@ use kvnc_consensus::CommittedSubDag;
 use kvnc_staking::{RewardOutcome, StakingError, StakingState};
 use kvnc_storage::{Storage, StorageError};
 use kvnc_types::Address;
+use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -32,6 +33,9 @@ pub use contracts::{
     execute_contract_call, is_entry_point, ContractEvent, ContractHost, ContractRunner, WasmCall,
     ENTRY_POINTS,
 };
+
+const EXECUTED_SUBDAGS: TableDefinition<[u8; 32], u8> =
+    TableDefinition::new("execution_committed_subdags");
 
 #[derive(Error, Debug)]
 pub enum ExecutionError {
@@ -98,15 +102,29 @@ impl ExecutionContext {
     ///
     /// Ordering / atomicity notes:
     ///
-    /// - The storage write transaction is opened *before* the staking
-    ///   accounting: if `on_leader_committed` fails (unknown authority) the
+    /// - The storage write transaction is opened before candidate staking
+    ///   accounting: if the transition fails (unknown authority), the
     ///   transaction is dropped and storage is untouched.
-    /// - The staking state (committed_leader_height, total_mining_issued,
-    ///   treasury vesting) is persisted in the same transaction.
+    /// - The candidate staking state, payout, and executed-leader marker are
+    ///   written in the same transaction. The candidate is published in memory
+    ///   only after that transaction commits.
     pub fn execute_committed_subdag(
         &mut self,
         subdag: &CommittedSubDag,
         storage: &Storage,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        self.execute_committed_subdag_with_commit(subdag, storage, |txn| {
+            txn.commit()
+                .map_err(StorageError::Commit)
+                .map_err(ExecutionError::from)
+        })
+    }
+
+    fn execute_committed_subdag_with_commit(
+        &mut self,
+        subdag: &CommittedSubDag,
+        storage: &Storage,
+        commit: impl FnOnce(WriteTransaction) -> Result<(), ExecutionError>,
     ) -> Result<ExecutionResult, ExecutionError> {
         // 1. Apply transactions contained in the blocks (placeholder)
         let mut txs_applied = 0;
@@ -117,13 +135,46 @@ impl ExecutionContext {
 
         // 2. Pay the mining reward to the leader of this sub-DAG.
         let txn = storage.begin_write()?;
-        let reward = self.staking.on_leader_committed(subdag.leader_author)?;
+        {
+            let table = txn
+                .open_table(EXECUTED_SUBDAGS)
+                .map_err(StorageError::Table)?;
+            if table
+                .get(subdag.leader.digest.0)
+                .map_err(StorageError::Storage)?
+                .is_some()
+            {
+                return Ok(ExecutionResult {
+                    reward: None,
+                    txs_applied: 0,
+                    circulating_supply: self.staking.circulating_supply(),
+                });
+            }
+        }
+        // Perform the transition on a candidate state. The live in-memory state
+        // is published only after all related storage writes commit successfully.
+        let mut candidate_staking = StakingState {
+            validators: self.staking.validators.clone(),
+            delegations: self.staking.delegations.clone(),
+            total_staked: self.staking.total_staked,
+            committed_leader_height: self.staking.committed_leader_height,
+            total_mining_issued: self.staking.total_mining_issued,
+            treasury: self.staking.treasury.clone(),
+        };
+        let reward = candidate_staking.on_leader_committed(subdag.leader_author)?;
         storage
             .state()
             .add_balance(&txn, &reward.recipient, reward.amount)?;
         // Persist staking state (height, total_mining_issued, treasury vesting)
-        storage.state().save_staking_state(&txn, &self.staking)?;
-        txn.commit().map_err(StorageError::Commit)?;
+        storage
+            .state()
+            .save_staking_state(&txn, &candidate_staking)?;
+        txn.open_table(EXECUTED_SUBDAGS)
+            .map_err(StorageError::Table)?
+            .insert(subdag.leader.digest.0, 1)
+            .map_err(StorageError::Storage)?;
+        commit(txn)?;
+        self.staking = candidate_staking;
 
         info!(
             target: "kvnc-execution",
@@ -215,6 +266,7 @@ mod tests {
     }
 
     fn sample_block_at(author: u16, round: u64) -> StatementBlock {
+        let digest = StatementBlock::compute_digest(author, round, &[], &[]);
         StatementBlock {
             author,
             round,
@@ -222,7 +274,7 @@ mod tests {
             transactions: Vec::new(),
             statements: Vec::new(),
             signature: Signature([0u8; 64]),
-            digest: kvnc_types::Hash::zero(),
+            digest,
         }
     }
 
@@ -326,10 +378,18 @@ mod tests {
         assert_eq!(read_balance(&storage, &validator), 0);
         assert_eq!(read_balance(&storage, &Address([7u8; 32])), 0);
 
-        // A second commit pays the next height's reward on top.
+        // Duplicate delivery of the same committed leader is idempotent.
         let second = ctx
             .execute_committed_subdag(&subdag, &storage)
-            .expect("second commit");
+            .expect("duplicate delivery");
+        assert!(second.reward.is_none());
+        assert_eq!(read_balance(&storage, &payout), reward.amount);
+
+        // A different committed leader pays the next height's reward.
+        let next_subdag = sample_committed_subdag(2, 0);
+        let second = ctx
+            .execute_committed_subdag(&next_subdag, &storage)
+            .expect("next commit");
         let reward2 = second.reward.expect("second reward");
         assert_eq!(reward2.height, reward.height + 1, "height counter advances");
         assert_eq!(
@@ -358,6 +418,40 @@ mod tests {
             reward.amount + reward2.amount,
             "failed commit credits nothing"
         );
+    }
+
+    #[test]
+    fn failed_storage_commit_does_not_publish_candidate_staking_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("failed-commit.redb")).expect("storage");
+        let initial_staking = genesis_staking_state();
+        persist_initial_staking_state(&storage, &initial_staking);
+        let mut ctx = ExecutionContext {
+            staking: initial_staking,
+        };
+        let initial_bytes = staking_state_bytes(&ctx.staking);
+        let subdag = sample_committed_subdag(1, 0);
+
+        let err = ctx
+            .execute_committed_subdag_with_commit(&subdag, &storage, |_txn| {
+                Err(ExecutionError::Other("injected commit failure".into()))
+            })
+            .expect_err("injected storage commit failure");
+        assert!(matches!(err, ExecutionError::Other(_)));
+        assert_eq!(staking_state_bytes(&ctx.staking), initial_bytes);
+        assert_eq!(
+            staking_state_bytes(&load_staking_state(&storage)),
+            initial_bytes,
+            "the aborted write transaction must not persist state"
+        );
+        assert_eq!(read_balance(&storage, &Address([11; 32])), 0);
+
+        // Aborting left the leader unmarked, so replay can apply it exactly once.
+        let replay = ctx
+            .execute_committed_subdag(&subdag, &storage)
+            .expect("replay after failed persistence");
+        assert!(replay.reward.is_some());
+        assert_eq!(ctx.staking.committed_leader_height, 1);
     }
 
     #[test]
@@ -581,5 +675,40 @@ mod tests {
             .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
             .expect_err("claim without treasury must fail");
         assert!(matches!(err, ExecutionError::Other(_)));
+    }
+
+    #[test]
+    fn duplicate_delivery_after_restart_does_not_pay_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("restart.redb");
+        let subdag = sample_committed_subdag(1, 0);
+        let payout = Address([11u8; 32]);
+        let first_reward;
+
+        {
+            let storage = Storage::new(&path).expect("storage");
+            let mut context = ExecutionContext {
+                staking: genesis_staking_state(),
+            };
+            persist_initial_staking_state(&storage, &context.staking);
+            first_reward = context
+                .execute_committed_subdag(&subdag, &storage)
+                .expect("first delivery")
+                .reward
+                .expect("reward paid")
+                .amount;
+            assert_eq!(read_balance(&storage, &payout), first_reward);
+        }
+
+        let storage = Storage::new(&path).expect("reopened storage");
+        let mut context = ExecutionContext {
+            staking: load_staking_state(&storage),
+        };
+        let replay = context
+            .execute_committed_subdag(&subdag, &storage)
+            .expect("replayed delivery");
+        assert!(replay.reward.is_none());
+        assert_eq!(context.staking.committed_leader_height, 1);
+        assert_eq!(read_balance(&storage, &payout), first_reward);
     }
 }

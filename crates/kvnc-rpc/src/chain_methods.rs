@@ -547,7 +547,7 @@ pub async fn handle_get_leader_schedule(params: Value, state: RpcState) -> Resul
 pub async fn handle_get_committee(_params: Value, state: RpcState) -> Result<Value, RpcError> {
     let committee = &state.committee;
     let members: Vec<Value> = committee
-        .authorities
+        .authorities()
         .iter()
         .map(|a| {
             json!({
@@ -588,7 +588,8 @@ mod tests {
             mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
-            committee: CommitteeInfo::new(0, vec![authority]),
+            committee: CommitteeInfo::try_new(0, vec![authority]).expect("test committee is valid"),
+            peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -701,6 +702,49 @@ mod tests {
         assert_eq!(
             handle_estimate_fee(Value::Null, state).await.unwrap(),
             json!("0x1")
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_fee_uses_minimum_observed_rate_and_floor() {
+        let (_dir, storage) = open_storage();
+        let state = test_state(storage);
+        let low_rate_tx = Transaction {
+            sender: Address([1; 32]),
+            nonce: 0,
+            kind: TransactionKind::Transfer {
+                to: Address([2; 32]),
+                amount: 1,
+            },
+            fee: 1,
+            signature: kvnc_types::crypto::Signature([0; 64]),
+            hash: Hash([3; 32]),
+        };
+        let serialized_size = bincode::serialize(&low_rate_tx).unwrap().len() as u64;
+        let higher_rate_tx = Transaction {
+            fee: serialized_size * 4,
+            hash: Hash([4; 32]),
+            ..low_rate_tx.clone()
+        };
+
+        state
+            .mempool
+            .add_transaction(low_rate_tx)
+            .expect("admit nonzero-fee transaction");
+        state
+            .mempool
+            .add_transaction(higher_rate_tx)
+            .expect("admit higher-fee transaction");
+
+        assert_eq!(
+            state.mempool.stats().fee_rates,
+            vec![(0, 1), (4, 1)],
+            "fixture must contain distinct observed rates"
+        );
+        assert_eq!(
+            handle_estimate_fee(Value::Null, state).await.unwrap(),
+            json!("0x1"),
+            "the minimum observed zero rate is advisory and floored at 1 atom/byte"
         );
     }
 }

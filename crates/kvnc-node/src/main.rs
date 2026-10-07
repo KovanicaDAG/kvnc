@@ -165,7 +165,7 @@ where
             }
         }
     };
-    let committee = build_committee(&public_key, &validator_address, &config.listen_addr);
+    let committee = build_committee(&public_key, &validator_address, &config.listen_addr)?;
 
     // ------------------------------------------------------------------
     // 4. Networking
@@ -174,6 +174,7 @@ where
     let (network, network_events) =
         NetworkService::new(network_config, dag_store.clone(), mempool.clone())
             .context("creating network service")?;
+    let peer_count = network.peer_count_handle();
     let (network_cmd_tx, network_cmd_rx) = mpsc::unbounded_channel::<NetworkCommand>();
 
     // ------------------------------------------------------------------
@@ -190,6 +191,7 @@ where
         mempool: mempool.clone(),
         staking: Arc::new(tokio::sync::RwLock::new(staking_state)),
         committee: committee.clone(),
+        peer_count,
     };
     let rpc_server = RpcServer::new(rpc_socket, rpc_state).await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
@@ -197,16 +199,22 @@ where
     // ------------------------------------------------------------------
     // 6. Consensus engine
     // ------------------------------------------------------------------
-    // NOTE: `ConsensusEngine::start` installs its own ephemeral signing key and
-    // persists the blocks it proposes without gossiping them (the engine has no
-    // network handle). Both are `kvnc-consensus` TODOs; the node-side key and
-    // broadcast wiring above are ready for them.
+    // The node-provided validator identity remains authoritative in the block
+    // manager; consensus does not generate or replace a signing key.
     let block_manager = Arc::new(BlockManager::new(dag_store.clone()));
     block_manager.set_authority(0);
     block_manager.set_signing_key(signing_key.clone());
+    block_manager.set_authority_keys(
+        committee
+            .authorities()
+            .iter()
+            .map(|authority| (authority.index, authority.public_key))
+            .collect(),
+    );
     let engine = Arc::new(ConsensusEngine::new(
         ConsensusConfig {
             round_duration_ms: config.round_duration_ms,
+            use_mysticghost: config.use_mysticghost,
             ..Default::default()
         },
         committee,
@@ -216,23 +224,26 @@ where
         Arc::new(RwLock::new(NodeBlockManager {
             inner: block_manager.clone(),
         })),
+        signing_key.clone(),
     ));
 
     // ------------------------------------------------------------------
     // 7. Shutdown plumbing + task spawning
     // ------------------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // TODO: the consensus engine currently discards the `CommittedSubDag` it
-    // builds inside `round_loop`, so nothing is ever sent on this channel yet.
-    // Once `kvnc-consensus` exposes committed sub-DAGs (e.g. via a callback or
-    // channel), forward them here and the execution task will pick them up.
     let (exec_tx, exec_rx) = mpsc::unbounded_channel::<kvnc_consensus::CommittedSubDag>();
+    engine.set_commit_sender(exec_tx.clone());
+    for subdag in recover_committed_subdags(&dag_store)? {
+        exec_tx
+            .send(subdag)
+            .context("queueing a previously committed sub-DAG for replay")?;
+    }
 
     let network_task = tokio::spawn(run_network(network, network_cmd_rx, shutdown_rx.clone()));
     let event_task = tokio::spawn(run_event_handler(
         network_events,
-        dag_store.clone(),
         mempool.clone(),
+        engine.clone(),
         network_cmd_tx.clone(),
         shutdown_rx.clone(),
     ));
@@ -386,15 +397,20 @@ async fn run_network(
 /// Ingest events emitted by the network layer into the DAG store and mempool.
 async fn run_event_handler(
     mut events: mpsc::UnboundedReceiver<NetworkEvent>,
-    dag_store: Arc<DagStore>,
     mempool: Arc<Mempool>,
+    engine: Arc<ConsensusEngine<NodeDagStore, NodeBlockManager>>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             maybe = events.recv() => match maybe {
-                Some(event) => handle_network_event(event, &dag_store, &mempool, &network_cmd_tx),
+                Some(event) => handle_network_event(
+                    event,
+                    &mempool,
+                    &engine,
+                    &network_cmd_tx,
+                ),
                 None => break,
             },
             changed = shutdown.changed() => {
@@ -409,25 +425,17 @@ async fn run_event_handler(
 /// Handle a single [`NetworkEvent`].
 fn handle_network_event(
     event: NetworkEvent,
-    dag_store: &DagStore,
     mempool: &Mempool,
+    engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
     network_cmd_tx: &mpsc::UnboundedSender<NetworkCommand>,
 ) {
     match event {
-        NetworkEvent::BlockReceived(block) => {
-            // The network layer already persisted the block before emitting the
-            // event; only store it here if it is genuinely missing so we do not
-            // duplicate the DAG indices.
-            match dag_store.has_block(&block.digest) {
-                Ok(true) => debug!(digest = %block.digest, "block already in DAG store"),
-                Ok(false) => {
-                    if let Err(e) = dag_store.put_block(&block) {
-                        warn!(error = %e, "failed to store received block");
-                    }
-                }
-                Err(e) => warn!(error = %e, "failed to query received block"),
+        NetworkEvent::BlockReceived(block) => match engine.process_block(&block) {
+            Ok(()) => debug!(digest = %block.digest, "validated received block into consensus"),
+            Err(e) => {
+                warn!(digest = %block.digest, error = %e, "rejected received consensus block")
             }
-        }
+        },
         NetworkEvent::TransactionReceived(tx) => match mempool.add_transaction(tx.clone()) {
             Ok(()) => {
                 // Re-gossip locally-accepted transactions.
@@ -532,7 +540,14 @@ async fn run_execution(
                         txs = result.txs_applied,
                         "executed committed sub-DAG"
                     ),
-                    Err(e) => error!(error = %e, "execution failed"),
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            round = subdag.leader_round,
+                            "execution failed; stopping worker so committed decisions replay after restart"
+                        );
+                        break;
+                    }
                 },
                 None => break,
             },
@@ -557,6 +572,10 @@ impl DagStoreTrait for NodeDagStore {
 
     fn get_ancestors(&self, hash: &Hash, min_round: Round) -> Result<Vec<Hash>, DagStoreError> {
         self.inner.get_ancestors(hash, min_round)
+    }
+
+    fn get_parents(&self, hash: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        self.inner.get_parents(hash)
     }
 
     fn get_block_by_author_round(
@@ -619,8 +638,44 @@ impl BlockManagerTrait for NodeBlockManager {
     }
 }
 
+/// Reconstruct durable commit decisions for restart-safe execution replay.
+fn recover_committed_subdags(dag_store: &DagStore) -> Result<Vec<kvnc_consensus::CommittedSubDag>> {
+    let rounds = dag_store.get_decided_rounds(u64::MAX)?;
+    let mut subdags = Vec::new();
+    for round in rounds {
+        for leader_hash in dag_store.get_decided_leaders(round)? {
+            let leader = dag_store.get_block(&leader_hash)?;
+            if leader.round != round || leader.digest != leader_hash {
+                anyhow::bail!(
+                    "persisted commit decision for round {round} references inconsistent leader block (block round {}, block digest {}, expected digest {leader_hash})",
+                    leader.round,
+                    leader.digest,
+                );
+            }
+            let history = dag_store
+                .get_ancestors(&leader_hash, 0)?
+                .into_iter()
+                .map(|hash| dag_store.get_block(&hash))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
+        }
+    }
+    subdags.sort_by_key(|subdag| {
+        (
+            subdag.leader_round,
+            subdag.leader_author,
+            subdag.leader.digest.0,
+        )
+    });
+    Ok(subdags)
+}
+
 /// Build the initial single-validator committee from the local identity.
-fn build_committee(public_key: &PublicKey, address: &Address, listen_addr: &str) -> CommitteeInfo {
+fn build_committee(
+    public_key: &PublicKey,
+    address: &Address,
+    listen_addr: &str,
+) -> Result<CommitteeInfo> {
     let authority = AuthorityInfo {
         index: 0,
         stake: MIN_VALIDATOR_STAKE,
@@ -628,7 +683,7 @@ fn build_committee(public_key: &PublicKey, address: &Address, listen_addr: &str)
         address: *address,
         network_address: listen_addr.to_string(),
     };
-    CommitteeInfo::new(0, vec![authority])
+    Ok(CommitteeInfo::try_new(0, vec![authority])?)
 }
 
 /// Build the [`NetworkConfig`] from the node configuration.
@@ -739,6 +794,11 @@ fn parse_address_hex(value: Option<&str>) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvnc_storage::BincodeSerialize;
+    use redb::{Database, TableDefinition};
+    use std::collections::HashMap;
+
+    const DAG_BLOCKS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("dag_blocks");
 
     #[test]
     fn host_port_converts_to_multiaddr() {
@@ -763,6 +823,271 @@ mod tests {
     fn zero_address_is_default_treasury() {
         assert_eq!(parse_address_hex(None).unwrap(), Address::default());
         assert!(parse_address_hex(Some("zz")).is_err());
+    }
+
+    #[test]
+    fn committed_subdag_decisions_are_recovered_from_dag_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let digest = StatementBlock::compute_digest(0, 1, &[], &[]);
+        let block = StatementBlock {
+            author: 0,
+            round: 1,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+        };
+        dag.put_block(&block).unwrap();
+        dag.mark_round_decided(1, &digest).unwrap();
+
+        let recovered = recover_committed_subdags(&dag).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].leader.digest, digest);
+        assert_eq!(recovered[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn committed_subdag_recovery_rejects_missing_decided_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let valid_digest = StatementBlock::compute_digest(0, 1, &[], &[]);
+        let valid_block = StatementBlock {
+            author: 0,
+            round: 1,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest: valid_digest,
+        };
+        dag.put_block(&valid_block).unwrap();
+        dag.mark_round_decided(1, &valid_digest).unwrap();
+
+        let missing_digest = StatementBlock::compute_digest(0, 2, &[], &[]);
+        dag.mark_round_decided(2, &missing_digest).unwrap();
+
+        assert!(recover_committed_subdags(&dag).is_err());
+    }
+
+    #[test]
+    fn committed_subdag_recovery_rejects_decision_round_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let digest = StatementBlock::compute_digest(0, 2, &[], &[]);
+        let block = StatementBlock {
+            author: 0,
+            round: 2,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+        };
+        dag.put_block(&block).unwrap();
+        dag.mark_round_decided(1, &digest).unwrap();
+
+        let error = recover_committed_subdags(&dag).unwrap_err();
+        assert!(
+            error.to_string().contains("round 1"),
+            "unexpected recovery error: {error}"
+        );
+        assert!(
+            error.to_string().contains("block round 2"),
+            "unexpected recovery error: {error}"
+        );
+    }
+
+    #[test]
+    fn committed_subdag_recovery_rejects_embedded_digest_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dag.redb");
+        let storage = Storage::new(&db_path).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let digest = StatementBlock::compute_digest(0, 1, &[], &[]);
+        let block = StatementBlock {
+            author: 0,
+            round: 1,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+        };
+        dag.put_block(&block).unwrap();
+        dag.mark_round_decided(1, &digest).unwrap();
+        drop(dag);
+
+        let raw_db = Database::open(&db_path).unwrap();
+        let mut corrupted_block = block;
+        corrupted_block.digest = Hash::new("kvnc-test/embedded-digest-mismatch");
+        let write_txn = raw_db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(DAG_BLOCKS).unwrap();
+            table
+                .insert(digest.0, corrupted_block.to_bytes().unwrap())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(raw_db);
+
+        let storage = Storage::new(&db_path).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let error = recover_committed_subdags(&dag).unwrap_err().to_string();
+        assert!(
+            error.contains("block digest"),
+            "recovery error should identify the mismatched block digest: {error}"
+        );
+        assert!(
+            error.contains(&format!("expected digest {digest}")),
+            "recovery error should identify the persisted decision digest: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_commit_reaches_execution_and_persists_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let dag =
+            Arc::new(DagStore::new(Storage::new(dir.path().join("dag.redb")).unwrap()).unwrap());
+        let state_storage = Arc::new(Storage::new(dir.path().join("state.redb")).unwrap());
+        let (signing_key, public_key) = kvnc_crypto::generate_keypair();
+        let validator_address = Address::from_public_key(&public_key);
+        let payout = Address([0x91; 32]);
+        let mut staking = StakingState::new();
+        staking
+            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .unwrap();
+        let txn = state_storage.begin_write().unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let committee = build_committee(&public_key, &validator_address, "127.0.0.1:0")
+            .expect("single-validator committee is valid");
+        let block_manager = Arc::new(BlockManager::new(dag.clone()));
+        block_manager.set_authority(0);
+        block_manager.set_signing_key(signing_key.clone());
+        block_manager.set_authority_keys(HashMap::from([(0, public_key)]));
+        let engine = ConsensusEngine::new(
+            ConsensusConfig::default(),
+            committee,
+            Arc::new(NodeDagStore { inner: dag.clone() }),
+            Arc::new(RwLock::new(NodeBlockManager {
+                inner: block_manager,
+            })),
+            signing_key.clone(),
+        );
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        engine.set_commit_sender(exec_tx);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let execution = tokio::spawn(run_execution(exec_rx, state_storage.clone(), shutdown_rx));
+
+        let leader_round = 3;
+        let digest = StatementBlock::compute_digest(0, leader_round, &[], &[]);
+        let block = StatementBlock {
+            author: 0,
+            round: leader_round,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&signing_key, digest.as_ref()),
+            digest,
+        };
+        engine.process_block(&block).unwrap();
+        engine.process_vote(leader_round, 0, digest).unwrap();
+
+        let mut committed_height = 0;
+        for _ in 0..100 {
+            let read = state_storage.begin_read().unwrap();
+            committed_height = state_storage
+                .state()
+                .load_staking_state(&read)
+                .unwrap()
+                .committed_leader_height;
+            if committed_height == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(committed_height, 1, "execution consumed committed sub-DAG");
+        let read = state_storage.begin_read().unwrap();
+        let account = state_storage
+            .state()
+            .get_account_or_default(&read, &payout)
+            .unwrap();
+        assert!(
+            account.balance > 0,
+            "leader reward persisted to payout account"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        execution.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_worker_stops_after_failure_before_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Arc::new(Storage::new(dir.path().join("state.redb")).unwrap());
+        let validator_address = Address([0x22; 32]);
+        let payout = Address([0xa1; 32]);
+        let mut staking = StakingState::new();
+        staking
+            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .unwrap();
+        let txn = state_storage.begin_write().unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let committed_subdag = |round, author| {
+            let digest = StatementBlock::compute_digest(author, round, &[], &[]);
+            let leader = StatementBlock {
+                author,
+                round,
+                parents: Vec::new(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: Signature([0; 64]),
+                digest,
+            };
+            kvnc_consensus::CommittedSubDag {
+                blocks: vec![leader.clone()],
+                leader,
+                leader_round: round,
+                leader_author: author,
+            }
+        };
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        exec_tx.send(committed_subdag(1, 9)).unwrap(); // Unregistered authority fails.
+        exec_tx.send(committed_subdag(2, 0)).unwrap(); // Must not be executed next.
+        drop(exec_tx);
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_execution(exec_rx, state_storage.clone(), shutdown_rx).await;
+
+        let read = state_storage.begin_read().unwrap();
+        let state = state_storage.state().load_staking_state(&read).unwrap();
+        assert_eq!(
+            state.committed_leader_height, 0,
+            "worker must not advance to a later queued commit after failure"
+        );
+        assert_eq!(
+            state_storage
+                .state()
+                .get_account_or_default(&read, &payout)
+                .unwrap()
+                .balance,
+            0,
+            "later committed leader must not receive a reward"
+        );
     }
 
     #[cfg(unix)]

@@ -7,16 +7,16 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 0: Foundation & Tooling
 
-### [ ] 0.1 Workspace Setup
+### [x] 0.1 Workspace Setup
 - [x] Verify `cargo build` works for all crates
 - [x] Add `cargo test` CI pipeline (GitHub Actions)
 - [x] Configure `clippy` and `rustfmt` checks
 - [x] Set up dependency auditing (`cargo audit`)
 
-### [ ] 0.2 Documentation
+### [x] 0.2 Documentation
 - [x] Add missing module-level docs to all crates
 - [x] Generate API docs with `cargo doc`
-- [ ] Create architecture decision records (ADRs) for key choices
+- [x] Create architecture decision records (ADRs) for key choices (ADRs 0001 and 0002 created; weighted consensus ADR 0001 remains a non-normative, proof-blocked draft and is not implementation/activation approval)
 
 ---
 
@@ -31,7 +31,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [ ] **Hash domain separation**: Distinct hash constructors for blocks, txs, state
 
 ### [ ] 1.2 kvnc-crypto — Production Ready
-- [ ] **Keypair persistence**: Secure file storage (encrypted with passphrase)
+- [x] **Keypair persistence**: Secure file storage (encrypted with passphrase) — implemented as the Argon2id + XChaCha20-Poly1305 keystore in kvnc-cli (see 11.1); kvnc-crypto itself holds no persistence module
 - [ ] **Batch verification**: Ed25519 batch verify for block signatures
 - [ ] **Key derivation**: BIP32-style HD wallet support (optional)
 - [ ] **VRF**: Verifiable random function for leader selection (if needed)
@@ -81,7 +81,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [x] **Leader status tracking**: `Undecided` → `Commit` / `Skip`
 - [x] **CommittedSubDag production**: Linearize blocks in topological order
 
-### [ ] 4.2 Linearizer
+### [x] 4.2 Linearizer
 - [x] **Topological sort**: Blocks in causal order for execution
 - [x] **Deduplication**: Handle blocks reachable via multiple paths
 
@@ -107,7 +107,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ### [ ] 5.2 Block Building
 - [x] **Select transactions**: Fill block up to `MAX_TXS_PER_BLOCK` / gas limit
 - [ ] **Conflict resolution**: Same sender nonce ordering
-- [ ] **Fee estimation**: RPC endpoint for suggested fee rates
+- [x] **Fee estimation**: Advisory RPC for suggested rate (minimum observed mempool rate, floored at 1 atom/byte; not an admission or confirmation guarantee)
 
 ---
 
@@ -115,18 +115,18 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ### [ ] 6.1 libp2p Setup
 - [x] **Transport**: TCP + Noise + Yamux
-- [ ] **Discovery**: Kademlia DHT + mDNS (local)
+- [ ] **Discovery**: Kademlia DHT + mDNS (local) (partial: Kademlia wired with bootstrap + routing-table eviction on ban; mDNS absent)
 - [x] **Gossipsub topics**: `blocks`, `transactions`, `votes`, `sync`
 
 ### [ ] 6.2 Protocols
-- [ ] **Block sync**: Request/response for missing blocks (by round/author)
+- [ ] **Block sync**: Request/response for missing blocks (by round/author) (partial: SYNC-topic range gossip exists in kvnc-network/src/sync.rs; no request-response protocol found)
 - [x] **Transaction gossip**: Flood new txs to peers
-- [ ] **Vote gossip**: Consensus votes (if separate from blocks)
-- [ ] **Peer scoring**: Ban misbehaving peers (invalid blocks, spam)
+- [ ] **Vote gossip**: Consensus votes (if separate from blocks) (partial: VOTES topic + receive handler exist at service.rs:459; no publish path found in kvnc-network/kvnc-node)
+- [ ] **Peer scoring**: Ban misbehaving peers (invalid blocks, spam) (partial: `ban_peer` wired for ping-failure limits at service.rs:538,685; no invalid-block/spam scoring)
 
-### [ ] 6.3 Bootstrap
+### [x] 6.3 Bootstrap
 - [x] **Seed nodes**: DNS seed (`seed.kovanica.online`) + hardcoded peers
-- [ ] **Connection management**: Target peer count, reconnect logic
+- [x] **Connection management**: Bootstrap-only target (distinct configured addresses capped by `max_peers`), reconnect with capped backoff
 
 ---
 
@@ -138,12 +138,12 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [ ] **Deploy**: Store WASM code, assign contract address
 - [x] **Call**: Execute WASM with gas metering, handle host calls (wasmi e2e proven)
 
-### [ ] 7.2 WASM Runtime (kvnc-runtime)
+### [x] 7.2 WASM Runtime (kvnc-runtime)
 - [x] **Host functions**: `storage_get`, `storage_set`, `balance_of`, `transfer`, `call_contract`, `crypto_verify`, `block_height`, `timestamp` (all 10 env imports implemented)
 - [x] **Gas metering**: Fuel-based execution, configurable costs per opcode (ExecutionConfig.gas_limit)
 - [x] **Memory limits**: Enforce `memory_limit_pages` (config field read; limiter TODO)
 - [x] **Determinism**: No non-deterministic host functions
-- [ ] **Module caching**: Compile once, instantiate many (TODO in ContractRunner)
+- [x] **Module caching**: In-memory per-ContractRunner cache compiles on WASM-hash miss; calls instantiate the cached module (process-restart persistence is out of scope)
 
 ### [ ] 7.3 Execution Context
 - [x] **State transitions**: Apply txs to account/contract state (ContractHost overlay + commit)
@@ -155,7 +155,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 8: Staking & Tokenomics (kvnc-staking)
 
-### [ ] 8.1 Emission & Treasury (DONE)
+### [x] 8.1 Emission & Treasury (DONE)
 - [x] **Block reward schedule**: Geometric decay (×¾ per 2,050,000 eras)
 - [x] **Treasury vesting**: Linear 1M KVNC/year over 8 years
 - [x] **Circulating supply**: Clamped to total supply (90.2M KVNC)
@@ -169,9 +169,9 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [ ] **Slashing**: Double-sign detection, stake slashing
 - [ ] **Governance hooks**: Parameter change proposals
 
-### [ ] 8.3 Tests (from AGENT_PROMPT.md item 2)
+### [x] 8.3 Tests (from AGENT_PROMPT.md item 2)
 - [x] **Tokenomics tests**: reward_era_0, reward_decays_by_three_quarters, treasury_vesting_linear, circulating_never_exceeds_total (in kvnc-staking)
-- [ ] **Contract tests**: HTLC create/claim/refund, Vault linear/absolute, Multisig threshold, Token mint/transfer/burn (using in-memory Host)
+- [x] **Contract tests**: Implemented and maintained under Phase 8.5; verified offline (HTLC 13, Vault 12, Multisig 12, Token 11 tests)
 
 ---
 
@@ -249,13 +249,13 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 11: CLI (kvnc-cli)
 
-### [ ] 11.1 Wallet Operations
-- [ ] **Keygen**: Generate + save encrypted keystore (partial: passphrase XOR obfuscation is not secure encryption; replace with AEAD)
-- [ ] **Import/Export**: Private key, mnemonic (partial: private-key import/export implemented; mnemonic support absent)
+### [x] 11.1 Wallet Operations
+- [x] **Keygen**: Generate + save authenticated encrypted keystore (Argon2id + XChaCha20-Poly1305, restrictive atomic write)
+- [x] **Import/Export**: Raw private key and 24-word mnemonic import/export; explicit legacy-v1 migration
 - [x] **Sign**: Offline transaction signing
 
 ### [ ] 11.2 Node Operations
-- [ ] **Status**: Sync status, peer count, latest block (partial: latest block/committee; sync and peer count absent)
+- [ ] **Status**: Sync status, peer count, latest block (partial: latest block/committee and peer count; sync status unavailable)
 - [ ] **Staking**: `stake`, `unstake`, `delegate`, `claim-rewards`
 - [ ] **Governance**: `propose`, `vote` (future)
 
@@ -267,7 +267,7 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 12: Testing & Verification
 
-### [ ] 12.1 Unit Tests
+### [x] 12.1 Unit Tests
 - [x] **kvnc-staking**: All tokenomics math (✓ mostly done)
 - [x] **kvnc-consensus**: Commit rules, linearizer (**74 passing / 0 ignored**: 37 committer, 6 engine, 11 linearizer, 11 proptest invariants, 9 wave arithmetic — the 4 BUG tests were un-ignored after fixes; see audit note 2026-10-07)
 - [x] **kvnc-execution**: Transaction application, reward distribution (6 tests)
@@ -294,9 +294,9 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 ## Phase 13: DevOps & Deployment
 
 ### [ ] 13.1 Docker
-- [ ] **Multi-stage build**: Builder + runtime images
+- [x] **Multi-stage build**: Builder + runtime images (`Dockerfile`, `.dockerignore`; local build verified)
 - [ ] **Docker Compose**: Local devnet (4 validators)
-- [ ] **Health checks**: RPC endpoint, peer count
+- [x] **Health checks**: RPC `/health` status and peer-count reporting; zero peers remains healthy
 
 ### [ ] 13.2 Kubernetes (optional)
 - [ ] **Helm chart**: Node deployment, configmaps, secrets
@@ -321,6 +321,54 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 - [ ] **Explorer**: Block explorer (web frontend)
 - [ ] **Faucet**: Testnet KVNC distribution
 - [ ] **Documentation**: Validator setup guide, RPC endpoints
+
+---
+
+## Phase 15: MysticGhost Consensus Integration (authorized 2026-10-07)
+
+Source: `zips/mysticghost-kvnc-integration-5.zip` (studied 2026-10-07). MysticGhost = existing wave engine (length 3) + scoped GHOSTDAG k=3 colouring over the mergeset of a committed leader, behind `use_mysticghost` (default false; fallback = current linearizer). Hard resource budget: full node <3 GB RSS, mergeset ≤1000 blocks (config cap 2000), `prune_window_waves = 100`. Work follows the package's recommended order; code + consensus work authorized by user, commit/PR only as coherent verified slices.
+
+### [x] 15.0 Phase 0 — production-loop prerequisites
+- [x] All kvnc-consensus tests green (re-verified 2026-10-07: property + wave-arithmetic suites; workspace suite green on merged tree)
+- [x] `CommittedSubDag` delivered to execution: `engine.set_commit_sender(exec_tx)` (main.rs:235) → `try_commit_and_deliver` publishes (engine.rs:347-369) → `run_execution` consumes (main.rs:520-536)
+- [x] Rewards credited on commit (8.4 live reward path)
+- [ ] Votes reach the consensus engine in a running node (production vote ingress — known open, see line 588)
+- [ ] Single-node smoke run ≥ 1 hour without crash (needs live node run)
+
+### [x] 15.1 Scaffolding (fix-24)
+- [x] Adapt the 4 stub modules to real types (no `BlockHash`/`Wave`: use `kvnc_types::Hash`, `digest` field, `wave_of` arithmetic)
+- [x] `pub mod` declarations in kvnc-consensus/kvnc-dag lib.rs
+- [x] `cargo check -p kvnc-consensus -p kvnc-dag` green
+- [x] `use_mysticghost` flag: `ConsensusConfig` (engine.rs:72) → `NodeConfig` (config.rs:17) + `KVNC_MYSTICGHOST` env override → main.rs ConsensusConfig construction; default false
+
+### [x] 15.2 Mergeset extraction (fix-25)
+- [x] `mergeset(leader) -> Vec<Hash>` (extend `DagStoreTrait` with parents/ancestors access — consensus→dag is the legal dep edge; DAG store already has `get_parents`/`get_ancestors`)
+- [x] Unit tests on small synthetic DAGs (7 tests in crates/kvnc-dag/tests/mergeset.rs)
+- [x] Benchmark on 1k–5k block DAGs
+
+### [x] 15.3 Scoped GHOSTDAG k=3 (fix-26)
+- [x] Real `colour_mergeset(blocks, k=3, previous_tips)` (no GHOSTDAG code exists in repo today — write from scratch)
+- [x] Blue-set conflict-free unit tests + selected-parent ordering tests (9 tests in crates/kvnc-consensus/tests/ghostdag_scoped.rs)
+- [x] Compare against a known GHOSTDAG reference on fixtures
+
+### [ ] 15.4 Committer integration (behind flag)
+- [ ] Hook in `build_committed_subdag` (committer.rs:376-398): flag off → bit-identical linearizer path; flag on → blue-set order
+- [ ] Same ordering on restart replay: `recover_committed_subdags` (main.rs:637-656) must use the identical path
+- [ ] Existing consensus tests pass with flag false; new tests pass with flag true
+
+### [ ] 15.5 Resource hardening
+- [ ] Prune non-blue blocks of committed waves; `prune_window_waves` (default 100)
+- [ ] Metrics: mergeset size, colouring duration, blocks in memory, RSS
+- [ ] Node run under MemoryMax=3G ≥6h with load; document observed RSS
+
+### [ ] 15.6 Multi-node & stabilisation
+- [ ] 4-node and 15-node local testnets
+- [ ] Partition / recovery tests
+- [ ] 24h+ soak; final resource report
+
+### [ ] 15.7 Optional later
+- [ ] Light-client support for wave commits + colouring certificates
+- [ ] Mainnet preparation (gated on existing mainnet checklist)
 
 ---
 
@@ -562,3 +610,33 @@ Verdicts corrected by the merge (old verdicts above superseded where listed):
 Verdicts **unchanged by the merge** (still open): **7.1** native tx execution (`TransactionKind::Transfer/Stake/Deploy/Call` still never applied — `execute_committed_subdag` remains reward-only), **4.1d / 9.2** consensus→execution handoff still unwired (`main.rs:225-229` TODO, `exec_tx` never fed ⇒ `run_execution` starves), **7.3** receipts & state root, **8.2** delegation/rotation/slashing/governance, **12.2** multi-node + partition tests, **3.1a** on-hot-path block validation, **13/14** devops & testnet/explorer/faucet.
 
 Merged-tree gates: fmt ✓ · clippy `-D warnings` ✓ · `cargo test --workspace --all-targets --no-fail-fast` ✓ (0 failures / 0 ignored).
+
+---
+
+## Current worktree update (2026-10-07)
+
+The following unchecked roll-ups were stale and are now checked based on their checked children and current verification: 0.1 Workspace Setup, 4.2 Linearizer, 8.1 Emission & Treasury, 11.1 Wallet Operations, and 12.1 Unit Tests. The wallet items now use the implemented v2 Argon2id/XChaCha20-Poly1305 keystore, explicit v1 migration, raw seed and 24-word mnemonic flows (mnemonic is exact seed entropy, not HD derivation). `cargo fmt --all -- --check`, `cargo test --workspace --all-targets --no-fail-fast` (all suites passed), and `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed on this worktree. Independent wallet security review/remediation is recorded in `.slim/deepwork/tasklist-completion.md`.
+
+Tasklist item 129 / Phase 6.3 connection management is now checked for the approved bootstrap-only scope: distinct configured bootstrap addresses are deduplicated and capped by `max_peers`; per-address pending dial IDs survive `start()` re-entry; failures/disconnects retry with staggered capped exponential backoff. Offline state-machine coverage verifies deduplication/capping, retry timing, exact-ID handling, re-entry state, and last-connection behavior. `cargo test -p kvnc-network --offline` (22 passed), `cargo clippy -p kvnc-network --all-targets --all-features --offline -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. No public/live peers were contacted. This does not add a general connected-peer floor, DHT discovery, or an in-memory Swarm integration test; listener and Kademlia bootstrap behavior on `start()` re-entry remains unchanged.
+
+Tasklist item 297 / Phase 13.1 multi-stage Docker build is now checked: the local `docker build --tag kvnc-node:local .` succeeded using Rust 1.90. The builder/runtime image, `.dockerignore`, and build-only README guidance are present; the default image command is `kvnc-node --help`. The user selected Rust 1.90 as the project minimum, now aligned across the README badge/prerequisite, CI MSRV toolchain, and Docker builder. The image/container was not run, the node was not started, and nothing was published. Compose/devnet and health checks remain open.
+
+Tasklist item 299 / Docker health check is now checked: RPC `/health` returns JSON `{status: "ok", peer_count: N}` using the shared distinct connected-peer count. Peer count is informational; zero peers does not fail liveness. The Docker image checks local HTTP health and verifies the response contains status and a nonnegative peer count. Focused handler tests cover zero and nonzero count. `cargo fmt --all -- --check`, `cargo test -p kvnc-network -p kvnc-rpc --offline` (29 passed), `cargo clippy -p kvnc-network -p kvnc-rpc -p kvnc-node --all-targets --all-features --offline -- -D warnings`, `cargo check -p kvnc-node --offline`, and diff checks passed. The first Docker build exposed invalid Dockerfile `CMD-SHELL` syntax; it was corrected to Dockerfile shell-form `CMD`, after which `docker build --tag kvnc-node:local .` succeeded. `docker image inspect` confirms Docker stores the intended `CMD-SHELL` healthcheck. The image/container and node were not run, no peers contacted, and nothing published. Docker Compose/devnet remains open.
+
+Phase 11.2 Status now has peer count from `/health` in CLI JSON and human-readable output; zero is preserved as a real count, while unavailable/malformed health remains unknown. `syncing` remains null/unknown because no sync-status source exists, so the Status item and 11.2 roll-up remain unchecked. `cargo fmt --all -- --check`, `cargo test -p kvnc-cli --offline` (21 passed), `cargo clippy -p kvnc-cli --all-targets --all-features --offline -- -D warnings`, and diff checks passed. No consensus, ledger, genesis, deployment, or live-network behavior changed. Changes remain uncommitted/unmerged.
+
+The duplicate Phase 8.3 Contract tests checkbox is now reconciled with the already-implemented Phase 8.5 suites and verified by `cargo test --offline -p kvnc-htlc -p kvnc-vault -p kvnc-multisig -p kvnc-token` (48 tests passed). Phase 8.3 is checked; no production code changed.
+
+Tasklist item 146 / Phase 7.2 module caching is checked at its existing in-memory per-`ContractRunner` scope: modules are keyed by WASM hash and compiled only on a cache miss; calls reuse the cached module and instantiate it per execution. `cargo test -p kvnc-execution --offline` passed all 9 tests, including the WASM end-to-end test that calls one module twice through the same runner. This does not add cache persistence across process restarts; no production code changed.
+
+Wallet ADR 0002 is a draft implementation record cross-checked against the hidden passphrase-confirmation helper. Phase 0.2 / line 19 is checked for the creation deliverable (ADRs 0001 and 0002 exist), not for consensus approval: weighted consensus ADR 0001 remains non-normative and proof-blocked pending its gate.
+
+Tasklist item 110 / fee estimation is verified: `kvnc_estimateFee` selects the minimum observed mempool rate with a 1 atom/byte floor. A synthetic nonempty-pool handler test covers distinct observed rates (including a sub-1 rate) and the floor. This estimate is advisory only; the current mempool does not enforce `min_fee_rate`, and the RPC does not promise admission or confirmation. `cargo fmt --all -- --check`, `cargo test -p kvnc-rpc --offline` (8 passed), `cargo clippy -p kvnc-rpc --all-targets --all-features --offline -- -D warnings`, and diff checks passed. The Phase 5.2 roll-up remains open because same-sender nonce conflict resolution is unchecked.
+
+Do not infer integrated/released status: source, ADR, and checklist changes remain uncommitted in the isolated worktree. Still unchecked intentionally: the weighted consensus ADR remains a non-normative draft; received-block validation needs parent-set/consensus review; full block validation still lacks transaction validity checks; the single-node production-cycle test uses manually injected block/vote inputs; general account/contract replay is not covered; and consensus Phase 4.1 remains blocked by weighted proof obligations and lack of authenticated production vote ingress. Historical audit notes above describe earlier snapshots and are retained as history.
+
+Supplemental Phase 4.1 test hardening: `try_commit_and_mark_durable` now has separate round-only, author-only, and digest-only mismatch regressions; the digest case uses a test-only `MockDag` alias fixture. The full offline consensus suite passed (90 tests), as did fmt, Clippy `-D warnings`, and diff checks. This does not resolve weighted proof/liveness or complete the committer roll-up.
+
+Supplemental Phase 12.2 recovery hardening: `recover_committed_subdags` now rejects a persisted `(round, leader_hash)` decision if the fetched leader's round or digest disagrees, before ancestor traversal/linearization. Temp-storage regressions cover a round-1 marker pointing to a round-2 block and a valid earlier marker followed by a decided hash with no block; the existing matching-marker recovery test remains. The missing-block regression confirms recovery errors instead of returning an incomplete replay list. `cargo test -p kvnc-node --offline` (11 passed), fmt, node Clippy `-D warnings`, and diff checks passed. This is only persisted-marker validation; it does not complete the full single-node production/commit/execute cycle or establish Phase 4.1/global consensus safety. The Phase 12.2 checkbox remains open.
+
+Additional supplemental Phase 12.2 recovery test: a raw-redb fixture keeps the persisted decision key/round but changes the stored block payload's embedded digest. `committed_subdag_recovery_rejects_embedded_digest_mismatch` asserts recovery errors with the mismatch identified; valid, missing-block, and round-mismatch cases remain. Added the already-in-workspace `redb` dependency to `kvnc-node` dev-dependencies only (user-approved), with no production API/behavior change. Focused test and full `cargo test -p kvnc-node --offline` (12 passed), fmt, node Clippy `-D warnings`, and diff checks passed. This is still only a recovery guard subtest; Phase 12.2 remains unchecked.

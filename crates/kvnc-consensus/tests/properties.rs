@@ -193,7 +193,9 @@ fn run_scenario(s: &Scenario, mode: VoteMode) -> Run {
     let mut status_observations = Vec::new();
 
     for _ in 0..100 {
-        let step = committer.try_commit(&dag);
+        let step = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("persist committed decision");
         for (round, info) in committer.get_all_decided_leaders() {
             status_observations.push((round, info.status));
         }
@@ -327,8 +329,13 @@ proptest! {
         let (committer, dag, committee) = build_scenario(&s, VoteMode::Baseline);
         let mut commits = Vec::new();
         for _ in 0..100 {
-            match committer.try_commit(&dag) {
-                Some(subdag) => commits.push(subdag),
+            match committer
+                .try_commit_and_mark_durable(&dag)
+                .expect("persist committed decision")
+            {
+                Some(subdag) => {
+                    commits.push(subdag);
+                }
                 None => break,
             }
         }
@@ -347,10 +354,10 @@ proptest! {
                 .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
                 .sum();
             prop_assert!(
-                stake_for_leader >= committee.quorum_threshold,
+                stake_for_leader >= committee.quorum_threshold(),
                 "round {round} committed with only {stake_for_leader} stake voting for the \
                  leader block (quorum {})",
-                committee.quorum_threshold
+                committee.quorum_threshold()
             );
 
             prop_assert!(
@@ -745,10 +752,10 @@ proptest! {
                 .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
                 .sum();
             prop_assert!(
-                stake_for_leader >= committee.quorum_threshold,
+                stake_for_leader >= committee.quorum_threshold(),
                 "committed the leader block with only {stake_for_leader} stake voting for it \
                  (quorum {}); votes: {:?}",
-                committee.quorum_threshold,
+                committee.quorum_threshold(),
                 info.votes
             );
         }

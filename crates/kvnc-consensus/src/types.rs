@@ -4,7 +4,7 @@
 pub use kvnc_types::CommittedSubDag;
 use kvnc_types::{block::StatementBlock, AuthorityIndex, Round, Stake};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Status of a leader slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,30 +36,107 @@ pub struct LeaderInfo {
 #[derive(Clone, Debug)]
 pub struct CommitteeInfo {
     /// Current epoch.
-    pub epoch: u64,
+    epoch: u64,
     /// Authorities in the committee.
-    pub authorities: Vec<AuthorityInfo>,
+    authorities: Vec<AuthorityInfo>,
     /// Total stake.
-    pub total_stake: Stake,
+    total_stake: Stake,
     /// Quorum threshold (2f+1).
-    pub quorum_threshold: Stake,
+    quorum_threshold: Stake,
     /// Validity threshold (f+1).
-    pub validity_threshold: Stake,
+    validity_threshold: Stake,
+}
+
+/// Errors returned when constructing an invalid consensus committee.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CommitteeInfoError {
+    /// A consensus committee must contain at least one authority.
+    #[error("committee must not be empty")]
+    EmptyCommittee,
+    /// An authority must have non-zero voting stake.
+    #[error("authority {index} has zero stake")]
+    ZeroStake { index: AuthorityIndex },
+    /// Authority indices must uniquely identify committee members.
+    #[error("duplicate authority index {index}")]
+    DuplicateAuthorityIndex { index: AuthorityIndex },
+    /// Each committee member must use a distinct public key.
+    #[error("duplicate authority public key")]
+    DuplicatePublicKey,
+    /// Total committee stake must fit in `Stake`.
+    #[error("total committee stake overflows u64")]
+    StakeOverflow,
 }
 
 impl CommitteeInfo {
-    pub fn new(epoch: u64, authorities: Vec<AuthorityInfo>) -> Self {
-        let total_stake: Stake = authorities.iter().map(|a| a.stake).sum();
-        let quorum_threshold = (total_stake * 2) / 3 + 1;
-        let validity_threshold = total_stake / 3 + 1;
+    /// Construct a validated committee and derive its voting thresholds.
+    pub fn try_new(
+        epoch: u64,
+        authorities: Vec<AuthorityInfo>,
+    ) -> Result<Self, CommitteeInfoError> {
+        if authorities.is_empty() {
+            return Err(CommitteeInfoError::EmptyCommittee);
+        }
 
-        Self {
+        let mut indices = HashSet::with_capacity(authorities.len());
+        let mut public_keys = HashSet::with_capacity(authorities.len());
+        let mut total_stake: Stake = 0;
+        for authority in &authorities {
+            if authority.stake == 0 {
+                return Err(CommitteeInfoError::ZeroStake {
+                    index: authority.index,
+                });
+            }
+            if !indices.insert(authority.index) {
+                return Err(CommitteeInfoError::DuplicateAuthorityIndex {
+                    index: authority.index,
+                });
+            }
+            if !public_keys.insert(authority.public_key) {
+                return Err(CommitteeInfoError::DuplicatePublicKey);
+            }
+            total_stake = total_stake
+                .checked_add(authority.stake)
+                .ok_or(CommitteeInfoError::StakeOverflow)?;
+        }
+
+        // Compute thresholds in u128 so doubling the u64 total cannot
+        // overflow. For positive T, both results are <= T and therefore fit
+        // in Stake.
+        let quorum_threshold = (u128::from(total_stake) * 2 / 3 + 1) as Stake;
+        let validity_threshold = (u128::from(total_stake) / 3 + 1) as Stake;
+
+        Ok(Self {
             epoch,
             authorities,
             total_stake,
             quorum_threshold,
             validity_threshold,
-        }
+        })
+    }
+
+    /// Current committee epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Authorities in this committee.
+    pub fn authorities(&self) -> &[AuthorityInfo] {
+        &self.authorities
+    }
+
+    /// Total voting stake in this committee.
+    pub fn total_stake(&self) -> Stake {
+        self.total_stake
+    }
+
+    /// Quorum voting threshold, `floor(2T/3) + 1`.
+    pub fn quorum_threshold(&self) -> Stake {
+        self.quorum_threshold
+    }
+
+    /// Validity voting threshold, `floor(T/3) + 1`.
+    pub fn validity_threshold(&self) -> Stake {
+        self.validity_threshold
     }
 
     pub fn size(&self) -> usize {
@@ -114,7 +191,7 @@ impl CommitteeInfo {
         }
     }
 
-    /// Get the leader for a given round (deterministic stake-weighted selection).
+    /// Get the leader for a given round using deterministic round-robin selection.
     pub fn leader(&self, round: Round) -> AuthorityIndex {
         if self.authorities.is_empty() {
             return 0;

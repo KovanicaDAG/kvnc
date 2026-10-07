@@ -7,7 +7,7 @@
 use crate::engine::DagStoreTrait;
 use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_types::{hash::Hash, AuthorityIndex, CommittedSubDag, Round};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -132,6 +132,8 @@ pub struct UniversalCommitter {
     leaders: RwLock<HashMap<Round, LeaderInfo>>,
     /// Map of decided leaders.
     decided_leaders: RwLock<HashMap<Round, LeaderInfo>>,
+    /// Serializes durable commit attempts and their in-memory publication.
+    durable_commit_lock: Mutex<()>,
 }
 
 impl UniversalCommitter {
@@ -142,6 +144,7 @@ impl UniversalCommitter {
             last_decided_round: RwLock::new(0),
             leaders: RwLock::new(HashMap::new()),
             decided_leaders: RwLock::new(HashMap::new()),
+            durable_commit_lock: Mutex::new(()),
         }
     }
 
@@ -152,7 +155,7 @@ impl UniversalCommitter {
     }
 
     /// Mark a leader as decided.
-    pub fn mark_decided(&self, round: Round, leader_info: LeaderInfo) {
+    fn mark_decided(&self, round: Round, leader_info: LeaderInfo) {
         let mut decided = self.decided_leaders.write();
         decided.insert(round, leader_info);
         let mut last = self.last_decided_round.write();
@@ -255,9 +258,19 @@ impl UniversalCommitter {
         leaders.retain(|&round, _| round >= cutoff);
     }
 
-    /// Attempt to produce a new committed sub-DAG.
-    /// This is the main entry point called by the core loop.
+    /// Construct the next committed sub-DAG candidate without publishing it.
+    /// Use [`Self::try_commit_and_mark_durable`] to persist and publish it.
     pub fn try_commit<D: DagStoreTrait>(&self, dag_store: &D) -> Option<CommittedSubDag> {
+        self.try_commit_with_leader(dag_store)
+            .map(|(subdag, _)| subdag)
+    }
+
+    /// Construct the next committed sub-DAG together with the registered
+    /// leader record that established its eligibility.
+    fn try_commit_with_leader<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+    ) -> Option<(CommittedSubDag, LeaderInfo)> {
         let last_decided = self.last_decided_round();
         let leaders = self.leaders.read().clone();
         let decided = self.decided_leaders.read().clone();
@@ -272,9 +285,10 @@ impl UniversalCommitter {
                 let direct_status = self.base.try_direct_decide(dag_store, leader_info);
 
                 if direct_status == LeaderStatus::Commit {
-                    // Directly commit this leader (and decide earlier leaders of the wave).
-                    self.decide_earlier_in_wave(dag_store, round);
-                    return self.build_committed_subdag(dag_store, leader_info, round);
+                    // Construct only; candidate-only callers do not publish it.
+                    return self
+                        .build_committed_subdag(dag_store, leader_info)
+                        .map(|subdag| (subdag, leader_info.clone()));
                 } else if direct_status == LeaderStatus::Skip {
                     // Mark as skipped and continue
                     let mut skipped = leader_info.clone();
@@ -289,8 +303,10 @@ impl UniversalCommitter {
                     self.base
                         .try_indirect_decide(dag_store, leader_info, &decided);
                 if indirect_status == LeaderStatus::Commit {
-                    self.decide_earlier_in_wave(dag_store, round);
-                    return self.build_committed_subdag(dag_store, leader_info, round);
+                    // Construct only; candidate-only callers do not publish it.
+                    return self
+                        .build_committed_subdag(dag_store, leader_info)
+                        .map(|subdag| (subdag, leader_info.clone()));
                 } else if indirect_status == LeaderStatus::Skip {
                     let mut skipped = leader_info.clone();
                     skipped.status = LeaderStatus::Skip;
@@ -310,12 +326,57 @@ impl UniversalCommitter {
         None
     }
 
+    /// Durably commit and publish the next eligible leader, if one is ready.
+    ///
+    /// The decision index is persisted before in-memory state is advanced. If
+    /// persistence fails, the eligible leader remains available for retry.
+    pub fn try_commit_and_mark_durable<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+    ) -> Result<Option<CommittedSubDag>, kvnc_dag::DagStoreError> {
+        let _guard = self.durable_commit_lock.lock();
+        let Some((subdag, mut decided_leader)) = self.try_commit_with_leader(dag_store) else {
+            return Ok(None);
+        };
+
+        let leader_block = &subdag.leader;
+        let metadata_matches = decided_leader.round == subdag.leader_round
+            && decided_leader.author == subdag.leader_author
+            && decided_leader.block_hash == Some(leader_block.digest)
+            && leader_block.round == subdag.leader_round
+            && leader_block.author == subdag.leader_author;
+        if !metadata_matches {
+            warn!(
+                registered_round = decided_leader.round,
+                registered_author = decided_leader.author,
+                registered_digest = ?decided_leader.block_hash,
+                subdag_round = subdag.leader_round,
+                subdag_author = subdag.leader_author,
+                subdag_digest = %leader_block.digest,
+                block_round = leader_block.round,
+                block_author = leader_block.author,
+                "refusing to persist mismatched committed leader metadata"
+            );
+            return Ok(None);
+        }
+
+        // Persist the exact eligible leader selected above; never synthesize a
+        // leader record from a caller-provided sub-DAG.
+        dag_store.mark_round_decided(subdag.leader_round, &subdag.leader.digest)?;
+        decided_leader.status = LeaderStatus::Commit;
+        self.mark_decided(subdag.leader_round, decided_leader);
+
+        // This existing same-wave bookkeeping is committed only after the
+        // later leader's durable mark succeeded.
+        self.decide_earlier_in_wave(dag_store, subdag.leader_round);
+        Ok(Some(subdag))
+    }
+
     /// Build a committed sub-DAG from a leader and its causal history.
     fn build_committed_subdag<D: DagStoreTrait>(
         &self,
         dag_store: &D,
         leader_info: &LeaderInfo,
-        round: Round,
     ) -> Option<CommittedSubDag> {
         let leader_hash = leader_info.block_hash?;
         let leader_block = dag_store.get_block(&leader_hash).ok()?;
@@ -326,27 +387,13 @@ impl UniversalCommitter {
         // Get the actual blocks for ancestors
         let mut history = Vec::new();
         for hash in ancestors {
-            if let Ok(block) = dag_store.get_block(&hash) {
-                history.push(block);
-            }
+            history.push(dag_store.get_block(&hash).ok()?);
         }
-
-        // Mark this leader as decided
-        let mut decided_leader = leader_info.clone();
-        decided_leader.status = LeaderStatus::Commit;
-        self.mark_decided(round, decided_leader);
 
         // Linearize the sub-DAG
         let linearizer = crate::linearizer::Linearizer::new();
         let subdag = linearizer.linearize(leader_block, history);
 
         Some(subdag)
-    }
-}
-
-impl Default for UniversalCommitter {
-    fn default() -> Self {
-        // Default with empty committee - will be set later
-        Self::new(CommitteeInfo::new(0, Vec::new()))
     }
 }

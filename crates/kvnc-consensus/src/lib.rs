@@ -12,15 +12,19 @@
 #![allow(unused_variables)]
 
 pub mod committer;
+pub mod committer_mysticghost;
 pub mod engine;
+pub mod ghostdag_scoped;
 pub mod linearizer;
+pub mod mysticghost;
 pub mod types;
 
 pub use committer::{BaseCommitter, UniversalCommitter};
 pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState};
 pub use linearizer::Linearizer;
 pub use types::{
-    AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, LeaderInfo, LeaderStatus,
+    AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo,
+    LeaderStatus,
 };
 
 use kvnc_types::{Round, WAVE_LENGTH};

@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/kovanica/kvnc/actions/workflows/ci.yml"><img alt="Build Status" src="https://img.shields.io/github/actions/workflow/status/kovanica/kvnc/ci.yml?branch=main&style=flat-square"></a>
   <a href="https://github.com/kovanica/kvnc/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/kovanica/kvnc?style=flat-square"></a>
-  <a href="https://www.rust-lang.org/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.85+-orange?style=flat-square&logo=rust"></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.90+-orange?style=flat-square&logo=rust"></a>
   <a href="https://crates.io/crates/kvnc-types"><img alt="Crates.io" src="https://img.shields.io/crates/v/kvnc-types?style=flat-square"></a>
   <a href="https://discord.gg/kovanica"><img alt="Discord" src="https://img.shields.io/discord/123456789?label=discord&style=flat-square&logo=discord&color=5865F2"></a>
   <a href="https://docs.kovanica.online"><img alt="Docs" src="https://img.shields.io/badge/docs-online-blue?style=flat-square&logo=readthedocs"></a>
@@ -143,7 +143,7 @@ Cumulative mining issuance approaches **82M KVNC** asymptotically. The treasury 
 
 ### Prerequisites
 
-- **Rust 1.85+** (install via [rustup](https://rustup.rs/))
+- **Rust 1.90+** (install via [rustup](https://rustup.rs/))
 - **Linux/macOS/Windows** (WSL2 recommended on Windows)
 
 ### Build from Source
@@ -181,16 +181,23 @@ The node will:
 4. Start JSON-RPC on `127.0.0.1:8545`
 5. Begin consensus participation
 
-### Docker (Coming Soon)
+### Docker (Build Only)
 
 ```bash
-# Pull and run
-docker run -d \
-  -p 8545:8545 \
-  -p 9000:9000 \
-  -v kvnc-data:/data \
-  ghcr.io/kovanica/kvnc-node:latest
+# Build the node image locally; this does not start a node.
+docker build -t kvnc-node:local .
 ```
+
+The image's default command is `kvnc-node --help`; it will not start a node on a plain
+`docker run`. Starting a node requires explicitly supplying its intended configuration
+(a config file or deliberate `KVNC_*` overrides). The built-in defaults include a
+bootstrap peer and can initialize genesis state, so do not rely on defaults. For
+container access to JSON-RPC, configure `rpc_addr` / `KVNC_RPC_ADDR` to bind to an
+appropriate container interface (typically `0.0.0.0`); the default is loopback-only.
+The image includes a Docker health check against `/health`. That endpoint reports
+HTTP/RPC liveness with `status: "ok"` and the current distinct connected-peer count;
+`peer_count` is informational, and zero peers is healthy. This build-only setup does
+not provide Docker Compose or deployment configuration.
 
 ---
 
@@ -363,7 +370,7 @@ round_duration_ms = 2000
 key_path = "./validator.key"  # 32-byte hex seed
 ```
 
-**Environment overrides:** `KVNC_DATA_DIR`, `KVNC_LISTEN_ADDR`, `KVNC_RPC_ADDR`, `KVNC_RPC_PORT`, `KVNC_ROUND_DURATION_MS`, `KVNC_VALIDATOR_KEY`.
+**Environment overrides:** `KVNC_DATA_DIR`, `KVNC_LISTEN_ADDR`, `KVNC_RPC_ADDR`, `KVNC_RPC_PORT`, `KVNC_ROUND_DURATION_MS`, `KVNC_VALIDATOR_KEY`, `KVNC_MYSTICGHOST`.
 
 ---
 

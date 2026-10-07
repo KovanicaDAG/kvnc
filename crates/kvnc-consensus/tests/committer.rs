@@ -13,11 +13,22 @@ use common::{
 };
 use kvnc_consensus::committer::BaseCommitter;
 use kvnc_consensus::{
-    CommittedSubDag, CommitteeInfo, LeaderInfo, LeaderStatus, UniversalCommitter,
+    AuthorityInfo, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo, LeaderStatus,
+    UniversalCommitter,
 };
 use kvnc_types::hash::Hash;
-use kvnc_types::{AuthorityIndex, Round};
+use kvnc_types::{Address, AuthorityIndex, PublicKey, Round};
 use std::collections::HashMap;
+
+fn authority(index: AuthorityIndex, stake: u64, key_byte: u8) -> AuthorityInfo {
+    AuthorityInfo {
+        index,
+        stake,
+        public_key: PublicKey([key_byte; 32]),
+        address: Address([key_byte; 32]),
+        network_address: format!("127.0.0.1:{}", key_byte),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CommitteeInfo: thresholds, quorum checks, leader selection
@@ -29,23 +40,70 @@ fn test_committee_quorum_formula_various_sizes() {
     for n in 1u16..=12 {
         let c = committee(n);
         let total = n as u64;
-        assert_eq!(c.total_stake, total, "n={n}");
-        assert_eq!(c.quorum_threshold, (total * 2) / 3 + 1, "n={n}");
-        assert_eq!(c.validity_threshold, total / 3 + 1, "n={n}");
+        assert_eq!(c.total_stake(), total, "n={n}");
+        assert_eq!(c.quorum_threshold(), (total * 2) / 3 + 1, "n={n}");
+        assert_eq!(c.validity_threshold(), total / 3 + 1, "n={n}");
         assert!(
-            c.quorum_threshold > total / 2,
+            c.quorum_threshold() > total / 2,
             "n={n}: quorum must be > half"
         );
-        assert!(c.quorum_threshold <= total, "n={n}");
+        assert!(c.quorum_threshold() <= total, "n={n}");
     }
+}
+
+#[test]
+fn test_committee_rejects_empty_authority_set() {
+    assert_eq!(
+        CommitteeInfo::try_new(0, Vec::new()).unwrap_err(),
+        CommitteeInfoError::EmptyCommittee
+    );
+}
+
+#[test]
+fn test_committee_rejects_zero_stake() {
+    let err = CommitteeInfo::try_new(0, vec![authority(8, 0, 1)]).unwrap_err();
+    assert_eq!(err, CommitteeInfoError::ZeroStake { index: 8 });
+}
+
+#[test]
+fn test_committee_rejects_duplicate_authority_index() {
+    let err = CommitteeInfo::try_new(0, vec![authority(3, 1, 1), authority(3, 1, 2)]).unwrap_err();
+    assert_eq!(
+        err,
+        CommitteeInfoError::DuplicateAuthorityIndex { index: 3 }
+    );
+}
+
+#[test]
+fn test_committee_rejects_duplicate_public_key() {
+    let err = CommitteeInfo::try_new(0, vec![authority(1, 1, 5), authority(2, 1, 5)]).unwrap_err();
+    assert_eq!(err, CommitteeInfoError::DuplicatePublicKey);
+}
+
+#[test]
+fn test_committee_rejects_total_stake_overflow() {
+    let err =
+        CommitteeInfo::try_new(0, vec![authority(1, u64::MAX, 1), authority(2, 1, 2)]).unwrap_err();
+    assert_eq!(err, CommitteeInfoError::StakeOverflow);
+}
+
+#[test]
+fn test_committee_accepts_near_max_stake_and_computes_thresholds_safely() {
+    let c = CommitteeInfo::try_new(42, vec![authority(11, u64::MAX, 1)])
+        .expect("u64::MAX total stake is valid");
+    assert_eq!(c.epoch(), 42);
+    assert_eq!(c.authorities().len(), 1);
+    assert_eq!(c.total_stake(), u64::MAX);
+    assert_eq!(c.quorum_threshold(), 12_297_829_382_473_034_411);
+    assert_eq!(c.validity_threshold(), 6_148_914_691_236_517_206);
 }
 
 #[test]
 fn test_committee_has_quorum_boundary_4_validators() {
     // 4 authorities, f = 1, 2f+1 = 3 votes.
     let c = committee(4);
-    assert_eq!(c.quorum_threshold, 3);
-    assert_eq!(c.validity_threshold, 2);
+    assert_eq!(c.quorum_threshold(), 3);
+    assert_eq!(c.validity_threshold(), 2);
 
     let h = Hash::new("vote");
     let mk = |voters: &[AuthorityIndex]| -> HashMap<AuthorityIndex, Hash> {
@@ -85,9 +143,9 @@ fn test_committee_has_validity_boundary_4_validators() {
 fn test_committee_stake_weighted_thresholds() {
     // Stakes [3, 1, 1, 1]: total 6, quorum = 5, validity = 3.
     let c = committee_with_stakes(&[3, 1, 1, 1]);
-    assert_eq!(c.total_stake, 6);
-    assert_eq!(c.quorum_threshold, 5);
-    assert_eq!(c.validity_threshold, 3);
+    assert_eq!(c.total_stake(), 6);
+    assert_eq!(c.quorum_threshold(), 5);
+    assert_eq!(c.validity_threshold(), 3);
 
     let h = Hash::new("vote");
     let mk = |voters: &[AuthorityIndex]| -> HashMap<AuthorityIndex, Hash> {
@@ -113,12 +171,6 @@ fn test_committee_leader_is_round_robin_and_deterministic() {
     for round in 0..32u64 {
         assert_eq!(c.leader(round), c.leader(round));
     }
-    // Empty committee must not panic.
-    let empty = CommitteeInfo::new(0, Vec::new());
-    assert_eq!(empty.size(), 0);
-    assert_eq!(empty.leader(7), 0);
-    // ... and never grants quorum (quorum threshold is at least 1).
-    assert!(!empty.has_quorum(&HashMap::new(), None));
 }
 
 #[test]
@@ -161,7 +213,7 @@ fn test_direct_decide_2f_plus_1_votes_commits() {
     );
     // Sanity: the exact stake that triggered it.
     let li = leader_info(3, 1, Some(block.digest), LeaderStatus::Undecided, &votes);
-    assert_eq!(voter_stake(&c, &li.votes), c.quorum_threshold);
+    assert_eq!(voter_stake(&c, &li.votes), c.quorum_threshold());
 }
 
 #[test]
@@ -557,36 +609,6 @@ fn test_update_get_leader_roundtrip() {
     assert_eq!(committer.get_all_leaders().len(), 1);
 }
 
-/// `last_decided_round` is monotone: deciding an earlier round never moves it back.
-#[test]
-fn test_mark_decided_monotonic_last_round() {
-    let committer = UniversalCommitter::new(committee(4));
-    assert_eq!(committer.last_decided_round(), 0);
-
-    committer.mark_decided(5, leader_info(5, 1, None, LeaderStatus::Commit, &[]));
-    assert_eq!(committer.last_decided_round(), 5);
-
-    // Marking an earlier round must not lower the watermark.
-    committer.mark_decided(2, leader_info(2, 0, None, LeaderStatus::Skip, &[]));
-    assert_eq!(committer.last_decided_round(), 5);
-
-    committer.mark_decided(9, leader_info(9, 3, None, LeaderStatus::Commit, &[]));
-    assert_eq!(committer.last_decided_round(), 9);
-
-    let decided = committer.get_all_decided_leaders();
-    assert_eq!(decided.get(&2).map(|l| l.status), Some(LeaderStatus::Skip));
-    assert_eq!(
-        decided.get(&5).map(|l| l.status),
-        Some(LeaderStatus::Commit)
-    );
-    assert_eq!(
-        decided.get(&9).map(|l| l.status),
-        Some(LeaderStatus::Commit)
-    );
-    // `get_decided_leaders` is the same view.
-    assert_eq!(committer.get_decided_leaders().len(), decided.len());
-}
-
 #[test]
 fn test_cleanup_old_leaders_retains_cutoff_and_above() {
     let committer = UniversalCommitter::new(committee(4));
@@ -611,11 +633,9 @@ fn test_cleanup_old_leaders_retains_cutoff_and_above() {
             "round {round} should be gone"
         );
     }
-    // Decided state is not affected by leader cleanup.
-    committer.mark_decided(3, leader_info(3, 0, None, LeaderStatus::Commit, &[]));
     committer.cleanup_old_leaders(5);
-    assert_eq!(committer.last_decided_round(), 3);
-    assert!(committer.get_all_decided_leaders().contains_key(&3));
+    assert_eq!(committer.last_decided_round(), 0);
+    assert!(committer.get_all_decided_leaders().is_empty());
 }
 
 #[test]
@@ -625,6 +645,153 @@ fn test_try_commit_with_no_leaders_returns_none() {
     assert!(committer.try_commit(&dag).is_none());
     assert_eq!(committer.last_decided_round(), 0);
     assert!(committer.get_all_decided_leaders().is_empty());
+}
+
+#[test]
+fn durable_commit_cannot_publish_an_unregistered_subdag() {
+    let fabricated = make_block(1, 3, vec![block_ref(&genesis())], "fabricated");
+    let dag = MockDag::with_blocks([fabricated]);
+    let committer = UniversalCommitter::new(committee(4));
+
+    assert!(committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("no eligible commit")
+        .is_none());
+    assert_eq!(committer.last_decided_round(), 0);
+    assert!(committer.get_all_decided_leaders().is_empty());
+    assert!(dag.decisions().is_empty());
+}
+
+#[test]
+fn durable_commit_rejects_registered_round_mismatch_with_leader_block() {
+    let g = genesis();
+    let actual_leader = make_block(2, 6, vec![block_ref(&g)], "wrong-round-leader");
+    let dag = MockDag::with_blocks([g, actual_leader.clone()]);
+    let committer = UniversalCommitter::new(committee(4));
+    // The author matches, but quorum is registered for round 3 while the
+    // matching digest resolves to a round-6 block.
+    committer.update_leader(leader_info(
+        3,
+        2,
+        Some(actual_leader.digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0, 1, 2] {
+        committer.add_vote(3, voter, actual_leader.digest);
+    }
+
+    assert!(committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("metadata mismatch is rejected without a storage error")
+        .is_none());
+    assert!(dag.decisions().is_empty());
+    assert_eq!(committer.last_decided_round(), 0);
+    assert!(committer.get_all_decided_leaders().is_empty());
+}
+
+#[test]
+fn durable_commit_rejects_registered_author_mismatch_with_leader_block() {
+    let g = genesis();
+    let actual_leader = make_block(2, 3, vec![block_ref(&g)], "wrong-author-leader");
+    let dag = MockDag::with_blocks([g, actual_leader.clone()]);
+    let committer = UniversalCommitter::new(committee(4));
+    // The round matches, but quorum is registered for author 1 while the
+    // matching digest resolves to an author-2 block.
+    committer.update_leader(leader_info(
+        3,
+        1,
+        Some(actual_leader.digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0, 1, 2] {
+        committer.add_vote(3, voter, actual_leader.digest);
+    }
+
+    assert!(committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("metadata mismatch is rejected without a storage error")
+        .is_none());
+    assert!(dag.decisions().is_empty());
+    assert_eq!(committer.last_decided_round(), 0);
+    assert!(committer.get_all_decided_leaders().is_empty());
+}
+
+#[test]
+fn durable_commit_rejects_digest_alias_for_matching_round_and_author() {
+    let g = genesis();
+    let actual_leader = make_block(2, 3, vec![block_ref(&g)], "aliased-leader");
+    let alias_digest = Hash::new("kvnc-test/leader-digest-alias");
+    let dag = MockDag::with_blocks([g, actual_leader.clone()]);
+    dag.alias_digest(alias_digest, actual_leader.digest);
+
+    let committer = UniversalCommitter::new(committee(4));
+    committer.update_leader(leader_info(
+        3,
+        2,
+        Some(alias_digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0, 1, 2] {
+        committer.add_vote(3, voter, alias_digest);
+    }
+
+    assert!(committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("digest mismatch is rejected without a storage error")
+        .is_none());
+    assert!(dag.decisions().is_empty());
+    assert!(committer.get_all_decided_leaders().is_empty());
+    assert_eq!(committer.last_decided_round(), 0);
+}
+
+#[test]
+fn durable_commit_persists_before_publication_and_retries_failures() {
+    let g = genesis();
+    let leader = make_block(1, 3, vec![block_ref(&g)], "durable-leader");
+    let dag = MockDag::with_blocks([g, leader.clone()]);
+    let committer = std::sync::Arc::new(UniversalCommitter::new(committee(4)));
+    committer.update_leader(leader_info(
+        3,
+        1,
+        Some(leader.digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0, 1, 2] {
+        committer.add_vote(3, voter, leader.digest);
+    }
+
+    dag.set_fail_next_decision_mark();
+    assert!(committer.try_commit_and_mark_durable(&dag).is_err());
+    assert_eq!(committer.last_decided_round(), 0);
+    assert!(committer.get_all_decided_leaders().is_empty());
+    assert!(dag.decisions().is_empty());
+
+    let observer_committer = std::sync::Arc::clone(&committer);
+    dag.set_decision_mark_observer(move || {
+        assert_eq!(observer_committer.last_decided_round(), 0);
+        assert!(observer_committer.get_all_decided_leaders().is_empty());
+    });
+    let committed = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("decision mark retry succeeds")
+        .expect("eligible leader remains retryable");
+    assert_eq!(committed.leader_round, 3);
+    assert_eq!(dag.decisions(), vec![(3, leader.digest)]);
+    assert_eq!(committer.last_decided_round(), 3);
+    assert_eq!(
+        committer.get_all_decided_leaders()[&3].status,
+        LeaderStatus::Commit
+    );
+
+    assert!(committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("repeated drive is harmless")
+        .is_none());
+    assert_eq!(dag.decisions(), vec![(3, leader.digest)]);
 }
 
 /// Full direct-commit path: quorum votes + leader block in the store produce a
@@ -649,7 +816,8 @@ fn test_try_commit_direct_commit_end_to_end() {
     }
 
     let subdag = committer
-        .try_commit(&dag)
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
         .expect("quorum + present block must commit");
     assert_eq!(subdag.leader_round, 3);
     assert_eq!(subdag.leader_author, 1);
@@ -712,7 +880,10 @@ fn test_try_commit_passes_over_uncertified_round() {
         committer.add_vote(3, voter, b3.digest);
     }
 
-    let subdag = committer.try_commit(&dag).expect("round 3 has quorum");
+    let subdag = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
+        .expect("round 3 has quorum");
     assert_eq!(subdag.leader_round, 3);
     assert_eq!(committer.last_decided_round(), 3);
 
@@ -784,7 +955,10 @@ fn test_try_commit_missing_leader_block_stalls_then_commits() {
 
     // Block arrives -> the same state now commits.
     dag.put(leader_block.clone());
-    let subdag = committer.try_commit(&dag).expect("retry succeeds");
+    let subdag = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
+        .expect("retry succeeds");
     assert_eq!(subdag.leader_round, 3);
     assert_eq!(committer.last_decided_round(), 3);
 }
@@ -808,7 +982,10 @@ fn test_try_commit_no_recommit_after_leader_update() {
     for voter in [0u16, 1, 2] {
         committer.add_vote(3, voter, leader_block.digest);
     }
-    let first = committer.try_commit(&dag).expect("first commit");
+    let first = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
+        .expect("first commit");
     assert_eq!(first.leader_round, 3);
 
     // The engine calls `update_leader` for every block it sees — even for

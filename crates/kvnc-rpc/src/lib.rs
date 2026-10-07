@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use axum::{
     extract::{Extension, Json},
@@ -99,6 +102,8 @@ pub struct RpcState {
     pub mempool: Arc<Mempool>,
     pub staking: Arc<RwLock<StakingState>>,
     pub committee: CommitteeInfo,
+    /// Shared distinct connected-peer count maintained by the network service.
+    pub peer_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -234,7 +239,8 @@ impl RpcServer {
         let app = Router::new()
             .route("/rpc", post(rpc_handler))
             .route("/health", get(health_check))
-            .layer(Extension(self.methods));
+            .layer(Extension(self.methods))
+            .layer(Extension(self.state.peer_count.clone()));
 
         let listener = TcpListener::bind(self.addr).await?;
         let actual_addr = listener.local_addr()?;
@@ -290,8 +296,17 @@ async fn rpc_handler(
     }
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    peer_count: usize,
+}
+
+async fn health_check(Extension(peer_count): Extension<Arc<AtomicUsize>>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        peer_count: peer_count.load(Ordering::Relaxed),
+    })
 }
 
 fn build_success_response(id: Option<Value>, result: Value) -> Response {
@@ -366,4 +381,29 @@ async fn execute_contract_call(
 
     // Return a placeholder success for now — real implementation needs node integration
     bincode::serialize(&()).map_err(|e| RpcError::InternalError(format!("encode failed: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_is_ok_with_zero_peers() {
+        let peer_count = Arc::new(AtomicUsize::new(0));
+        let Json(response) = health_check(Extension(peer_count)).await;
+        let response = serde_json::to_value(response).expect("health response serializes");
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["peer_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_reports_nonzero_peer_count() {
+        let peer_count = Arc::new(AtomicUsize::new(3));
+        let Json(response) = health_check(Extension(peer_count)).await;
+        let response = serde_json::to_value(response).expect("health response serializes");
+
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["peer_count"], 3);
+    }
 }

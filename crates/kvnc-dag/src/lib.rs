@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 pub mod block_manager;
 pub mod dag_store;
+pub mod mergeset;
 
 pub use block_manager::{BlockManager, BlockManagerError};
 pub use dag_store::{DagStore, DagStoreError};

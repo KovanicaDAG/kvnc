@@ -187,6 +187,9 @@ impl DagStore {
 
     /// Store a new DAG block.
     pub fn put_block(&self, block: &StatementBlock) -> Result<(), DagStoreError> {
+        if self.has_block(&block.digest)? {
+            return Ok(());
+        }
         let txn = self.storage.begin_write()?;
         self.storage.consensus().put_dag_block(&txn, block)?;
         txn.commit()?;
@@ -199,6 +202,13 @@ impl DagStore {
         round: Round,
         leader_hash: &Hash,
     ) -> Result<(), DagStoreError> {
+        if self
+            .get_decided_leaders(round)?
+            .iter()
+            .any(|existing| existing == leader_hash)
+        {
+            return Ok(());
+        }
         let txn = self.storage.begin_write()?;
         self.storage
             .consensus()
@@ -227,5 +237,56 @@ impl DagStore {
         let pruned = self.storage.consensus().prune_dag_below(&txn, min_round)?;
         txn.commit()?;
         Ok(pruned)
+    }
+
+    /// Get the mergeset for a leader block.
+    ///
+    /// The mergeset is the set of all blocks reachable from the leader that
+    /// have not yet been included in any previously committed sub-DAG.
+    /// We compute this by BFS from the leader via parent links, stopping when
+    /// we reach a block whose round is <= the last committed leader's round
+    /// (or more precisely, when the round is already decided).
+    pub fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+
+        // Get the last committed leader's round to know where to stop.
+        // If there's no committed leader yet, we don't stop at any round.
+        let committed_leader_round = match self.get_last_committed()? {
+            Some(last_committed_hash) => {
+                let block = self.get_block(&last_committed_hash)?;
+                Some(block.round)
+            }
+            None => None, // No committed leaders yet - don't stop
+        };
+
+        queue.push_back(*leader);
+        visited.insert(*leader);
+
+        while let Some(current) = queue.pop_front() {
+            let block = self.get_block(&current)?;
+
+            // If there's a committed leader and this block's round is <= committed_leader_round,
+            // it's already in a previous sub-DAG. Don't include it and don't traverse further.
+            if current != *leader {
+                if let Some(committed_round) = committed_leader_round {
+                    if block.round <= committed_round {
+                        continue;
+                    }
+                }
+            }
+
+            result.push(current);
+
+            // Traverse parents
+            for parent in self.get_parents(&current)? {
+                if visited.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
