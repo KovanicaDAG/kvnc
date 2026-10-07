@@ -537,3 +537,28 @@ All **FALSE/stub**: Phase 10 chain/tx/account/staking/mempool/consensus RPC hand
 5. **Workspace-wide gates remain red** solely because of `crates/kvnc-rpc` (36 errors, Phase 10 ownership).
 
 Gates this commit: `cargo fmt -p kvnc-consensus --check` ✓ · `cargo clippy -p kvnc-consensus --all-targets -- -D warnings` ✓ · `cargo test -p kvnc-consensus` ✓ (74/74). Workspace-wide `cargo test`/`check` **red** until kvnc-rpc is fixed.
+
+---
+
+## Post-merge update (2026-10-07) — parallel sessions landed while the audit ran
+
+The 5 commits merged from the Phase 10/11/test sessions (`60802c4` RPC, `6486423` CLI, `bc00aa4` runtime+tokenomics tests, `a35f599` mempool stress, `42ba15c` execution replay) land on top of the consensus fixes above. **Merged-tree gates are now fully green:** `cargo fmt --all -- --check` ✓ · `cargo clippy --workspace --all-targets -- -D warnings` ✓ · `cargo test --workspace --all-targets --no-fail-fast` ✓ (0 failures, 0 ignored; `kvnc-consensus` still 74/74 incl. BUG-1..4 fixes).
+
+Verdicts corrected by the merge (old verdicts above superseded where listed):
+
+| Old verdict (above) | New state | Evidence |
+|---------------------|-----------|----------|
+| 8.6 RPC: does not compile / 17 undefined / stub executor | **PARTIAL** — 17 chain/tx/account/staking/mempool/consensus handlers now implemented + tests (kvnc-rpc 5 tests, compiles); **contract executor is still a STUB** (`execute_contract_call` warns "STUB" `lib.rs:348-363`, TODO ContractHost wiring) | `kvnc-rpc/src/chain_methods.rs`, `lib.rs:347-363` |
+| 8.6 CLI: 3-command TODO stub | **PARTIAL** — wallet/node/contracts/rpc/tx/output modules implemented and compiling (`kvnc-cli/src/*.rs`, ~1500 lines); contract subcommands route through the RPC stub above | `kvnc-cli/src/{wallet,node,contracts,rpc,tx,output}.rs` |
+| 5.x mempool: ALL FALSE (FIFO Vec) | **PARTIAL** — fee-rate-priority pool `by_fee_rate: BTreeMap<u64, VecDeque>` (highest first), lowest-fee eviction against `max_mempool_size`, `min_fee_rate`, `fee_rates` stats; still no nonce/balance admission (`lib.rs:194-195` comment) | `kvnc-mempool/src/lib.rs` |
+| 6.1 Kademlia: FALSE | **VERIFIED** — `kad::Behaviour<MemoryStore>` wired with bootstrap + routing-table eviction on ban | `kvnc-network/src/behaviour.rs:26-27,121-124`, `service.rs:277-290,463` |
+| 6.1 gossipsub topics: only blocks+transactions | **PARTIAL** — module doc now lists `transactions`, `votes`, `sync` topics (`lib.rs:4`); on-wire publish paths still to verify for votes/sync | `kvnc-network/src/lib.rs:4` |
+| 6.3 connection mgmt: FALSE | **PARTIAL** — `libp2p-connection-limits` now a dependency; enforcement wiring TBD | kvnc-network deps |
+| 12.1 kvnc-runtime: FALSE (0 tests) | **VERIFIED** — 6 tests (ABI, errors, fuel, exports, host import, memory limits) | `kvnc-runtime/src/lib.rs` |
+| 12.3 tokenomics invariants: PARTIAL | **VERIFIED** — 3 proptests (256 cases each) | `kvnc-staking` (bc00aa4) |
+| 12.3 state transitions: PARTIAL | **VERIFIED** — deterministic staking-replay test (kvnc-execution 7 tests) | `42ba15c` |
+| 12.4 mempool stress: FALSE | **VERIFIED** — 10,000 pending txs under a cap (kvnc-mempool stress test) | `a35f599` |
+
+Verdicts **unchanged by the merge** (still open): **7.1** native tx execution (`TransactionKind::Transfer/Stake/Deploy/Call` still never applied — `execute_committed_subdag` remains reward-only), **4.1d / 9.2** consensus→execution handoff still unwired (`main.rs:225-229` TODO, `exec_tx` never fed ⇒ `run_execution` starves), **7.3** receipts & state root, **8.2** delegation/rotation/slashing/governance, **12.2** multi-node + partition tests, **3.1a** on-hot-path block validation, **13/14** devops & testnet/explorer/faucet.
+
+Merged-tree gates: fmt ✓ · clippy `-D warnings` ✓ · `cargo test --workspace --all-targets --no-fail-fast` ✓ (0 failures / 0 ignored).
