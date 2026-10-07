@@ -37,9 +37,10 @@ impl BaseCommitter {
         }
 
         let votes = &leader_info.votes;
+        let leader_hash = leader_info.block_hash.as_ref();
 
-        // Check if we have quorum (2f+1 stake)
-        if self.committee.has_quorum(votes) {
+        // Check if we have quorum (2f+1 stake) of votes *for the leader block*
+        if self.committee.has_quorum(votes, leader_hash) {
             debug!(
                 "Direct commit: leader round {} author {} has quorum ({} votes)",
                 leader_info.round,
@@ -50,7 +51,7 @@ impl BaseCommitter {
         }
 
         // Check if we have validity threshold but not quorum - could be skip
-        if self.committee.has_validity(votes) {
+        if self.committee.has_validity(votes, leader_hash) {
             debug!(
                 "Leader round {} author {} has validity but not quorum",
                 leader_info.round, leader_info.author
@@ -191,13 +192,61 @@ impl UniversalCommitter {
         if let Some(leader_info) = leaders.get_mut(&leader_round) {
             leader_info.votes.insert(voter, vote_hash);
 
-            // Check if we now have quorum
-            if self.base.committee.has_quorum(&leader_info.votes) {
+            // Check if we now have quorum of votes *for the leader block*
+            if self
+                .base
+                .committee
+                .has_quorum(&leader_info.votes, leader_info.block_hash.as_ref())
+            {
                 leader_info.status = LeaderStatus::Commit;
                 return true;
             }
         }
         false
+    }
+
+    /// Decide (commit or skip) any still-undecided leaders *earlier in the
+    /// same wave* as `commit_round`, using the indirect rule.
+    ///
+    /// In Mysticeti a leader that is committed (directly or indirectly) makes
+    /// the earlier leaders of its wave decidable: each is committed when it is
+    /// causally connected to the committed leader, skipped otherwise. Without
+    /// this sweep the indirect rule is unreachable, because the main
+    /// `try_commit` walk only ever looks at rounds *after* the last decided
+    /// round and `try_indirect_decide` only finds *later* decided leaders in
+    /// the wave.
+    fn decide_earlier_in_wave<D: DagStoreTrait>(&self, dag_store: &D, commit_round: Round) {
+        let wave_start = (commit_round / kvnc_types::WAVE_LENGTH) * kvnc_types::WAVE_LENGTH;
+        if commit_round <= wave_start {
+            return;
+        }
+
+        let leaders = self.leaders.read().clone();
+        let mut decided = self.decided_leaders.read().clone();
+
+        // Treat the round being committed as already committed for the rule.
+        if let Some(committing) = leaders.get(&commit_round) {
+            let mut committing_with_status = committing.clone();
+            committing_with_status.status = LeaderStatus::Commit;
+            decided.insert(commit_round, committing_with_status);
+        }
+
+        for round in wave_start..commit_round {
+            if decided.contains_key(&round) {
+                continue;
+            }
+            let Some(leader_info) = leaders.get(&round) else {
+                continue;
+            };
+            let status = self
+                .base
+                .try_indirect_decide(dag_store, leader_info, &decided);
+            if status != LeaderStatus::Undecided {
+                let mut decided_leader = leader_info.clone();
+                decided_leader.status = status;
+                self.mark_decided(round, decided_leader);
+            }
+        }
     }
 
     /// Clean up old leader info to limit memory usage.
@@ -223,11 +272,14 @@ impl UniversalCommitter {
                 let direct_status = self.base.try_direct_decide(dag_store, leader_info);
 
                 if direct_status == LeaderStatus::Commit {
-                    // Directly commit this leader
+                    // Directly commit this leader (and decide earlier leaders of the wave).
+                    self.decide_earlier_in_wave(dag_store, round);
                     return self.build_committed_subdag(dag_store, leader_info, round);
                 } else if direct_status == LeaderStatus::Skip {
                     // Mark as skipped and continue
-                    self.mark_decided(round, leader_info.clone());
+                    let mut skipped = leader_info.clone();
+                    skipped.status = LeaderStatus::Skip;
+                    self.mark_decided(round, skipped);
                     round += 1;
                     continue;
                 }
@@ -237,9 +289,12 @@ impl UniversalCommitter {
                     self.base
                         .try_indirect_decide(dag_store, leader_info, &decided);
                 if indirect_status == LeaderStatus::Commit {
+                    self.decide_earlier_in_wave(dag_store, round);
                     return self.build_committed_subdag(dag_store, leader_info, round);
                 } else if indirect_status == LeaderStatus::Skip {
-                    self.mark_decided(round, leader_info.clone());
+                    let mut skipped = leader_info.clone();
+                    skipped.status = LeaderStatus::Skip;
+                    self.mark_decided(round, skipped);
                     round += 1;
                     continue;
                 }
@@ -277,7 +332,9 @@ impl UniversalCommitter {
         }
 
         // Mark this leader as decided
-        self.mark_decided(round, leader_info.clone());
+        let mut decided_leader = leader_info.clone();
+        decided_leader.status = LeaderStatus::Commit;
+        self.mark_decided(round, decided_leader);
 
         // Linearize the sub-DAG
         let linearizer = crate::linearizer::Linearizer::new();

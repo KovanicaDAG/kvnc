@@ -74,16 +74,44 @@ impl CommitteeInfo {
         self.get_by_index(index).map(|a| a.stake)
     }
 
-    /// Check if we have quorum for a set of votes.
-    pub fn has_quorum(&self, votes: &HashMap<AuthorityIndex, kvnc_types::hash::Hash>) -> bool {
-        let stake: Stake = votes.keys().filter_map(|idx| self.stake_of(*idx)).sum();
-        stake >= self.quorum_threshold
+    /// Check if we have quorum (2f+1) of votes **for the leader block**.
+    ///
+    /// Only votes whose hash matches `leader_hash` are counted. A vote for a
+    /// different block (equivocation, or a stale/foreign vote) must never
+    /// contribute to committing this leader. When the leader block is unknown
+    /// (`None`), no quorum can exist.
+    pub fn has_quorum(
+        &self,
+        votes: &HashMap<AuthorityIndex, kvnc_types::hash::Hash>,
+        leader_hash: Option<&kvnc_types::hash::Hash>,
+    ) -> bool {
+        self.stake_for(votes, leader_hash) >= self.quorum_threshold
     }
 
-    /// Check if we have validity threshold for a set of votes.
-    pub fn has_validity(&self, votes: &HashMap<AuthorityIndex, kvnc_types::hash::Hash>) -> bool {
-        let stake: Stake = votes.keys().filter_map(|idx| self.stake_of(*idx)).sum();
-        stake >= self.validity_threshold
+    /// Check if we have the validity threshold (f+1) of votes **for the leader block**.
+    pub fn has_validity(
+        &self,
+        votes: &HashMap<AuthorityIndex, kvnc_types::hash::Hash>,
+        leader_hash: Option<&kvnc_types::hash::Hash>,
+    ) -> bool {
+        self.stake_for(votes, leader_hash) >= self.validity_threshold
+    }
+
+    /// Sum the stake of voters whose vote hash matches `leader_hash`.
+    /// Returns 0 when the leader block is unknown.
+    fn stake_for(
+        &self,
+        votes: &HashMap<AuthorityIndex, kvnc_types::hash::Hash>,
+        leader_hash: Option<&kvnc_types::hash::Hash>,
+    ) -> Stake {
+        match leader_hash {
+            Some(target) => votes
+                .iter()
+                .filter(|(_, h)| *h == target)
+                .filter_map(|(idx, _)| self.stake_of(*idx))
+                .sum(),
+            None => 0,
+        }
     }
 
     /// Get the leader for a given round (deterministic stake-weighted selection).

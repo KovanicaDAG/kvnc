@@ -64,12 +64,25 @@ impl Linearizer {
             }
         }
 
-        // Kahn's algorithm
-        let mut queue = VecDeque::new();
-        for (hash, &degree) in &in_degree {
-            if degree == 0 {
-                queue.push_back(*hash);
-            }
+        // Kahn's algorithm — deterministic ordering.
+        //
+        // Seed the queue from the zero-degree nodes sorted by digest, and
+        // expand children in sorted order, so the output depends only on the
+        // graph structure (parent/child edges + the block set), never on
+        // HashMap iteration order or the order of the input `history` slice.
+        // Two nodes with identical committed history must linearize
+        // identically; any divergence here would fork execution.
+        let mut roots: Vec<Hash> = in_degree
+            .iter()
+            .filter(|(_, &degree)| degree == 0)
+            .map(|(hash, _)| *hash)
+            .collect();
+        roots.sort_by_key(|h| h.0);
+        let mut queue: VecDeque<Hash> = roots.into();
+
+        // Canonicalize adjacency lists so child expansion is deterministic.
+        for children in adjacency.values_mut() {
+            children.sort_by_key(|h| h.0);
         }
 
         let mut sorted = Vec::new();
@@ -97,11 +110,15 @@ impl Linearizer {
             }
         }
 
-        // Add any remaining blocks (shouldn't happen in a valid DAG)
-        for block in &history {
-            if !seen.contains(&block.digest) {
-                result_blocks.push(block.clone());
-            }
+        // Add any remaining blocks (shouldn't happen in a valid DAG).
+        // Deterministic: sorted by (round, author, digest) rather than input order.
+        let mut remaining: Vec<&StatementBlock> = history
+            .iter()
+            .filter(|block| !seen.contains(&block.digest))
+            .collect();
+        remaining.sort_by_key(|b| (b.round, b.author, b.digest.0));
+        for block in remaining {
+            result_blocks.push(block.clone());
         }
 
         // Leader should be last in topological order
