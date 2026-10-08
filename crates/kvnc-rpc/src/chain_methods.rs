@@ -143,7 +143,7 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
     match kind {
         TransactionKind::Transfer { to, amount } => json!({
             "type": "transfer",
-            "to": to_hex(&to.0),
+            "to": to.to_string(),
             "amount": quantity(*amount),
         }),
         TransactionKind::Stake { amount } => json!({
@@ -165,7 +165,7 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
             gas_limit,
         } => json!({
             "type": "call",
-            "contract": to_hex(&contract.0),
+            "contract": contract.to_string(),
             "method": method,
             "args": to_hex(args),
             "gas_limit": quantity(*gas_limit),
@@ -177,7 +177,7 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
 pub(crate) fn transaction_to_json(tx: &Transaction) -> Value {
     json!({
         "hash": to_hex(&tx.hash.0),
-        "sender": to_hex(&tx.sender.0),
+        "sender": tx.sender.to_string(),
         "nonce": quantity(tx.nonce),
         "fee": quantity(tx.fee),
         "kind": kind_to_json(&tx.kind),
@@ -440,11 +440,11 @@ pub async fn handle_get_validators(_params: Value, state: RpcState) -> Result<Va
         .iter()
         .map(|v| {
             json!({
-                "address": to_hex(&v.address.0),
+                "address": v.address.to_string(),
                 "stake": quantity(v.stake),
                 "commission_bps": v.commission_bps,
                 "active": v.active,
-                "payout_address": to_hex(&v.payout_address.0),
+                "payout_address": v.payout_address.to_string(),
             })
         })
         .collect();
@@ -545,7 +545,7 @@ pub async fn handle_get_leader_schedule(params: Value, state: RpcState) -> Resul
             let leader_index = committee.leader(round);
             let leader_address = committee
                 .get_by_index(leader_index)
-                .map(|a| to_hex(&a.address.0))
+                .map(|a| a.address.to_string())
                 .unwrap_or_default();
             json!({
                 "round": quantity(round),
@@ -566,7 +566,7 @@ pub async fn handle_get_committee(_params: Value, state: RpcState) -> Result<Val
         .map(|a| {
             json!({
                 "index": a.index,
-                "address": to_hex(&a.address.0),
+                "address": a.address.to_string(),
                 "stake": quantity(a.stake),
                 "network_address": a.network_address,
             })
@@ -625,6 +625,24 @@ mod tests {
 
         assert!(parse_hash(&Value::String("0x1234".into()), "hash").is_err());
         assert!(parse_hash(&Value::String("not-hex".into()), "hash").is_err());
+    }
+
+    #[test]
+    fn parses_canonical_and_hex_addresses() {
+        let address = Address([0x2a; 32]);
+        assert_eq!(address.to_string(), address.encode());
+        assert_eq!(
+            parse_address(&json!(address.to_string()), "address").unwrap(),
+            address
+        );
+        assert_eq!(
+            parse_address(&json!(hex32(0x2a)), "address").unwrap(),
+            address
+        );
+
+        // Correct affixes/length but a wrong checksum must be rejected.
+        let bad = json!(format!("kvnc{}dag", "00".repeat(36)));
+        assert!(parse_address(&bad, "address").is_err());
     }
 
     #[test]
@@ -694,7 +712,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(committee.as_array().unwrap().len(), 1);
-        assert_eq!(committee[0]["address"], json!(hex32(0x09)));
+        assert_eq!(
+            committee[0]["address"],
+            json!(Address([0x09; 32]).to_string())
+        );
 
         let schedule = handle_get_leader_schedule(Value::Null, state.clone())
             .await

@@ -141,7 +141,7 @@ fn encrypted_keystore(
 
     Ok(Keystore {
         version: KEYSTORE_VERSION,
-        address: address.to_hex(),
+        address: address.encode(),
         public_key: hex::encode(public_key.as_bytes()),
         encrypted: true,
         secret_key: hex::encode(ciphertext),
@@ -372,10 +372,13 @@ fn validate_metadata(ks: &Keystore) -> Result<()> {
             let nonce = decode_hex_field(ks.nonce.as_deref(), "nonce", NONCE_LEN)?;
             let parsed_address = address(ks)?;
             let parsed_public_key = public_key(ks)?;
-            if ks.address != parsed_address.to_hex()
+            // Accept the canonical `kvnc…dag` encoding or a bare lowercase hex
+            // address so that keystores written before the canonical format
+            // remain usable.
+            if (ks.address != parsed_address.encode() && ks.address != parsed_address.to_hex())
                 || ks.public_key != hex::encode(parsed_public_key.as_bytes())
             {
-                bail!("v2 identity fields must use canonical lowercase hex");
+                bail!("v2 identity fields must use canonical `kvnc…dag` or lowercase hex");
             }
             let ciphertext = decode_secret(&ks.secret_key)?;
             if ciphertext.len() != CIPHERTEXT_LEN {
@@ -471,15 +474,11 @@ pub fn address(keystore: &Keystore) -> Result<Address> {
     parse_address(&keystore.address, "keystore address")
 }
 
-pub fn parse_address(hex_str: &str, what: &str) -> Result<Address> {
-    let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(raw).with_context(|| format!("{what}: invalid hex"))?;
-    if bytes.len() != 32 {
-        bail!("{what}: expected 32 bytes (64 hex chars)");
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(Address(arr))
+pub fn parse_address(value: &str, what: &str) -> Result<Address> {
+    value
+        .trim()
+        .parse::<Address>()
+        .map_err(|e| anyhow!("{what}: {e}"))
 }
 
 pub fn seed_from_raw_hex(raw: &str) -> Result<Zeroizing<[u8; 32]>> {
@@ -587,6 +586,21 @@ mod tests {
         tampered["public_key"] = serde_json::Value::String("22".repeat(32));
         let loaded = from_value(tampered).unwrap();
         assert!(secret_seed(&loaded, Some("correct horse")).is_err());
+    }
+
+    #[test]
+    fn v2_keystore_uses_canonical_address_and_accepts_legacy_hex() {
+        let ks = from_seed(&[5u8; 32], "pw").unwrap();
+        assert!(ks.address.starts_with("kvnc"));
+        assert!(ks.address.ends_with("dag"));
+        let parsed = address(&ks).unwrap();
+        assert_eq!(parsed.encode(), ks.address);
+
+        // A keystore written before the canonical format stays loadable.
+        let mut legacy = serde_json::to_value(&ks).unwrap();
+        legacy["address"] = serde_json::Value::String(parsed.to_hex());
+        let loaded = from_value(legacy).unwrap();
+        assert_eq!(address(&loaded).unwrap(), parsed);
     }
 
     #[test]
