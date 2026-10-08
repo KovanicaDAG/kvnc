@@ -121,7 +121,7 @@ fn build_scenario(s: &Scenario, mode: VoteMode) -> (UniversalCommitter, MockDag,
     let g = genesis();
     let dag = MockDag::with_blocks([g.clone()]);
     let mut last_stored_parent = block_ref(&g);
-    let committer = UniversalCommitter::new(committee.clone());
+    let committer = UniversalCommitter::new(committee.clone(), false);
 
     for (i, row) in s.rows.iter().enumerate() {
         let round = i as u64 + 1;
@@ -193,7 +193,9 @@ fn run_scenario(s: &Scenario, mode: VoteMode) -> Run {
     let mut status_observations = Vec::new();
 
     for _ in 0..100 {
-        let step = committer.try_commit(&dag);
+        let step = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("persist committed decision");
         for (round, info) in committer.get_all_decided_leaders() {
             status_observations.push((round, info.status));
         }
@@ -327,8 +329,13 @@ proptest! {
         let (committer, dag, committee) = build_scenario(&s, VoteMode::Baseline);
         let mut commits = Vec::new();
         for _ in 0..100 {
-            match committer.try_commit(&dag) {
-                Some(subdag) => commits.push(subdag),
+            match committer
+                .try_commit_and_mark_durable(&dag)
+                .expect("persist committed decision")
+            {
+                Some(subdag) => {
+                    commits.push(subdag);
+                }
                 None => break,
             }
         }
@@ -347,10 +354,10 @@ proptest! {
                 .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
                 .sum();
             prop_assert!(
-                stake_for_leader >= committee.quorum_threshold,
+                stake_for_leader >= committee.quorum_threshold(),
                 "round {round} committed with only {stake_for_leader} stake voting for the \
                  leader block (quorum {})",
-                committee.quorum_threshold
+                committee.quorum_threshold()
             );
 
             prop_assert!(
@@ -717,7 +724,7 @@ proptest! {
         let block = make_block(0, 1, vec![block_ref(&g)], "eq/leader");
         dag.put(block.clone());
 
-        let committer = UniversalCommitter::new(committee.clone());
+        let committer = UniversalCommitter::new(committee.clone(), false);
         committer.update_leader(leader_info(
             1,
             block.author,
@@ -745,10 +752,10 @@ proptest! {
                 .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
                 .sum();
             prop_assert!(
-                stake_for_leader >= committee.quorum_threshold,
+                stake_for_leader >= committee.quorum_threshold(),
                 "committed the leader block with only {stake_for_leader} stake voting for it \
                  (quorum {}); votes: {:?}",
-                committee.quorum_threshold,
+                committee.quorum_threshold(),
                 info.votes
             );
         }
@@ -773,7 +780,7 @@ proptest! {
         let dag_a = MockDag::with_blocks([g.clone()]);
         let block_x = make_block(0, 1, vec![block_ref(&g)], "eq/view-x");
         dag_a.put(block_x.clone());
-        let view_a = UniversalCommitter::new(committee.clone());
+        let view_a = UniversalCommitter::new(committee.clone(), false);
         view_a.update_leader(leader_info(
             1,
             block_x.author,
@@ -788,7 +795,7 @@ proptest! {
         let dag_b = MockDag::with_blocks([g.clone()]);
         let block_y = make_block(0, 1, vec![block_ref(&g)], "eq/view-y");
         dag_b.put(block_y.clone());
-        let view_b = UniversalCommitter::new(committee.clone());
+        let view_b = UniversalCommitter::new(committee.clone(), false);
         view_b.update_leader(leader_info(
             1,
             block_y.author,

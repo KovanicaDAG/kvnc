@@ -100,7 +100,7 @@ pub fn is_entry_point(name: &str) -> bool {
 /// One event emitted during a contract call. Returned by
 /// [`ContractHost::commit`] — events of a failed call are discarded with
 /// everything else.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContractEvent {
     /// Event topic (e.g. `b"htlc_claimed"`).
     pub topic: Vec<u8>,
@@ -577,7 +577,9 @@ impl ContractRunner {
     /// committed only when the runtime returns `Ok` (including
     /// `Ok(empty)`); any [`kvnc_runtime::RuntimeError`] — contract rejection,
     /// out of gas, missing export, trap — drops the host uncommitted.
-    pub fn execute_wasm_call(&mut self, call: WasmCall<'_>) -> Result<Vec<u8>, ExecutionError> {
+    ///
+    /// Returns the output bytes and the emitted events.
+    pub fn execute_wasm_call(&mut self, call: WasmCall<'_>) -> Result<(Vec<u8>, Vec<ContractEvent>), ExecutionError> {
         let key = kvnc_common::hash(call.wasm);
         if !self.modules.contains_key(&key) {
             let module = self.runtime.compile(call.wasm)?;
@@ -598,7 +600,7 @@ impl ContractRunner {
             .execute(module, call.entry, call.args, call.config, &mut host)?;
         let events = host.commit()?;
         log_events(&events);
-        Ok(out)
+        Ok((out, events))
     }
 }
 

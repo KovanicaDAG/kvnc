@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod error;
 pub mod hash;
 pub mod transaction;
+pub mod vote;
 
 pub use address::Address;
 pub use block::{Block, BlockReference, StatementBlock};
@@ -23,6 +24,7 @@ pub use crypto::{PublicKey, Signature, SigningKey};
 pub use error::TypesError;
 pub use hash::Hash;
 pub use transaction::{Transaction, TransactionKind};
+pub use vote::Vote;
 
 /// Logical round number in the DAG.
 pub type Round = u64;

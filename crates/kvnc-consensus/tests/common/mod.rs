@@ -34,7 +34,7 @@ pub fn committee_with_stakes(stakes: &[Stake]) -> CommitteeInfo {
             network_address: format!("/ip4/127.0.0.1/tcp/90{:02}", i),
         })
         .collect();
-    CommitteeInfo::new(0, authorities)
+    CommitteeInfo::try_new(0, authorities).expect("test committee is valid")
 }
 
 /// Build a block. `tag` must be unique within a test; it determines the digest.
@@ -102,6 +102,10 @@ pub fn voter_stake(committee: &CommitteeInfo, votes: &HashMap<AuthorityIndex, Ha
 #[derive(Default)]
 pub struct MockDag {
     blocks: parking_lot::RwLock<HashMap<Hash, StatementBlock>>,
+    digest_aliases: parking_lot::RwLock<HashMap<Hash, Hash>>,
+    decisions: parking_lot::Mutex<Vec<(Round, Hash)>>,
+    fail_next_decision_mark: AtomicBool,
+    decision_mark_observer: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl MockDag {
@@ -121,26 +125,75 @@ impl MockDag {
         self.blocks.write().insert(block.digest, block);
     }
 
+    /// Resolve `alias` to the stored block identified by `actual_digest`.
+    /// Useful for testing stores that return inconsistent digest metadata.
+    pub fn alias_digest(&self, alias: Hash, actual_digest: Hash) {
+        assert_ne!(alias, actual_digest, "digest alias must be distinct");
+        self.digest_aliases.write().insert(alias, actual_digest);
+    }
+
+    fn resolve_digest(&self, digest: &Hash) -> Hash {
+        self.digest_aliases
+            .read()
+            .get(digest)
+            .copied()
+            .unwrap_or(*digest)
+    }
+
     pub fn contains(&self, digest: &Hash) -> bool {
         self.blocks.read().contains_key(digest)
+    }
+
+    pub fn blocks(&self) -> Vec<StatementBlock> {
+        self.blocks.read().values().cloned().collect()
+    }
+
+    pub fn set_fail_next_decision_mark(&self) {
+        self.fail_next_decision_mark.store(true, Ordering::SeqCst);
+    }
+
+    pub fn decisions(&self) -> Vec<(Round, Hash)> {
+        self.decisions.lock().clone()
+    }
+
+    pub fn set_decision_mark_observer(&self, observer: impl Fn() + Send + Sync + 'static) {
+        *self.decision_mark_observer.lock() = Some(Box::new(observer));
     }
 }
 
 impl DagStoreTrait for MockDag {
     fn get_block(&self, hash: &Hash) -> Result<StatementBlock, DagStoreError> {
+        let digest = self.resolve_digest(hash);
         self.blocks
             .read()
-            .get(hash)
+            .get(&digest)
             .cloned()
             .ok_or_else(|| DagStoreError::NotFound(format!("block {hash}")))
     }
 
-    fn get_ancestors(&self, hash: &Hash, min_round: Round) -> Result<Vec<Hash>, DagStoreError> {
+    fn get_parents(
+        &self,
+        hash: &Hash,
+    ) -> Result<Vec<Hash>, DagStoreError> {
+        let digest = self.resolve_digest(hash);
+        let blocks = self.blocks.read();
+        let block = blocks
+            .get(&digest)
+            .ok_or_else(|| DagStoreError::NotFound(format!("block {hash}")))?;
+        Ok(block.parents.iter().map(|p| p.digest).collect())
+    }
+
+    fn get_ancestors(
+        &self,
+        hash: &Hash,
+        min_round: Round,
+    ) -> Result<Vec<Hash>, DagStoreError> {
+        let root_digest = self.resolve_digest(hash);
         let blocks = self.blocks.read();
         let mut ancestors = Vec::new();
         let mut visited: HashSet<Hash> = HashSet::new();
         let mut queue: VecDeque<Hash> = VecDeque::new();
-        queue.push_back(*hash);
+        queue.push_back(root_digest);
 
         while let Some(current) = queue.pop_front() {
             if visited.contains(&current) {
@@ -194,7 +247,8 @@ impl DagStoreTrait for MockDag {
     }
 
     fn has_block(&self, hash: &Hash) -> Result<bool, DagStoreError> {
-        Ok(self.blocks.read().contains_key(hash))
+        let digest = self.resolve_digest(hash);
+        Ok(self.blocks.read().contains_key(&digest))
     }
 
     fn put_block(&self, block: &StatementBlock) -> Result<(), DagStoreError> {
@@ -214,14 +268,66 @@ impl DagStoreTrait for MockDag {
         Ok(0)
     }
 
-    fn mark_round_decided(&self, _round: Round, _leader_hash: &Hash) -> Result<(), DagStoreError> {
+    fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
+        if let Some(observer) = self.decision_mark_observer.lock().as_ref() {
+            observer();
+        }
+        if self.fail_next_decision_mark.swap(false, Ordering::SeqCst) {
+            return Err(DagStoreError::NotFound(
+                "injected decision-mark failure".into(),
+            ));
+        }
+        let mut decisions = self.decisions.lock();
+        if !decisions.contains(&(round, *leader_hash)) {
+            decisions.push((round, *leader_hash));
+        }
         Ok(())
+    }
+
+    fn mergeset(&self, _leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        Ok(Vec::new())
+    }
+
+    fn get_blocks(
+        &self,
+        hashes: &[Hash],
+    ) -> Result<Vec<StatementBlock>, DagStoreError> {
+        let blocks = self.blocks.read();
+        Ok(hashes
+            .iter()
+            .filter_map(|h| {
+                let digest = self.resolve_digest(h);
+                blocks.get(&digest).cloned()
+            })
+            .collect())
+    }
+
+    fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, DagStoreError> {
+        Ok(self
+            .decisions
+            .lock()
+            .iter()
+            .filter(|(r, _)| *r == round)
+            .map(|(_, h)| *h)
+            .collect())
+    }
+
+    fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, DagStoreError> {
+        Ok(self
+            .decisions
+            .lock()
+            .iter()
+            .filter(|(r, _)| *r <= max_round)
+            .map(|(r, _)| *r)
+            .collect())
     }
 }
 
 /// In-memory block manager for `kvnc_consensus::ConsensusEngine` tests.
 pub struct MockBlockManager {
     authority: AuthorityIndex,
+    dag: std::sync::Arc<MockDag>,
+    signing_key: parking_lot::RwLock<Option<SigningKey>>,
     fail_process: AtomicBool,
     process_calls: AtomicUsize,
     propose_calls: AtomicUsize,
@@ -229,9 +335,11 @@ pub struct MockBlockManager {
 }
 
 impl MockBlockManager {
-    pub fn new(authority: AuthorityIndex) -> Self {
+    pub fn new(authority: AuthorityIndex, dag: std::sync::Arc<MockDag>) -> Self {
         Self {
             authority,
+            dag,
+            signing_key: parking_lot::RwLock::new(None),
             fail_process: AtomicBool::new(false),
             process_calls: AtomicUsize::new(0),
             propose_calls: AtomicUsize::new(0),
@@ -259,23 +367,34 @@ impl MockBlockManager {
 
 impl BlockManagerTrait for MockBlockManager {
     fn propose_block(&self, round: Round) -> Result<StatementBlock, BlockManagerError> {
-        let block = make_block(
-            self.authority,
+        let parents = Vec::new();
+        let transactions = Vec::new();
+        let digest = StatementBlock::compute_digest(self.authority, round, &parents, &transactions);
+        let key = self.signing_key.read().clone().ok_or_else(|| {
+            BlockManagerError::InvalidBlock("validator signing key is not installed".into())
+        })?;
+        let block = StatementBlock {
+            author: self.authority,
             round,
-            Vec::new(),
-            &format!("proposed/{}/{}", self.authority, round),
-        );
+            parents,
+            transactions,
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest.as_ref()),
+            digest,
+        };
+        self.dag.put(block.clone());
         self.propose_calls.fetch_add(1, Ordering::SeqCst);
         Ok(block)
     }
 
-    fn process_block(&self, _block: &StatementBlock) -> Result<(), BlockManagerError> {
+    fn process_block(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
         self.process_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_process.load(Ordering::SeqCst) {
             return Err(BlockManagerError::InvalidBlock(
                 "mock block manager rejects".into(),
             ));
         }
+        self.dag.put(block.clone());
         Ok(())
     }
 
@@ -283,7 +402,8 @@ impl BlockManagerTrait for MockBlockManager {
         self.authority
     }
 
-    fn set_signing_key(&self, _key: SigningKey) {
+    fn set_signing_key(&self, key: SigningKey) {
+        *self.signing_key.write() = Some(key);
         self.signing_key_set.store(true, Ordering::SeqCst);
     }
 }
@@ -299,7 +419,10 @@ pub fn drive_try_commit(
 ) -> Vec<kvnc_consensus::CommittedSubDag> {
     let mut out = Vec::new();
     for _ in 0..10_000 {
-        match committer.try_commit(dag) {
+        match committer
+            .try_commit_and_mark_durable(dag)
+            .expect("persist committed decision")
+        {
             Some(subdag) => out.push(subdag),
             None => return out,
         }
@@ -317,9 +440,24 @@ pub fn make_engine(
     std::sync::Arc<MockDag>,
     std::sync::Arc<parking_lot::RwLock<MockBlockManager>>,
 ) {
+    let (signing_key, public_key) = kvnc_crypto::generate_keypair();
+    let mut authorities = committee.authorities().to_vec();
+    if let Some(info) = authorities.iter_mut().find(|info| info.index == authority) {
+        info.public_key = public_key;
+    }
+    let committee = kvnc_consensus::CommitteeInfo::try_new(committee.epoch(), authorities)
+        .expect("updated test committee is valid");
     let dag = std::sync::Arc::new(MockDag::new());
-    let manager = std::sync::Arc::new(parking_lot::RwLock::new(MockBlockManager::new(authority)));
-    let engine =
-        kvnc_consensus::ConsensusEngine::new(config, committee, dag.clone(), manager.clone());
+    let manager = std::sync::Arc::new(parking_lot::RwLock::new(MockBlockManager::new(
+        authority,
+        dag.clone(),
+    )));
+    let engine = kvnc_consensus::ConsensusEngine::new(
+        config,
+        committee,
+        dag.clone(),
+        manager.clone(),
+        signing_key,
+    );
     (engine, dag, manager)
 }

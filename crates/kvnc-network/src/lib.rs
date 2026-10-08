@@ -11,21 +11,23 @@
 #![allow(clippy::large_enum_variant)]
 
 mod behaviour;
+mod block_sync;
 mod error;
 mod service;
 mod sync;
 pub mod topics;
 
+pub use block_sync::{BlockRequest, BlockResponse, BlockSyncRequestEvent, BlockSyncResponseEvent, BLOCK_SYNC_PROTOCOL};
 pub use error::NetworkError;
 pub use service::NetworkService;
 pub use sync::SyncRequest;
 
-use kvnc_types::{block::StatementBlock, transaction::Transaction, Round};
+use kvnc_types::{block::StatementBlock, transaction::Transaction, Vote, Round};
 use libp2p::{Multiaddr, PeerId};
 use std::time::Duration;
 
 /// Network event emitted by the networking layer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum NetworkEvent {
     /// A new block was received.
     BlockReceived(StatementBlock),
@@ -37,7 +39,7 @@ pub enum NetworkEvent {
     PeerDisconnected(PeerId),
     /// A new peer was discovered.
     PeerDiscovered(PeerId, Multiaddr),
-    /// Sync request received.
+    /// Sync request received (gossipsub-based).
     SyncRequest {
         /// Peer that issued the request.
         peer: PeerId,
@@ -45,6 +47,22 @@ pub enum NetworkEvent {
         from_round: Round,
         /// Last round of the requested range.
         to_round: Round,
+    },
+    /// Block sync response received (request-response).
+    BlockSyncResponse {
+        /// Peer that sent the response.
+        peer: PeerId,
+        /// The request ID this response corresponds to.
+        request_id: libp2p::request_response::OutboundRequestId,
+        /// The response.
+        response: BlockResponse,
+    },
+    /// A consensus vote was received.
+    VoteReceived {
+        /// Peer that sent the vote.
+        peer: PeerId,
+        /// The vote.
+        vote: Vote,
     },
 }
 

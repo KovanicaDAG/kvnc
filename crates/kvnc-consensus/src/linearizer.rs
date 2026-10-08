@@ -19,6 +19,9 @@ impl Linearizer {
         leader: StatementBlock,
         history: Vec<StatementBlock>,
     ) -> CommittedSubDag {
+        let mut history = history;
+        history.sort_by_key(block_order_key);
+
         // Build a map of blocks by hash for quick lookup
         let mut block_map: HashMap<Hash, StatementBlock> = HashMap::new();
         for block in &history {
@@ -138,8 +141,58 @@ impl Linearizer {
     }
 }
 
+fn block_order_key(block: &StatementBlock) -> (u64, u16, [u8; 32]) {
+    (block.round, block.author, block.digest.0)
+}
+
 impl Default for Linearizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvnc_types::{block::BlockReference, Signature};
+
+    fn block(author: u16, round: u64, parents: Vec<BlockReference>) -> StatementBlock {
+        let digest = StatementBlock::compute_digest(author, round, &parents, &[]);
+        StatementBlock {
+            author,
+            round,
+            parents,
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+        }
+    }
+
+    fn reference(block: &StatementBlock) -> BlockReference {
+        BlockReference {
+            author: block.author,
+            round: block.round,
+            digest: block.digest,
+        }
+    }
+
+    #[test]
+    fn fork_history_linearizes_deterministically() {
+        let root = block(0, 1, Vec::new());
+        let left = block(1, 2, vec![reference(&root)]);
+        let right = block(2, 2, vec![reference(&root)]);
+        let leader = block(0, 3, vec![reference(&left), reference(&right)]);
+
+        let forward = Linearizer::new().linearize(
+            leader.clone(),
+            vec![root.clone(), left.clone(), right.clone()],
+        );
+        let reversed = Linearizer::new().linearize(leader, vec![right, root, left]);
+        let forward_hashes: Vec<_> = forward.blocks.iter().map(|block| block.digest).collect();
+        let reversed_hashes: Vec<_> = reversed.blocks.iter().map(|block| block.digest).collect();
+
+        assert_eq!(forward_hashes, reversed_hashes);
+        assert_eq!(forward_hashes.last(), Some(&forward.leader.digest));
     }
 }

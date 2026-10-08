@@ -71,6 +71,32 @@ impl RpcClient {
             .cloned()
             .ok_or_else(|| anyhow!("RPC `{method}`: response had no `result` (HTTP {status})"))
     }
+
+    /// Read the node's `/health` peer count.
+    ///
+    /// Health is supplementary to the JSON-RPC status data, so transport errors,
+    /// non-success responses, and malformed payloads are reported as `None`.
+    pub async fn health_peer_count(&self) -> Option<usize> {
+        let url = format!("{}/health", self.url.strip_suffix("/rpc")?);
+        let response = self.http.get(url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value: Value = response.json().await.ok()?;
+        parse_health_peer_count(&value)
+    }
+}
+
+/// Parse the peer count from a successful node `/health` response.
+///
+/// A count is only trusted when the response has the expected `status: "ok"`
+/// shape and an unsigned integer `peer_count` field. In particular, zero is a
+/// valid count; absent or malformed data is not treated as zero.
+pub fn parse_health_peer_count(value: &Value) -> Option<usize> {
+    if value.get("status")?.as_str()? != "ok" {
+        return None;
+    }
+    usize::try_from(value.get("peer_count")?.as_u64()?).ok()
 }
 
 /// Parse a JSON-RPC quantity (decimal number or `0x`-prefixed hex string).
@@ -144,5 +170,31 @@ mod tests {
         assert_eq!(parse_quantity(&json!(42)).unwrap(), 42);
         assert_eq!(parse_quantity(&json!("0x2a")).unwrap(), 42);
         assert!(parse_quantity(&json!("nope")).is_err());
+    }
+
+    #[test]
+    fn health_peer_count_accepts_zero_and_nonzero() {
+        assert_eq!(
+            parse_health_peer_count(&json!({"status":"ok", "peer_count":0})),
+            Some(0)
+        );
+        assert_eq!(
+            parse_health_peer_count(&json!({"status":"ok", "peer_count":3})),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn health_peer_count_rejects_missing_or_malformed_data() {
+        assert_eq!(parse_health_peer_count(&json!({"status":"ok"})), None);
+        assert_eq!(
+            parse_health_peer_count(&json!({"status":"ok", "peer_count":"3"})),
+            None
+        );
+        assert_eq!(
+            parse_health_peer_count(&json!({"status":"error", "peer_count":3})),
+            None
+        );
+        assert_eq!(parse_health_peer_count(&json!({"peer_count":3})), None);
     }
 }

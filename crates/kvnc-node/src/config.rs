@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub max_peers: usize,
     /// Genesis treasury address (32-byte hex). Defaults to the zero address.
     pub treasury_address: Option<String>,
+    /// Enable the experimental MysticGhost ordering path (default off).
+    pub use_mysticghost: bool,
 }
 
 impl Default for NodeConfig {
@@ -47,6 +49,7 @@ impl Default for NodeConfig {
             round_duration_ms: 2000,
             max_peers: 50,
             treasury_address: None,
+            use_mysticghost: false,
         }
     }
 }
@@ -119,6 +122,13 @@ impl NodeConfig {
         }
         if let Ok(v) = std::env::var("KVNC_TREASURY_ADDRESS") {
             self.treasury_address = Some(v);
+        }
+        if let Ok(v) = std::env::var("KVNC_MYSTICGHOST") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.use_mysticghost = true,
+                "0" | "false" | "no" | "off" => self.use_mysticghost = false,
+                _ => tracing::warn!(value = %v, "ignoring invalid KVNC_MYSTICGHOST"),
+            }
         }
     }
 

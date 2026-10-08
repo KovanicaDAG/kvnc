@@ -2,6 +2,7 @@
 
 use crate::{
     behaviour::{self, Behaviour},
+    block_sync::{BlockRequest, BlockResponse},
     error::NetworkError,
     sync::SyncRequest,
     topics, NetworkConfig, NetworkEvent,
@@ -9,15 +10,19 @@ use crate::{
 use futures::StreamExt;
 use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolError};
-use kvnc_types::{StatementBlock, Transaction};
+use kvnc_types::{StatementBlock, Transaction, Vote};
 use libp2p::{
-    gossipsub, identify, kad,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    gossipsub, identify, kad, request_response,
+    swarm::{dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -29,11 +34,20 @@ type BehaviourEvent = <Behaviour as NetworkBehaviour>::ToSwarm;
 /// and evicted from the Kademlia routing table.
 const PING_FAILURE_LIMIT: u32 = 3;
 
+/// Maximum consecutive invalid block failures before a peer is banned.
+const INVALID_BLOCK_FAILURE_LIMIT: u32 = 5;
+
+/// Keep bootstrap retries bounded and separated so stale seeds do not trigger
+/// a burst of simultaneous dials.
+const BOOTSTRAP_RETRY_BASE: Duration = Duration::from_secs(1);
+const BOOTSTRAP_RETRY_MAX: Duration = Duration::from_secs(60);
+const BOOTSTRAP_DIAL_STAGGER: Duration = Duration::from_millis(250);
+
 /// Main network service.
 pub struct NetworkService {
     /// Effective configuration.
     config: NetworkConfig,
-    /// Store that ingests blocks received over gossip.
+    /// DAG store for serving block sync requests.
     dag_store: Arc<DagStore>,
     /// Mempool that ingests transactions received over gossip.
     mempool: Arc<Mempool>,
@@ -44,11 +58,150 @@ pub struct NetworkService {
     swarm: Mutex<Swarm<Behaviour>>,
     /// Peers we reported as connected; source of [`NetworkService::connected_peers`].
     connected: Mutex<HashSet<PeerId>>,
+    /// Shared snapshot of the distinct connected-peer count for status surfaces.
+    peer_count: Arc<AtomicUsize>,
     /// Consecutive ping failures per peer.
     ping_failures: Mutex<HashMap<PeerId, u32>>,
+    /// Invalid block failures per peer (invalid sig, unknown author, bad parents, etc.)
+    invalid_block_failures: Mutex<HashMap<PeerId, u32>>,
     /// Addresses learned for a peer (from Kademlia), used to evict banned peers
     /// from the routing table.
     peer_addresses: Mutex<HashMap<PeerId, Vec<Multiaddr>>>,
+    /// Bootstrap transport attempts survive cancellation/re-entry of `start`.
+    bootstrap: Mutex<BootstrapMaintenance>,
+}
+
+/// State for one distinct, configured bootstrap address.
+struct BootstrapAddress {
+    address: Multiaddr,
+    retry_at: Instant,
+    failures: u32,
+    pending: Option<ConnectionId>,
+    peer: Option<PeerId>,
+    endpoint: Option<Multiaddr>,
+}
+
+/// Small deterministic state machine for bootstrap-only transport maintenance.
+/// It deliberately knows nothing about discovered or otherwise connected peers.
+struct BootstrapMaintenance {
+    addresses: Vec<BootstrapAddress>,
+    next_dial_at: Option<Instant>,
+}
+
+impl BootstrapMaintenance {
+    fn new(addresses: &[Multiaddr], max_peers: usize, now: Instant) -> Self {
+        let mut seen = HashSet::new();
+        let addresses = addresses
+            .iter()
+            .filter(|address| seen.insert((*address).clone()))
+            .take(max_peers)
+            .map(|address| BootstrapAddress {
+                address: address.clone(),
+                retry_at: now,
+                failures: 0,
+                pending: None,
+                peer: None,
+                endpoint: None,
+            })
+            .collect();
+        Self {
+            addresses,
+            next_dial_at: None,
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        let retry = self
+            .addresses
+            .iter()
+            .filter(|state| state.pending.is_none() && state.peer.is_none())
+            .map(|state| state.retry_at)
+            .min()?;
+        Some(
+            self.next_dial_at
+                .map_or(retry, |stagger| retry.max(stagger)),
+        )
+    }
+
+    fn due_address(&mut self, now: Instant) -> Option<(usize, Multiaddr)> {
+        if self.next_dial_at.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+        let (index, state) = self.addresses.iter_mut().enumerate().find(|(_, state)| {
+            state.pending.is_none() && state.peer.is_none() && state.retry_at <= now
+        })?;
+        self.next_dial_at = Some(now + BOOTSTRAP_DIAL_STAGGER);
+        Some((index, state.address.clone()))
+    }
+
+    fn set_attempt(&mut self, index: usize, connection_id: ConnectionId) {
+        if let Some(state) = self.addresses.get_mut(index) {
+            state.pending = Some(connection_id);
+        }
+    }
+
+    fn fail_attempt(&mut self, connection_id: ConnectionId, now: Instant) -> bool {
+        let Some((index, state)) = self
+            .addresses
+            .iter_mut()
+            .enumerate()
+            .find(|(_, state)| state.pending == Some(connection_id))
+        else {
+            return false;
+        };
+        state.pending = None;
+        Self::schedule_retry(index, state, now);
+        true
+    }
+
+    fn establish_attempt(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        endpoint: Multiaddr,
+    ) -> bool {
+        let Some(state) = self
+            .addresses
+            .iter_mut()
+            .find(|state| state.pending == Some(connection_id))
+        else {
+            return false;
+        };
+        state.pending = None;
+        state.failures = 0;
+        state.peer = Some(peer);
+        state.endpoint = Some(endpoint);
+        true
+    }
+
+    fn peer_disconnected(&mut self, peer: PeerId, num_established: u32, now: Instant) -> bool {
+        if num_established != 0 {
+            return false;
+        }
+        let mut matched = false;
+        for (index, state) in self.addresses.iter_mut().enumerate() {
+            if state.peer == Some(peer) {
+                state.peer = None;
+                state.endpoint = None;
+                Self::schedule_retry(index, state, now);
+                matched = true;
+            }
+        }
+        matched
+    }
+
+    fn schedule_retry(index: usize, state: &mut BootstrapAddress, now: Instant) {
+        state.failures = state.failures.saturating_add(1);
+        let shift = state.failures.saturating_sub(1).min(31);
+        let backoff = BOOTSTRAP_RETRY_BASE
+            .checked_mul(1u32 << shift)
+            .unwrap_or(BOOTSTRAP_RETRY_MAX)
+            .min(BOOTSTRAP_RETRY_MAX);
+        // Apply a stable per-address offset even when several failures happen
+        // together, while keeping the total delay within the retry cap.
+        let stagger = BOOTSTRAP_DIAL_STAGGER.saturating_mul((index as u32).min(240));
+        state.retry_at = now + backoff.saturating_add(stagger).min(BOOTSTRAP_RETRY_MAX);
+    }
 }
 
 /// Lock a mutex, recovering from poisoning: a panic while a lock is held must
@@ -70,6 +223,8 @@ impl NetworkService {
     ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkEvent>), NetworkError> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let swarm = behaviour::build_swarm(&config)?;
+        let bootstrap =
+            BootstrapMaintenance::new(&config.bootstrap_nodes, config.max_peers, Instant::now());
         info!(peer_id = %swarm.local_peer_id(), "network swarm created");
 
         Ok((
@@ -80,8 +235,11 @@ impl NetworkService {
                 event_tx,
                 swarm: Mutex::new(swarm),
                 connected: Mutex::new(HashSet::new()),
+                peer_count: Arc::new(AtomicUsize::new(0)),
                 ping_failures: Mutex::new(HashMap::new()),
+                invalid_block_failures: Mutex::new(HashMap::new()),
                 peer_addresses: Mutex::new(HashMap::new()),
+                bootstrap: Mutex::new(bootstrap),
             },
             event_rx,
         ))
@@ -100,11 +258,7 @@ impl NetworkService {
             }
         }
 
-        for addr in &self.config.bootstrap_nodes {
-            if let Err(err) = self.swarm().dial(addr.clone()) {
-                warn!(%addr, %err, "failed to dial bootstrap node");
-            }
-        }
+        self.dial_due_bootstrap();
 
         if let Err(err) = self.swarm().behaviour_mut().kad.bootstrap() {
             debug!(%err, "kad bootstrap deferred: no known peers yet");
@@ -117,7 +271,19 @@ impl NetworkService {
         );
 
         loop {
-            let Some(event) = self.next_swarm_event().await else {
+            let event = match self.next_bootstrap_deadline() {
+                Some(deadline) => {
+                    tokio::select! {
+                        event = self.next_swarm_event() => event,
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                            self.dial_due_bootstrap();
+                            continue;
+                        }
+                    }
+                }
+                None => self.next_swarm_event().await,
+            };
+            let Some(event) = event else {
                 return Err(NetworkError::Swarm(
                     "swarm event stream ended unexpectedly".to_string(),
                 ));
@@ -138,6 +304,12 @@ impl NetworkService {
         self.publish(topics::TRANSACTIONS, payload)
     }
 
+    /// Broadcast a vote to all peers.
+    pub fn broadcast_vote(&self, vote: &Vote) -> Result<(), NetworkError> {
+        let payload = bincode::serialize(vote)?;
+        self.publish(topics::VOTES, payload)
+    }
+
     /// Get connected peers.
     pub fn connected_peers(&self) -> HashSet<PeerId> {
         lock(&self.connected).clone()
@@ -146,6 +318,14 @@ impl NetworkService {
     /// Get peer count.
     pub fn peer_count(&self) -> usize {
         lock(&self.connected).len()
+    }
+
+    /// Get a cloneable snapshot handle for the distinct connected-peer count.
+    ///
+    /// The value is updated by the network event loop whenever its existing
+    /// distinct-peer bookkeeping changes.
+    pub fn peer_count_handle(&self) -> Arc<AtomicUsize> {
+        self.peer_count.clone()
     }
 
     /// Lock the swarm.
@@ -161,6 +341,29 @@ impl NetworkService {
     /// across an await point would block [`NetworkService::publish`].
     async fn next_swarm_event(&self) -> Option<SwarmEvent<BehaviourEvent>> {
         std::future::poll_fn(|ctx| lock(&self.swarm).poll_next_unpin(ctx)).await
+    }
+
+    fn next_bootstrap_deadline(&self) -> Option<Instant> {
+        lock(&self.bootstrap).next_deadline()
+    }
+
+    /// Start at most one due configured-bootstrap dial. The next attempt is
+    /// staggered, and pending connection IDs survive cancellation of `start`.
+    fn dial_due_bootstrap(&self) {
+        let now = Instant::now();
+        let Some((index, address)) = lock(&self.bootstrap).due_address(now) else {
+            return;
+        };
+        let opts = DialOpts::unknown_peer_id().address(address.clone()).build();
+        let connection_id = opts.connection_id();
+        lock(&self.bootstrap).set_attempt(index, connection_id);
+        match self.swarm().dial(opts) {
+            Ok(()) => debug!(%address, ?connection_id, "dialing configured bootstrap"),
+            Err(error) => {
+                lock(&self.bootstrap).fail_attempt(connection_id, Instant::now());
+                warn!(%address, %error, "failed to dial bootstrap node");
+            }
+        }
     }
 
     /// Publish a serialized payload on a gossipsub topic.
@@ -182,6 +385,34 @@ impl NetworkService {
         }
     }
 
+    /// Respond to a block sync request.
+    pub fn respond_block_sync(
+        &self,
+        channel: request_response::ResponseChannel<BlockResponse>,
+        response: BlockResponse,
+    ) -> Result<(), NetworkError> {
+        let mut swarm = self.swarm();
+        swarm
+            .behaviour_mut()
+            .block_sync
+            .send_response(channel, response)
+            .map_err(|e| NetworkError::Swarm(format!("failed to send block sync response: {e}")))
+    }
+
+    /// Send a block sync request to a peer.
+    pub fn request_block_sync(
+        &self,
+        peer: PeerId,
+        request: BlockRequest,
+    ) -> Result<request_response::OutboundRequestId, NetworkError> {
+        let mut swarm = self.swarm();
+        let request_id = swarm
+            .behaviour_mut()
+            .block_sync
+            .send_request(&peer, request);
+        Ok(request_id)
+    }
+
     /// Forward an event to the caller. A dropped receiver only means nobody is
     /// consuming events anymore, so this never fails the event loop.
     fn emit(&self, event: NetworkEvent) {
@@ -190,28 +421,53 @@ impl NetworkService {
         }
     }
 
-    /// Turn a swarm event into [`NetworkEvent`]s and store writes.
+    /// Turn a swarm event into [`NetworkEvent`]s.
     fn handle_swarm_event(&self, event: SwarmEvent<BehaviourEvent>) -> Result<(), NetworkError> {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening on new address");
                 Ok(())
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => self.on_peer_connected(peer_id),
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
+            } => {
+                lock(&self.bootstrap).establish_attempt(
+                    connection_id,
+                    peer_id,
+                    endpoint.get_remote_address().clone(),
+                );
+                self.on_peer_connected(peer_id)
+            }
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 num_established,
                 ..
             } => {
                 if num_established == 0 {
+                    if lock(&self.bootstrap).peer_disconnected(
+                        peer_id,
+                        num_established,
+                        Instant::now(),
+                    ) {
+                        debug!(%peer_id, "configured bootstrap disconnected; retry scheduled");
+                    }
                     self.on_peer_disconnected(peer_id);
                 }
                 Ok(())
             }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                // Dial failures are tolerated: bootstrap addresses go stale and
-                // Kademlia retries through other routing table entries.
-                debug!(?peer_id, %error, "outgoing connection failed");
+            SwarmEvent::OutgoingConnectionError {
+                peer_id,
+                connection_id,
+                error,
+            } => {
+                if lock(&self.bootstrap).fail_attempt(connection_id, Instant::now()) {
+                    debug!(?peer_id, ?connection_id, %error, "bootstrap dial failed; retry scheduled");
+                } else {
+                    debug!(?peer_id, ?connection_id, %error, "outgoing connection failed");
+                }
                 Ok(())
             }
             SwarmEvent::IncomingConnectionError { error, .. } => {
@@ -234,6 +490,7 @@ impl NetworkService {
             BehaviourEvent::Kad(event) => self.handle_kad_event(event),
             BehaviourEvent::Ping(event) => self.handle_ping_event(event),
             BehaviourEvent::Identify(event) => self.handle_identify_event(event),
+            BehaviourEvent::BlockSync(event) => self.handle_request_response_event(event),
         }
     }
 
@@ -244,10 +501,7 @@ impl NetworkService {
                 topics::BLOCKS => self.on_block_message(&message.data),
                 topics::TRANSACTIONS => self.on_transaction_message(&message.data),
                 topics::SYNC => self.on_sync_message(message.source, &message.data),
-                topics::VOTES => {
-                    debug!("ignoring vote message: tallying is not wired up yet");
-                    Ok(())
-                }
+                topics::VOTES => self.on_vote_message(message.source, &message.data),
                 other => {
                     debug!(topic = other, "message on unexpected topic");
                     Ok(())
@@ -345,7 +599,87 @@ impl NetworkService {
         Ok(())
     }
 
-    /// Ingest a block received over gossip and announce it to the caller.
+    /// Handle request-response events (block sync).
+    fn handle_request_response_event(
+        &self,
+        event: request_response::Event<BlockRequest, BlockResponse>,
+    ) -> Result<(), NetworkError> {
+        match event {
+            request_response::Event::Message { peer, message, connection_id: _ } => match message {
+                request_response::Message::Request {
+                    request_id: _,
+                    request,
+                    channel,
+                } => {
+                    debug!(%peer, ?request, "block sync request received");
+                    // Automatically respond using the DAG store
+                    let response = match request {
+                        BlockRequest::ByHash(hash) => {
+                            match self.dag_store.get_block(&hash) {
+                                Ok(block) => BlockResponse::Block(block),
+                                Err(_) => BlockResponse::NotFound,
+                            }
+                        }
+                        BlockRequest::ByAuthorRound { author, round } => {
+                            match self.dag_store.get_block_by_author_round(author, round) {
+                                Ok(Some(block)) => BlockResponse::Block(block),
+                                Ok(None) => BlockResponse::NotFound,
+                                Err(_) => BlockResponse::InvalidRequest,
+                            }
+                        }
+                    };
+                    let mut swarm = self.swarm();
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .block_sync
+                        .send_response(channel, response)
+                    {
+                        warn!(%peer, %e, "failed to send block sync response");
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    debug!(%peer, ?request_id, ?response, "block sync response received");
+                    self.emit(NetworkEvent::BlockSyncResponse {
+                        peer,
+                        request_id,
+                        response,
+                    });
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "block sync request failed");
+                self.emit(NetworkEvent::BlockSyncResponse {
+                    peer,
+                    request_id,
+                    response: BlockResponse::InvalidRequest,
+                });
+            }
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "incoming block sync request failed");
+            }
+            request_response::Event::ResponseSent { .. } => {
+                debug!("block sync response sent");
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a block received over gossip and announce it to the caller.
+    /// Validation and persistence belong to the BlockManager, not the network
+    /// ingress path.
     fn on_block_message(&self, payload: &[u8]) -> Result<(), NetworkError> {
         let block: StatementBlock = match bincode::deserialize(payload) {
             Ok(block) => block,
@@ -355,10 +689,7 @@ impl NetworkService {
             }
         };
         let (round, digest) = (block.round, block.digest);
-        // A local storage failure is fatal for the event loop: better to surface
-        // it than to keep accepting blocks we cannot persist.
-        self.dag_store.put_block(&block)?;
-        info!(round, %digest, "stored block received over gossip");
+        info!(round, %digest, "block received over gossip");
         self.emit(NetworkEvent::BlockReceived(block));
         Ok(())
     }
@@ -389,6 +720,24 @@ impl NetworkService {
                 Ok(())
             }
         }
+    }
+
+    /// Decode a vote received over gossip and announce it to the caller.
+    fn on_vote_message(&self, source: Option<PeerId>, payload: &[u8]) -> Result<(), NetworkError> {
+        let vote: Vote = match bincode::deserialize(payload) {
+            Ok(vote) => vote,
+            Err(err) => {
+                warn!(%err, "dropping malformed vote gossip");
+                return Ok(());
+            }
+        };
+        let Some(peer) = source else {
+            warn!("dropping vote message without an author");
+            return Ok(());
+        };
+        debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "vote received over gossip");
+        self.emit(NetworkEvent::VoteReceived { peer, vote });
+        Ok(())
     }
 
     /// Decode a sync-range request and announce it to the caller.
@@ -444,6 +793,7 @@ impl NetworkService {
             return Ok(());
         }
         connected.insert(peer);
+        self.peer_count.store(connected.len(), Ordering::Relaxed);
         drop(connected);
         info!(%peer, "peer connected");
         self.emit(NetworkEvent::PeerConnected(peer));
@@ -452,7 +802,15 @@ impl NetworkService {
 
     /// Record a disconnected peer (and only report it once).
     fn on_peer_disconnected(&self, peer: PeerId) {
-        if lock(&self.connected).remove(&peer) {
+        let removed = {
+            let mut connected = lock(&self.connected);
+            let removed = connected.remove(&peer);
+            if removed {
+                self.peer_count.store(connected.len(), Ordering::Relaxed);
+            }
+            removed
+        };
+        if removed {
             lock(&self.ping_failures).remove(&peer);
             lock(&self.peer_addresses).remove(&peer);
             info!(%peer, "peer disconnected");
@@ -464,6 +822,7 @@ impl NetworkService {
     /// swarm stops redialing it.
     fn ban_peer(&self, peer: PeerId) {
         lock(&self.ping_failures).remove(&peer);
+        lock(&self.invalid_block_failures).remove(&peer);
         let known: Vec<Multiaddr> = lock(&self.peer_addresses).remove(&peer).unwrap_or_default();
 
         let mut swarm = self.swarm();
@@ -481,6 +840,28 @@ impl NetworkService {
             }
         }
         info!(%peer, "banned peer");
+    }
+
+    /// Record an invalid block failure from a peer. If the failure limit is
+    /// reached, ban the peer.
+    pub fn record_invalid_block_failure(&self, peer: PeerId, reason: &str) {
+        let failures = {
+            let mut failures = lock(&self.invalid_block_failures);
+            let counter = failures.entry(peer).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        if failures >= INVALID_BLOCK_FAILURE_LIMIT {
+            warn!(peer = %peer, failures, reason, "peer exceeded invalid block limit; banning");
+            self.ban_peer(peer);
+        } else {
+            debug!(peer = %peer, failures, reason, "invalid block failure recorded");
+        }
+    }
+
+    /// Reset invalid block failure counter for a peer (e.g., on successful validation).
+    pub fn reset_invalid_block_failures(&self, peer: PeerId) {
+        lock(&self.invalid_block_failures).remove(&peer);
     }
 }
 
@@ -514,6 +895,125 @@ mod tests {
             signature: Signature([0u8; 64]),
             digest: Hash::zero(),
         }
+    }
+
+    fn address(text: &str) -> Multiaddr {
+        text.parse().expect("valid test multiaddr")
+    }
+
+    fn test_id(id: usize) -> ConnectionId {
+        ConnectionId::new_unchecked(id)
+    }
+
+    #[test]
+    fn bootstrap_addresses_are_deduplicated_and_capped() {
+        let now = Instant::now();
+        let first = address("/ip4/127.0.0.1/tcp/19001");
+        let second = address("/ip4/127.0.0.1/tcp/19002");
+        let third = address("/ip4/127.0.0.1/tcp/19003");
+        let maintenance = BootstrapMaintenance::new(
+            &[first.clone(), first.clone(), second.clone(), third],
+            2,
+            now,
+        );
+
+        assert_eq!(maintenance.addresses.len(), 2);
+        assert_eq!(maintenance.addresses[0].address, first);
+        assert_eq!(maintenance.addresses[1].address, second);
+    }
+
+    #[test]
+    fn bootstrap_retry_backoff_is_exponential_and_capped() {
+        let now = Instant::now();
+        let mut maintenance =
+            BootstrapMaintenance::new(&[address("/ip4/127.0.0.1/tcp/19001")], 1, now);
+
+        let (index, _) = maintenance.due_address(now).expect("initial dial due");
+        let first_id = test_id(1);
+        maintenance.set_attempt(index, first_id);
+        assert!(maintenance.fail_attempt(first_id, now));
+        assert_eq!(
+            maintenance.addresses[0].retry_at,
+            now + Duration::from_secs(1)
+        );
+
+        let second_due = now + Duration::from_secs(1);
+        let (index, _) = maintenance
+            .due_address(second_due)
+            .expect("second dial due");
+        let second_id = test_id(2);
+        maintenance.set_attempt(index, second_id);
+        assert!(maintenance.fail_attempt(second_id, second_due));
+        assert_eq!(
+            maintenance.addresses[0].retry_at,
+            second_due + Duration::from_secs(2)
+        );
+
+        let mut retry_at = maintenance.addresses[0].retry_at;
+        let mut latest_attempt_at = None;
+        for id in 3..16 {
+            latest_attempt_at = Some(retry_at);
+            let (index, _) = maintenance.due_address(retry_at).expect("retry due");
+            let connection_id = test_id(id);
+            maintenance.set_attempt(index, connection_id);
+            assert!(maintenance.fail_attempt(connection_id, retry_at));
+            retry_at = maintenance.addresses[0].retry_at;
+        }
+        assert_eq!(
+            retry_at - latest_attempt_at.expect("at least one capped retry"),
+            BOOTSTRAP_RETRY_MAX
+        );
+    }
+
+    #[test]
+    fn pending_bootstrap_attempt_survives_start_reentry_and_old_events_are_exact() {
+        let now = Instant::now();
+        let mut maintenance =
+            BootstrapMaintenance::new(&[address("/ip4/127.0.0.1/tcp/19001")], 1, now);
+        let (index, _) = maintenance.due_address(now).expect("initial dial due");
+        let older_id = test_id(41);
+        maintenance.set_attempt(index, older_id);
+
+        // Re-entering `start` sees the same pending state and does not create a
+        // replacement dial just because the start future was canceled.
+        assert!(maintenance
+            .due_address(now + Duration::from_secs(10))
+            .is_none());
+        assert_eq!(maintenance.addresses[0].pending, Some(older_id));
+
+        assert!(maintenance.fail_attempt(older_id, now));
+        let retry_at = maintenance.addresses[0].retry_at;
+        let (index, _) = maintenance.due_address(retry_at).expect("retry due");
+        let newer_id = test_id(42);
+        maintenance.set_attempt(index, newer_id);
+        assert!(!maintenance.fail_attempt(older_id, retry_at + Duration::from_secs(1)));
+        assert_eq!(maintenance.addresses[0].pending, Some(newer_id));
+    }
+
+    #[test]
+    fn bootstrap_disconnect_retries_only_associated_peer_after_last_connection() {
+        let now = Instant::now();
+        let mut maintenance =
+            BootstrapMaintenance::new(&[address("/ip4/127.0.0.1/tcp/19001")], 1, now);
+        let (index, _) = maintenance.due_address(now).expect("initial dial due");
+        let connection_id = test_id(51);
+        let peer = PeerId::random();
+        maintenance.set_attempt(index, connection_id);
+        assert!(maintenance.establish_attempt(
+            connection_id,
+            peer,
+            address("/ip4/127.0.0.1/tcp/19001")
+        ));
+
+        assert!(!maintenance.peer_disconnected(peer, 1, now));
+        assert_eq!(maintenance.addresses[0].peer, Some(peer));
+        assert!(!maintenance.peer_disconnected(PeerId::random(), 0, now));
+        assert!(maintenance.peer_disconnected(peer, 0, now));
+        assert_eq!(maintenance.addresses[0].peer, None);
+        assert_eq!(
+            maintenance.addresses[0].retry_at,
+            now + BOOTSTRAP_RETRY_BASE
+        );
     }
 
     #[tokio::test]
@@ -551,6 +1051,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_gossip_emits_for_validation_without_pre_storing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
+        let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
+        let mempool_storage =
+            Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
+        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let (service, mut events) =
+            NetworkService::new(NetworkConfig::default(), dag_store.clone(), mempool)
+                .expect("service");
+
+        // This payload is structurally decodable but has an invalid digest and
+        // signature. The event remains available for the caller to reject.
+        let block = sample_block();
+        let payload = bincode::serialize(&block).expect("serialize block");
+        service
+            .on_block_message(&payload)
+            .expect("decoded gossip is announced");
+
+        assert!(!dag_store.has_block(&block.digest).expect("query store"));
+        match events.try_recv().expect("block event emitted") {
+            NetworkEvent::BlockReceived(received) => {
+                assert_eq!(received.digest, block.digest);
+                assert_eq!(received.signature, block.signature);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn valid_sync_request_reaches_the_caller() {
         let dir = tempfile::tempdir().expect("temp dir");
         let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
@@ -584,16 +1114,20 @@ mod tests {
     #[tokio::test]
     async fn peer_bookkeeping_enforces_max_peers() {
         let (_dir, service) = test_service();
+        let shared_peer_count = service.peer_count_handle();
         let first = PeerId::random();
 
         service.on_peer_connected(first).expect("connect");
         assert_eq!(service.peer_count(), 1);
+        assert_eq!(shared_peer_count.load(Ordering::Relaxed), 1);
         // Duplicate connection events do not double count.
         service.on_peer_connected(first).expect("reconnect");
         assert_eq!(service.peer_count(), 1);
+        assert_eq!(shared_peer_count.load(Ordering::Relaxed), 1);
 
         service.on_peer_disconnected(first);
         assert_eq!(service.peer_count(), 0);
+        assert_eq!(shared_peer_count.load(Ordering::Relaxed), 0);
 
         // Fill up to the configured limit, then the next peer must be rejected.
         let mut peers = Vec::new();

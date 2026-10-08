@@ -9,6 +9,7 @@ kvnc-types = { path = "../kvnc-types" }
 kvnc-storage = { path = "../kvnc-storage" }
 kvnc-crypto = { path = "../kvnc-crypto" }
 serde = { workspace = true }
+bincode = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }

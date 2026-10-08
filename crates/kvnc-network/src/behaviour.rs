@@ -1,9 +1,10 @@
 //! Swarm construction: transport, security and the composite [`Behaviour`].
 
-use crate::{error::NetworkError, topics, NetworkConfig};
+use crate::{block_sync, error::NetworkError, topics, NetworkConfig};
 use libp2p::{
-    gossipsub, identify, kad, kad::store::MemoryStore, noise, ping, swarm::NetworkBehaviour, tcp,
-    yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    gossipsub, identify, kad, kad::store::MemoryStore, noise, ping, request_response,
+    request_response::ProtocolSupport,
+    swarm::NetworkBehaviour, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::{error::Error, time::Duration};
 
@@ -18,7 +19,7 @@ const IDENTIFY_PROTOCOL: &str = "/kovanica/1.0.0";
 /// DHT even if they share the transport.
 const KAD_PROTOCOL: &str = "/kovanica/kad/1.0.0";
 
-/// Composite libp2p behaviour: gossip, peer routing, liveness and identification.
+/// Composite libp2p behaviour: gossip, peer routing, liveness, identification and request-response.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
     /// Gossipsub carrying blocks, transactions, votes and sync requests.
@@ -29,6 +30,8 @@ pub(crate) struct Behaviour {
     pub(crate) ping: ping::Behaviour,
     /// Identify used for protocol exchange and address discovery.
     pub(crate) identify: identify::Behaviour,
+    /// Request-response for block sync.
+    pub(crate) block_sync: request_response::Behaviour<block_sync::BlockSyncCodec>,
 }
 
 /// Deterministic message id: BLAKE3 of the payload.
@@ -133,11 +136,21 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
                 key.public(),
             ));
 
+            // Block sync request-response protocol
+            let block_sync = request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(block_sync::BLOCK_SYNC_PROTOCOL),
+                    ProtocolSupport::Full,
+                )],
+                block_sync::block_sync_protocol(),
+            );
+
             Ok(Behaviour {
                 gossipsub,
                 kad,
                 ping,
                 identify,
+                block_sync,
             })
         })
         .map_err(|err| NetworkError::Swarm(err.to_string()))?
