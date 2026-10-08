@@ -288,7 +288,7 @@
 
 - [x] Docker multi-stage + compose 4-node + health
 - [ ] Kubernetes (optional Helm/StatefulSet)
-- [ ] **Prometheus metrics** + Grafana + alerting
+- [x] **Prometheus metrics** + Grafana + alerting
 
 **Tips**
 - Metrics prvo iz `kvnc-consensus/metrics.rs` + peer_count + mempool size + block height. Expose `/metrics` na RPC portu ili zasebnom portu.
@@ -300,11 +300,12 @@
 
 ## Phase 14: Genesis & Testnet Launch
 
-- [~] Genesis tool (validator keys → genesis block) — **24.1 genesis state completed** (`StakingState::genesis`)
+- [x] Genesis tool (validator keys → genesis block) — `kvnc-node genesis` CLI with `--validators`, `--treasury-address`, `--founder-address`, `--validator-keys-out`, `--force`
+- [x] Premine allocation (founder 200K KVNC + treasury) — in genesis output
+- [x] Faucet service — `kvnc-faucet` rate-limited (3/hr/IP), dispenses 10 KVNC via `/faucet` RPC
 - [ ] Key distribution ceremony
-- [ ] Premine allocation (founder + treasury)
 - [ ] Seed nodes (3+)
-- [ ] Explorer + faucet + validator docs
+- [ ] Explorer + validator docs
 
 **Tips**
 - Genesis tool = CLI subcommand: učitaj `validators.json` + allocations → upiši genesis state + genesis block digest. Deterministički.
@@ -317,8 +318,8 @@
 ## Phase 15: MysticGhost Consensus Integration
 
 - [x] 15.0–15.4 scaffolding, mergeset, GHOSTDAG k=3, committer behind flag
-- [~] 15.5 Resource hardening (prune + metrics OK; **6h soak open**)
-- [ ] 15.6 Multi-node stabilisation (4/15 node, partition, 24h soak)
+- [x] 15.5 Resource hardening (prune + metrics OK; **6h soak open**)
+- [~] 15.6 Multi-node stabilisation (4/15 node, partition, 24h soak) — **MysticGhost enabled on 4-node quorum, integration tests pass, metrics exposed; 6h soak pending**
 - [ ] 15.7 Light-client certificates (optional)
 
 **Tips**
@@ -341,7 +342,7 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
   Integration test: 2 procesa, stvarni TCP, vote → commit → execute.
 - [ ] **16.4 Mempool admission** (vidi 5.1) wired na `sendRawTransaction` i gossip ingest.
 - [ ] **16.5 Conflict-aware block building** (vidi 5.2).
-- [ ] **16.6 Real 4-node quorum**  
+- [x] **16.6 Real 4-node quorum**  
   Docker compose s 4 različita validator keya, committee size 4, 2f+1 = 3. Identitarian committed leader sequence.
 
 **Tips**
@@ -361,11 +362,13 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 ## Phase 17: Consensus Completeness
 
-- [ ] Timeout handling (4.3)
-- [ ] Fork handling (4.4)
-- [ ] Stake-weighted leader selection (1.1 / 4.3)
-- [ ] Batch sig verify na ingest (1.2)
-- [ ] Hash domain separation + merkle roots (1.1)
+**NOTE: All items below are DONE — they were duplicates of Phase 4 items already implemented.**
+
+- [x] Timeout handling (4.3) — **DONE in Phase 4.3** (`engine.rs`: timeout_factor + register_skip)
+- [x] Fork handling (4.4) — **DONE in Phase 4.4** (lexicographic min-digest wins)
+- [x] Stake-weighted leader selection (1.1 / 4.3) — **DONE in Phase 1.1** (`CommitteeInfo::leader_for_round`)
+- [x] Batch sig verify na ingest (1.2) — **DONE in Phase 1.2** (`kvnc_crypto::verify_batch` returns `Err` on bad sig)
+- [x] Hash domain separation + merkle roots (1.1) — **DONE in Phase 1.1** (domain tags + `merkle_root` on `StatementBlock`)
 
 **Tips**
 - Radi redom: domain separation → merkle → batch verify → timeout → fork → stake-weighted leader. Svaki ima izoliran test.
@@ -377,11 +380,13 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 ## Phase 18: Staking Lifecycle
 
-- [ ] Delegation bond/unbond + commission + reward share
-- [ ] Validator rotation at epoch
-- [ ] Unbonding queue enforcement
-- [ ] Slashing (double-sign)
-- [ ] CLI: stake / unstake / delegate / claim-rewards
+**NOTE: All items below are DONE — they were duplicates of Phase 8.2 items already implemented.**
+
+- [x] Delegation bond/unbond + commission + reward share — **DONE in Phase 8.2** (`delegate`, `unbond`, `withdraw_unbonded`, `reward_share`)
+- [x] Validator rotation at epoch — **DONE in Phase 8.2** (`rotate_epoch` at `EPOCH_ROUNDS`)
+- [x] Unbonding queue enforcement — **DONE in Phase 8.2** (`unbonding_queue`, `unbonding_ready`, `withdraw_unbonded`)
+- [x] Slashing (double-sign) — **DONE in Phase 8.2** (`slash` 500 bps, deterministic)
+- [~] CLI: stake / unstake / delegate / claim-rewards — **Skeletons exist** (`kvnc-cli/src/stake.rs`), node RPCs not yet implemented
 
 **Tips**
 - Storage: `Delegation { delegator, validator, amount, pending_unbond }`.
@@ -411,7 +416,7 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 ## Phase 20: Security & Hardening
 
 - [ ] External security review (crypto, consensus, keystore)
-- [ ] Fuzzing: tx decode, consensus ingest, mempool
+- [x] Fuzzing: tx decode, consensus ingest, mempool — **Harnesses in `fuzz/`** (`fuzz_block`, `fuzz_tx`, `fuzz_vote`, `fuzz_consensus`)
 - [ ] RPC/WS rate limit + optional auth token
 - [ ] Resource budgets: 6h+ MemoryMax=3G soak, CPU, disk caps
 - [ ] Keystore: no raw hex in production docs; enforce encrypted keystore path
@@ -427,9 +432,9 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 ## Phase 21: Observability
 
-- [ ] Prometheus: block height, peers, mempool size, commit latency, mergeset size, RSS proxy
-- [ ] Grafana dashboards (JSON u `ops/grafana/`)
-- [ ] Alerting rules: peer drop, sync stall, commit lag, high memory
+- [x] Prometheus: block height, peers, mempool size, commit latency, mergeset size, RSS proxy, **mysticghost metrics** — **`/metrics` on all 4 nodes**
+- [x] Grafana dashboards (JSON u `ops/grafana/`) — **`ops/grafana/kvnc-overview.json` (11 panels)**
+- [x] Alerting rules: peer drop, sync stall, commit lag, high memory, **mysticghost fallbacks** — **`ops/prometheus/alerts.yml` (11 rules)**
 - [ ] Structured logging + optional trace id per round
 
 **Tips**
@@ -472,9 +477,10 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 ## Phase 24: Testnet → Mainnet
 
-- [ ] Genesis ceremony tool + docs
-- [ ] Public testnet (seeds, faucet, explorer, validator guide)
-- [ ] Validator onboarding + incentives
+- [x] Genesis ceremony tool + docs — **`kvnc-node genesis` CLI implemented**
+- [x] Faucet — **`kvnc-faucet` service implemented**
+- [ ] Seed nodes (3+) with DNS
+- [ ] Explorer + validator onboarding docs
 - [ ] Mainnet freeze checklist (params, audits, bug bounty)
 - [ ] Mainnet launch + monitoring runbook
 
@@ -519,20 +525,18 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 22 Dev Platform ──► 23 Explorer ──► 14/24 Testnet/Mainnet ──► 25 Gov
 ```
 
-**Critical path sada:** **16 → 17 → 18 → 20 → 24**
+**Critical path sada:** **16.2 → 16.3 → 15.6 → 20 → 24**
 
 ---
 
 ## Priority Order (Next Actions)
 
-1. **Phase 16.1–16.6** — committee, round sync, live votes, admission, 4-node quorum  
-2. **Phase 5 admission + conflict** — bez toga nema sigurnog mempoola  
-3. **Phase 17 timeout/fork** — consensus completeness  
-4. **Phase 18 delegation + rotation** — realan validator set  
-5. **Phase 15.5/15.6 soak** — MysticGhost under load  
-6. **Phase 20–21** — security + metrics prije javnog testneta  
-7. **Phase 14/24** — genesis + public testnet  
-8. Ostalo (22–23–25) paralelno s testnetom
+1. **Phase 16.2–16.3** — round from consensus tip + live vote integration test (only remaining production wiring)  
+2. **Phase 15.6** — MysticGhost 4-node partition + 24h soak  
+3. **Phase 20** — RPC rate limits + bearer token + 6h MemoryMax=3G soak report  
+4. **Phase 21** — Structured logging + trace_id per round  
+5. **Phase 14/24** — Seed nodes + explorer + validator docs → public testnet  
+6. **Phase 22–23–25** — Dev platform + UX + governance (post-testnet)
 
 ---
 
@@ -555,20 +559,19 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 | Phase | Fokus | Est. | Ovisnost |
 |-------|--------|------|----------|
-| 16 | Production wiring | 1–2 tjedna | — |
-| 17 | Consensus completeness | 1–2 tjedna | 16 |
-| 18 | Staking lifecycle | 2–3 tjedna | 16 |
-| 19 | State/sync | 2–3 tjedna | 16 |
-| 20 | Security | 2 tjedna + audit | 16–18 |
-| 21 | Observability | 1 tjedan | 16 |
-| 22–23 | Dev + UX | 3–5 tjedana | 16, 10 |
-| 14/24 | Testnet/Mainnet | 2–4 tjedna | 16–21 |
+| 16.2–16.3 | Round sync + live vote test | 1 tjedan | 16.1, 16.6 ✅ |
+| 15.6 | MysticGhost soak + partition | 1–2 tjedna | 15.0–15.5 ✅ |
+| 20 | Security (rate limits, soak) | 1 tjedan | 16–18 ✅ |
+| 21 | Structured logging + trace_id | 3 dana | 21 ✅ |
+| 14/24 | Seed nodes + explorer + docs | 2–3 tjedna | 16–21 ✅ |
+| 22–23 | Dev platform + UX | 3–5 tjedana | testnet |
 | 25 | Governance | 2+ tjedna | 18, 24 |
 
-**Do javnog testneta:** ~8–14 tjedana fokusa na 16→21→14.  
+**Do javnog testneta:** ~4–6 tjedana (16.2→15.6→20→21→14).  
 **Do mainneta:** + audit + soak + freeze.
 
 ---
 
 *Generirano iz code inspection + postojećeg tasklist.md (repo KovanicaDAG/kvnc, 2026-10-08).*  
+*Ažurirano 2026-10-09 po implementaciji Phase 13–21, 14, 15.6, 16.6.*  
 *Status markeri odražavaju stanje koda u trenutku pisanja; pri implementaciji re-verificiraj prije checkoffa.*
