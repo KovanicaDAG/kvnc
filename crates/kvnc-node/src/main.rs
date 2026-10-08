@@ -151,6 +151,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
         statements: Vec::new(),
         signature: Signature([0u8; 64]),
         digest,
+        merkle_root: Hash::zero(),
     };
 
     // Serialize output JSON
@@ -520,6 +521,7 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
         statements: Vec::new(),
         signature: Signature([0u8; 64]),
         digest,
+        merkle_root: Hash::zero(),
     };
     dag_store.put_block(&genesis)?;
     info!(digest = %genesis.digest, "genesis block created");
@@ -618,13 +620,20 @@ fn handle_network_event(
     events: &EventBus,
 ) {
     match event {
-        NetworkEvent::BlockReceived(block) => match engine.process_block(&block) {
+        NetworkEvent::BlockReceived(block) => {
+            // Hot-path validation (audit 3.1): verify signature before engine.process_block
+            if let Err(e) = kvnc_crypto::verify_batch(&[block.clone()]) {
+                warn!(digest = %block.digest, error = %e, "rejected invalid block signature in main hot path");
+                return;
+            }
+            match engine.process_block(&block) {
             Ok(()) => {
                 debug!(digest = %block.digest, "validated received block into consensus");
                 events.publish_new_head(&block);
             }
             Err(e) => {
                 warn!(digest = %block.digest, error = %e, "rejected received consensus block")
+            }
             }
         },
         NetworkEvent::TransactionReceived(tx) => match mempool.add_transaction(tx.clone()) {

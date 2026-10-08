@@ -123,6 +123,8 @@ impl BlockManager {
 
     /// Propose a new block for the given round with specific transactions.
     pub fn propose_block_with_txs(&self, round: Round, transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
+        // Wire mempool feed into block proposal (audit 3.1): feed pending txs via add_transaction
+        for tx in &transactions { self.add_transaction(tx.clone()); }
         // Get parent blocks from previous round with stake/validity filtering
         let parents = self.select_parents(round)?;
 
@@ -186,6 +188,7 @@ impl BlockManager {
         transactions: Vec<Transaction>,
     ) -> Result<StatementBlock, BlockManagerError> {
         // Compute digest
+        let merkle_root = StatementBlock::compute_merkle_root(&transactions);
         let digest = StatementBlock::compute_digest(
             *self.our_authority.read(),
             round,
@@ -201,6 +204,7 @@ impl BlockManager {
             statements: Vec::new(),        // Placeholder for votes
             signature: Signature([0; 64]), // Will be filled by sign_block
             digest,
+            merkle_root,
         })
     }
 
@@ -276,6 +280,14 @@ impl BlockManager {
             ));
         }
 
+        // Verify merkle root matches transaction hashes
+        let computed_merkle = StatementBlock::compute_merkle_root(&block.transactions);
+        if computed_merkle != block.merkle_root {
+            return Err(BlockManagerError::InvalidBlock(
+                "Merkle root mismatch".to_string(),
+            ));
+        }
+
         let public_key = self
             .authority_keys
             .read()
@@ -291,13 +303,10 @@ impl BlockManager {
     /// Validate a transaction's hash and basic structure.
     /// Full signature verification requires state access and is done in the mempool/execution layer.
     fn validate_transaction(&self, tx: &kvnc_types::Transaction) -> Result<(), BlockManagerError> {
-        // Recompute the signable hash and verify it matches the cached hash
-        let encoded = bincode::serialize(&(&tx.sender, tx.nonce, &tx.kind, tx.fee))
-            .map_err(|e| BlockManagerError::InvalidBlock(format!("transaction encoding failed: {}", e)))?;
-        let expected_hash = kvnc_types::Hash::new(&encoded);
-        if tx.hash != expected_hash {
+        // Verify cached hash matches domain-tagged signing hash (DOMAIN_TX)
+        if tx.hash != tx.signing_hash() {
             return Err(BlockManagerError::InvalidBlock(
-                "Transaction hash mismatch".to_string(),
+                "Transaction hash mismatch (DOMAIN_TX)".to_string(),
             ));
         }
 

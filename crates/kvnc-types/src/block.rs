@@ -34,6 +34,8 @@ pub struct StatementBlock {
     pub signature: Signature,
     /// Cached digest.
     pub digest: Hash,
+    /// Binary merkle root over included transaction hashes.
+    pub merkle_root: Hash,
 }
 
 impl StatementBlock {
@@ -52,7 +54,10 @@ impl StatementBlock {
             data.extend_from_slice(&p.round.to_le_bytes());
             data.extend_from_slice(&p.digest.0);
         }
-        // TODO: properly serialize transactions
+        // Compute merkle root from transactions first, then include it.
+        let merkle = Self::compute_merkle_root(transactions);
+        data.extend_from_slice(&merkle.0);
+        // Transaction hashes for digest
         for tx in transactions {
             data.extend_from_slice(&tx.hash().0);
         }
@@ -66,6 +71,29 @@ impl StatementBlock {
             return Hash::zero();
         }
         let mut current: Vec<Hash> = self.transactions.iter().map(|tx| tx.hash()).collect();
+        while current.len() > 1 {
+            let mut next = Vec::with_capacity((current.len() + 1) / 2);
+            for chunk in current.chunks(2) {
+                if chunk.len() == 2 {
+                    let mut data = Vec::with_capacity(64);
+                    data.extend_from_slice(chunk[0].as_ref());
+                    data.extend_from_slice(chunk[1].as_ref());
+                    next.push(Hash::new_keyed(Hash::DOMAIN_MERKLE, &data));
+                } else {
+                    next.push(chunk[0]);
+                }
+            }
+            current = next;
+        }
+        current[0]
+    }
+
+    /// Compute merkle root from a slice of transactions (static).
+    pub fn compute_merkle_root(transactions: &[Transaction]) -> Hash {
+        if transactions.is_empty() {
+            return Hash::zero();
+        }
+        let mut current: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
         while current.len() > 1 {
             let mut next = Vec::with_capacity((current.len() + 1) / 2);
             for chunk in current.chunks(2) {
@@ -114,6 +142,7 @@ mod tests {
             statements: vec![],
             signature: Signature([0; 64]),
             digest: Hash::zero(),
+            merkle_root: Hash::zero(),
         };
         assert_eq!(block.merkle_root(), Hash::zero());
     }
@@ -129,6 +158,7 @@ mod tests {
             statements: vec![],
             signature: Signature([0; 64]),
             digest: Hash::zero(),
+            merkle_root: Hash::zero(),
         };
         assert_eq!(block.merkle_root(), h);
     }
@@ -146,6 +176,7 @@ mod tests {
             statements: vec![],
             signature: Signature([0; 64]),
             digest: Hash::zero(),
+            merkle_root: Hash::zero(),
         };
         let root = block.merkle_root();
         assert_ne!(root, Hash::zero());
@@ -158,6 +189,20 @@ mod tests {
         let block_hash = Hash::new_keyed(Hash::DOMAIN_BLOCK, data);
         let tx_hash = Hash::new_keyed(Hash::DOMAIN_TX, data);
         assert_ne!(block_hash, tx_hash, "domain tags must separate hashes");
+    }
+
+    #[test]
+    fn digest_uses_domain() {
+        let d = StatementBlock::compute_digest(1, 2, &[], &[]);
+        assert_ne!(d, Hash::zero());
+        // Keyed with DOMAIN_BLOCK differs from unkeyed same payload
+        let payload = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&1u32.to_le_bytes());
+            v.extend_from_slice(&2u32.to_le_bytes());
+            v
+        };
+        assert_ne!(d, Hash::new(&payload), "must be keyed, not raw BLAKE3");
     }
 
     #[test]
