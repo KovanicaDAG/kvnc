@@ -1,0 +1,12 @@
+# BEGIN oh-my-opencode-slim deepwork
+!.slim/
+!.slim/deepwork/
+!.slim/deepwork/**
+# END oh-my-opencode-slim deepwork
+
+# BEGIN oh-my-opencode-slim worktrees
+!.slim/
+!.slim/worktrees.json
+!.slim/worktrees/
+!.slim/worktrees/**
+# END oh-my-opencode-slim worktrees

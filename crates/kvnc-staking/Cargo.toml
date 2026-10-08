@@ -11,3 +11,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"
+bincode = { workspace = true }

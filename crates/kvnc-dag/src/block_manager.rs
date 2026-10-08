@@ -118,14 +118,13 @@ impl BlockManager {
 
     /// Propose a new block for the given round.
     pub fn propose_block(&self, round: Round) -> Result<StatementBlock, BlockManagerError> {
+        self.propose_block_with_txs(round, Vec::new())
+    }
+
+    /// Propose a new block for the given round with specific transactions.
+    pub fn propose_block_with_txs(&self, round: Round, transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
         // Get parent blocks from previous round with stake/validity filtering
         let parents = self.select_parents(round)?;
-
-        // Get transactions
-        let transactions = self.get_next_transactions();
-        if transactions.is_empty() && round > 0 {
-            // Allow empty blocks for consensus rounds
-        }
 
         // Create the block (without signature first)
         let block = self.create_block(round, parents, transactions)?;

@@ -746,6 +746,7 @@ mod tests {
                     kvnc_staking::MIN_VALIDATOR_STAKE,
                     0,
                     Some(Address([i + 11; 32])),
+                    None,
                 )
                 .expect("genesis validator");
         }
@@ -798,6 +799,7 @@ mod tests {
                 kvnc_staking::MIN_VALIDATOR_STAKE,
                 0,
                 Some(payout),
+                None,
             )
             .expect("join validator");
 
@@ -1075,6 +1077,7 @@ mod tests {
                 kvnc_staking::MIN_VALIDATOR_STAKE,
                 0,
                 Some(payout),
+                None,
             )
             .expect("join validator");
 
@@ -1200,6 +1203,7 @@ mod tests {
                 kvnc_staking::MIN_VALIDATOR_STAKE,
                 0,
                 Some(payout),
+                None,
             )
             .expect("join validator");
 
@@ -1260,6 +1264,7 @@ mod tests {
                 kvnc_staking::MIN_VALIDATOR_STAKE,
                 0,
                 Some(payout),
+                None,
             )
             .expect("join validator");
 

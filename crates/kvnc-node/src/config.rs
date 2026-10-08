@@ -35,6 +35,9 @@ pub struct NodeConfig {
     pub treasury_address: Option<String>,
     /// Enable the experimental MysticGhost ordering path (default off).
     pub use_mysticghost: bool,
+    /// Run as a validator (produce blocks, participate in consensus).
+    /// When false, the node runs as an RPC/read-only node without consensus participation.
+    pub run_validator: bool,
 }
 
 impl Default for NodeConfig {
@@ -50,6 +53,7 @@ impl Default for NodeConfig {
             max_peers: 50,
             treasury_address: None,
             use_mysticghost: false,
+            run_validator: true,
         }
     }
 }
@@ -128,6 +132,13 @@ impl NodeConfig {
                 "1" | "true" | "yes" | "on" => self.use_mysticghost = true,
                 "0" | "false" | "no" | "off" => self.use_mysticghost = false,
                 _ => tracing::warn!(value = %v, "ignoring invalid KVNC_MYSTICGHOST"),
+            }
+        }
+        if let Ok(v) = std::env::var("KVNC_RUN_VALIDATOR") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.run_validator = true,
+                "0" | "false" | "no" | "off" => self.run_validator = false,
+                _ => tracing::warn!(value = %v, "ignoring invalid KVNC_RUN_VALIDATOR"),
             }
         }
     }

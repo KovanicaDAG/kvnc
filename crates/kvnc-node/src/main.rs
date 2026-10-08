@@ -41,12 +41,11 @@ use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
 use kvnc_rpc::{EventBus, RpcServer, RpcState};
-use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
+use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE, MAX_ACTIVE_VALIDATORS};
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
     Address, AuthorityIndex, Hash, PublicKey, Round, Signature, SigningKey, Transaction,
-    MAX_TXS_PER_BLOCK,
 };
 
 /// Command line arguments.
@@ -155,8 +154,28 @@ where
     let validator_address = Address::from_public_key(&public_key);
     info!(validator = %validator_address, "validator identity ready");
 
-    // Load the staking state and build the committee up front so both the RPC
-    // server and the consensus engine can share them.
+    // Build the committee from active validators in StakingState.
+    let committee = build_committee(
+        &state_storage,
+        &public_key,
+        &validator_address,
+        &config.listen_addr,
+    )?;
+
+    // Determine our authority index from the committee (match local public key)
+    let our_authority = if config.run_validator {
+        committee
+            .authorities()
+            .iter()
+            .find(|a| a.public_key == public_key)
+            .map(|a| a.index)
+            .ok_or_else(|| anyhow::anyhow!("local validator public key not found in committee; cannot run as validator"))?
+    } else {
+        info!("run_validator=false; not participating in consensus");
+        u16::MAX // Invalid authority index
+    };
+
+    // Load the staking state for the RPC server (shared with consensus via Arc<RwLock>).
     let staking_state = {
         let read = state_storage.begin_read()?;
         match state_storage.state().load_staking_state(&read) {
@@ -167,7 +186,6 @@ where
             }
         }
     };
-    let committee = build_committee(&public_key, &validator_address, &config.listen_addr)?;
 
     // ------------------------------------------------------------------
     // 4. Networking
@@ -208,8 +226,13 @@ where
     // The node-provided validator identity remains authoritative in the block
     // manager; consensus does not generate or replace a signing key.
     let block_manager = Arc::new(BlockManager::new(dag_store.clone()));
-    block_manager.set_authority(0);
-    block_manager.set_signing_key(signing_key.clone());
+    if config.run_validator {
+        block_manager.set_authority(our_authority);
+        block_manager.set_signing_key(signing_key.clone());
+    } else {
+        // Set an invalid authority index so we never think we're the leader
+        block_manager.set_authority(u16::MAX);
+    }
     block_manager.set_authority_keys(
         committee
             .authorities()
@@ -230,7 +253,7 @@ where
             use_mysticghost: config.use_mysticghost,
             ..Default::default()
         },
-        committee,
+        committee.clone(),
         Arc::new(NodeDagStore {
             inner: dag_store.clone(),
         }),
@@ -238,7 +261,11 @@ where
             inner: block_manager.clone(),
         })),
         signing_key.clone(),
+        if config.run_validator { Some(mempool.clone()) } else { None },
     ));
+
+    // Subscribe to consensus engine's round changes
+    let _round_rx = engine.subscribe_round();
 
     // Set up block broadcaster to gossip proposed blocks
     let broadcast_tx = network_cmd_tx.clone();
@@ -273,15 +300,10 @@ where
         events.clone(),
         shutdown_rx.clone(),
     ));
-    let builder_task = tokio::spawn(run_block_builder(
-        config.round_duration_ms,
-        dag_store.clone(),
-        mempool.clone(),
-        network_cmd_tx.clone(),
-        signing_key,
-        events.clone(),
-        shutdown_rx.clone(),
-    ));
+
+    // The consensus engine now handles block production internally with mempool transactions
+    // No separate builder task needed
+    let _builder_task = tokio::spawn(async {});
     let exec_task = tokio::spawn(run_execution(
         exec_rx,
         state_storage.clone(),
@@ -314,7 +336,6 @@ where
     for (name, handle) in [
         ("network", network_task),
         ("events", event_task),
-        ("builder", builder_task),
         ("execution", exec_task),
         ("consensus", engine_task),
     ] {
@@ -504,67 +525,6 @@ fn handle_network_event(
     }
 }
 
-/// Periodically drain the mempool into a signed block and broadcast it.
-///
-/// Blocks are only produced when the mempool has transactions: the consensus
-/// engine already proposes (empty) blocks for each round it leads, so the
-/// builder deliberately stays out of the way when there is nothing to include.
-async fn run_block_builder(
-    round_duration_ms: u64,
-    dag_store: Arc<DagStore>,
-    mempool: Arc<Mempool>,
-    network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
-    signing_key: SigningKey,
-    events: EventBus,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let author: AuthorityIndex = 0;
-    let mut round: Round = 1;
-    let mut interval = tokio::time::interval(Duration::from_millis(round_duration_ms.max(1)));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let transactions = mempool.get_next_transactions(MAX_TXS_PER_BLOCK);
-                if transactions.is_empty() {
-                    continue;
-                }
-
-                // TODO: derive the round from the consensus tip instead of a
-                // local counter once the engine exposes its current round.
-                let parents = dag_store.find_parents(round, 3).unwrap_or_default();
-                let digest = StatementBlock::compute_digest(author, round, &parents, &transactions);
-                let signature = kvnc_crypto::sign(&signing_key, digest.as_ref());
-                let block = StatementBlock {
-                    author,
-                    round,
-                    parents,
-                    transactions,
-                    statements: Vec::new(),
-                    signature,
-                    digest,
-                };
-
-                match dag_store.put_block(&block) {
-                    Ok(()) => {
-                        info!(round, digest = %block.digest, "produced block");
-                        events.publish_new_head(&block);
-                        let _ = network_cmd_tx.send(NetworkCommand::BroadcastBlock(block));
-                    }
-                    Err(e) => warn!(error = %e, "failed to store produced block"),
-                }
-                round += 1;
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
 /// Execute committed sub-DAGs as they are produced by consensus.
 async fn run_execution(
     mut subdags: mpsc::UnboundedReceiver<kvnc_consensus::CommittedSubDag>,
@@ -712,6 +672,10 @@ impl BlockManagerTrait for NodeBlockManager {
         self.inner.propose_block(round)
     }
 
+    fn propose_block_with_txs(&self, round: Round, transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
+        self.inner.propose_block_with_txs(round, transactions)
+    }
+
     fn process_block(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
         self.inner.process_block(block)
     }
@@ -852,20 +816,82 @@ fn recover_committed_subdag_mysticghost(
     }
 }
 
-/// Build the initial single-validator committee from the local identity.
+/// Build the committee from active validators in StakingState.
 fn build_committee(
-    public_key: &PublicKey,
-    address: &Address,
+    storage: &Storage,
+    local_public_key: &PublicKey,
+    local_address: &Address,
     listen_addr: &str,
 ) -> Result<CommitteeInfo> {
-    let authority = AuthorityInfo {
-        index: 0,
-        stake: MIN_VALIDATOR_STAKE,
-        public_key: *public_key,
-        address: *address,
-        network_address: listen_addr.to_string(),
-    };
-    Ok(CommitteeInfo::try_new(0, vec![authority])?)
+    let read = storage.begin_read()?;
+    let staking_state = storage.state().load_staking_state(&read)?;
+
+    // Filter active validators with sufficient stake
+    let mut active_validators: Vec<_> = staking_state
+        .validators
+        .iter()
+        .filter(|v| v.active && v.stake >= MIN_VALIDATOR_STAKE)
+        .collect();
+
+    // If no validators in staking state (fresh genesis), fall back to local validator identity
+    // This allows a fresh node to start and produce blocks until validators join via staking txs.
+    if active_validators.is_empty() {
+        info!("no active validators in staking state; falling back to local validator identity");
+        let authority = AuthorityInfo {
+            index: 0,
+            stake: MIN_VALIDATOR_STAKE,
+            public_key: *local_public_key,
+            address: *local_address,
+            network_address: listen_addr.to_string(),
+        };
+        return Ok(CommitteeInfo::try_new(0, vec![authority])?);
+    }
+
+    // Sort by address for deterministic ordering across all nodes
+    active_validators.sort_by_key(|a| a.address.0);
+
+    // Take up to MAX_ACTIVE_VALIDATORS top validators by stake (then by address for tie-breaking)
+    // Sort by stake desc, take top 21, then sort by address for index assignment.
+    active_validators.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.address.0.cmp(&b.address.0)));
+    let top_validators = active_validators.into_iter().take(MAX_ACTIVE_VALIDATORS).collect::<Vec<_>>();
+
+    // Re-sort by address for stable index assignment
+    let mut top_validators = top_validators;
+    top_validators.sort_by_key(|a| a.address.0);
+
+    if top_validators.is_empty() {
+        anyhow::bail!("no active validators found in staking state; committee cannot be empty");
+    }
+
+    let mut authorities = Vec::with_capacity(top_validators.len());
+    for (index, validator) in top_validators.iter().enumerate() {
+        // Determine public key: use local node's key if this is our validator, otherwise use stored key
+        let public_key = if validator.address == *local_address {
+            *local_public_key
+        } else if let Some(pk) = validator.public_key {
+            pk
+        } else {
+            anyhow::bail!(
+                "validator {} missing public key; run registration or add to genesis",
+                validator.address
+            );
+        };
+
+        let authority = AuthorityInfo {
+            index: index as u16,
+            stake: validator.stake,
+            public_key,
+            address: validator.address,
+            network_address: listen_addr.to_string(),
+        };
+        authorities.push(authority);
+    }
+
+    if authorities.is_empty() {
+        anyhow::bail!("no validators with registered public keys; committee cannot be empty");
+    }
+
+    Ok(CommitteeInfo::try_new(0, authorities)?)
 }
 
 /// Build the [`NetworkConfig`] from the node configuration.
@@ -976,6 +1002,7 @@ fn parse_address_hex(value: Option<&str>) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvnc_staking::{MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC, StakingState};
     use kvnc_storage::BincodeSerialize;
     use redb::{Database, TableDefinition};
     use std::collections::HashMap;
@@ -1166,7 +1193,7 @@ mod tests {
         let payout = Address([0x91; 32]);
         let mut staking = StakingState::new();
         staking
-            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout), Some(public_key))
             .unwrap();
         let txn = state_storage.begin_write().unwrap();
         state_storage
@@ -1175,7 +1202,7 @@ mod tests {
             .unwrap();
         txn.commit().unwrap();
 
-        let committee = build_committee(&public_key, &validator_address, "127.0.0.1:0")
+        let committee = build_committee(&state_storage, &public_key, &validator_address, "127.0.0.1:0")
             .expect("single-validator committee is valid");
         let block_manager = Arc::new(BlockManager::new(dag.clone()));
         block_manager.set_authority(0);
@@ -1189,6 +1216,7 @@ mod tests {
                 inner: block_manager,
             })),
             signing_key.clone(),
+            None, // No mempool for this test
         );
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         engine.set_commit_sender(exec_tx);
@@ -1250,7 +1278,7 @@ mod tests {
         let payout = Address([0xa1; 32]);
         let mut staking = StakingState::new();
         staking
-            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout), Some(PublicKey([0x22; 32])))
             .unwrap();
         let txn = state_storage.begin_write().unwrap();
         state_storage
@@ -1357,5 +1385,187 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[test]
+    fn build_committee_from_staking_state() {
+        // Create a temp directory for the state database
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Storage::new(dir.path().join("state.redb")).unwrap();
+
+        // Generate 4 validators with different stakes and addresses
+        let (_sk1, pk1) = kvnc_crypto::generate_keypair();
+        let addr1 = Address::from_public_key(&pk1);
+        let (_sk2, pk2) = kvnc_crypto::generate_keypair();
+        let addr2 = Address::from_public_key(&pk2);
+        let (_sk3, pk3) = kvnc_crypto::generate_keypair();
+        let addr3 = Address::from_public_key(&pk3);
+        let (_sk4, pk4) = kvnc_crypto::generate_keypair();
+        let addr4 = Address::from_public_key(&pk4);
+
+        // Create staking state with 4 validators with different stakes
+        let mut staking = StakingState::new();
+        staking.init_treasury(Address([0xaa; 32]));
+        
+        // Validator stakes: 100K, 80K, 120K, 60K KVNC (all above MIN_VALIDATOR_STAKE = 50K)
+        staking
+            .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
+            .unwrap();
+        staking
+            .join_validator(addr2, 80_000 * ONE_KVNC, 0, Some(addr2), Some(pk2))
+            .unwrap();
+        staking
+            .join_validator(addr3, 120_000 * ONE_KVNC, 0, Some(addr3), Some(pk3))
+            .unwrap();
+        staking
+            .join_validator(addr4, 60_000 * ONE_KVNC, 0, Some(addr4), Some(pk4))
+            .unwrap();
+
+        // Save to storage
+        let txn = state_storage.begin_write().unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Use addr1 as the "local" validator (first one by address sort)
+        let local_pk = pk1;
+        let local_addr = addr1;
+
+        // Build committee
+        let committee = build_committee(&state_storage, &local_pk, &local_addr, "127.0.0.1:0")
+            .expect("committee should be built successfully");
+
+        // Verify committee has all 4 validators
+        assert_eq!(committee.size(), 4, "committee should have 4 validators");
+
+        // Verify validators are sorted by address (deterministic ordering)
+        // Since we sort by address for index assignment, the order should be by address
+        let authorities = committee.authorities();
+        
+        // Collect addresses in index order
+        let committee_addresses: Vec<Address> = authorities.iter().map(|a| a.address).collect();
+        
+        // Sort the expected addresses to match committee ordering
+        let mut expected_addresses = vec![addr1, addr2, addr3, addr4];
+        expected_addresses.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        assert_eq!(
+            committee_addresses, expected_addresses,
+            "committee validators should be sorted by address for deterministic index assignment"
+        );
+
+        // Verify indices are 0..3
+        for (idx, authority) in authorities.iter().enumerate() {
+            assert_eq!(authority.index, idx as u16, "authority index should match sorted position");
+        }
+
+        // Verify stakes match
+        let addr_to_stake = vec![
+            (addr1, 100_000 * ONE_KVNC),
+            (addr2, 80_000 * ONE_KVNC),
+            (addr3, 120_000 * ONE_KVNC),
+            (addr4, 60_000 * ONE_KVNC),
+        ];
+        for (addr, expected_stake) in addr_to_stake {
+            let auth = committee.get_by_index(
+                expected_addresses.iter().position(|a| *a == addr).unwrap() as u16
+            ).expect("authority should exist");
+            assert_eq!(auth.stake, expected_stake, "stake should match for address {}", addr);
+        }
+
+        // Verify leader round-robin selection
+        // Round 0 -> index 0, Round 1 -> index 1, etc.
+        for round in 0..8 {
+            let leader_idx = committee.leader(round);
+            let expected_idx = (round as usize) % 4;
+            assert_eq!(
+                leader_idx, expected_idx as u16,
+                "leader for round {} should be index {} (round-robin)",
+                round, expected_idx
+            );
+        }
+    }
+
+    #[test]
+    fn build_committee_skips_inactive_and_low_stake() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Storage::new(dir.path().join("state.redb")).unwrap();
+
+        let (_sk1, pk1) = kvnc_crypto::generate_keypair();
+        let addr1 = Address::from_public_key(&pk1);
+        let (_sk2, pk2) = kvnc_crypto::generate_keypair();
+        let addr2 = Address::from_public_key(&pk2);
+        let (_sk3, pk3) = kvnc_crypto::generate_keypair();
+        let addr3 = Address::from_public_key(&pk3);
+
+        let mut staking = StakingState::new();
+        staking.init_treasury(Address([0xbb; 32]));
+        
+        // Active, sufficient stake
+        staking.join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1)).unwrap();
+        // Inactive - should be skipped
+        staking.join_validator(addr2, 100_000 * ONE_KVNC, 0, Some(addr2), Some(pk2)).unwrap();
+        staking.validators.iter_mut().find(|v| v.address == addr2).unwrap().active = false;
+        // Below MIN_VALIDATOR_STAKE - manually add (bypassing join_validator check)
+        staking.validators.push(kvnc_staking::ValidatorInfo {
+            address: addr3,
+            stake: 10_000 * ONE_KVNC,
+            commission_bps: 0,
+            active: true,
+            payout_address: addr3,
+            public_key: Some(pk3),
+        });
+        staking.total_staked += 10_000 * ONE_KVNC;
+
+        let txn = state_storage.begin_write().unwrap();
+        state_storage.state().save_staking_state(&txn, &staking).unwrap();
+        txn.commit().unwrap();
+
+        let committee = build_committee(&state_storage, &pk1, &addr1, "127.0.0.1:0")
+            .expect("committee should be built with only active, sufficient-stake validators");
+
+        assert_eq!(committee.size(), 1, "only 1 validator should be active and have sufficient stake");
+        assert_eq!(committee.authorities()[0].address, addr1);
+    }
+
+    #[test]
+    fn build_committee_limits_to_max_active_validators() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Storage::new(dir.path().join("state.redb")).unwrap();
+
+        let mut staking = StakingState::new();
+        staking.init_treasury(Address([0xcc; 32]));
+
+        // Create 25 validators (MAX_ACTIVE_VALIDATORS = 21) - manually bypass join_validator limit
+        let mut validators = Vec::new();
+        for _ in 0..25 {
+            let (_sk, pk) = kvnc_crypto::generate_keypair();
+            let addr = Address::from_public_key(&pk);
+            validators.push((addr, pk));
+            staking.validators.push(kvnc_staking::ValidatorInfo {
+                address: addr,
+                stake: 100_000 * ONE_KVNC,
+                commission_bps: 0,
+                active: true,
+                payout_address: addr,
+                public_key: Some(pk),
+            });
+            staking.total_staked += 100_000 * ONE_KVNC;
+        }
+
+        let txn = state_storage.begin_write().unwrap();
+        state_storage.state().save_staking_state(&txn, &staking).unwrap();
+        txn.commit().unwrap();
+
+        // Use first validator as local
+        let (local_addr, local_pk) = validators[0];
+        
+        let committee = build_committee(&state_storage, &local_pk, &local_addr, "127.0.0.1:0")
+            .expect("committee should be built");
+
+        // Should only have MAX_ACTIVE_VALIDATORS (21)
+        assert_eq!(committee.size(), MAX_ACTIVE_VALIDATORS, "committee should be limited to MAX_ACTIVE_VALIDATORS");
     }
 }

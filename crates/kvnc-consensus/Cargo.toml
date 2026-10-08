@@ -9,6 +9,7 @@ kvnc-types = { path = "../kvnc-types" }
 kvnc-crypto = { path = "../kvnc-crypto" }
 kvnc-dag = { path = "../kvnc-dag" }
 kvnc-storage = { path = "../kvnc-storage" }
+kvnc-mempool = { path = "../kvnc-mempool" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

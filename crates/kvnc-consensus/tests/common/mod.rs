@@ -12,7 +12,7 @@ use kvnc_consensus::{AuthorityInfo, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_dag::{BlockManagerError, DagStoreError};
 use kvnc_types::block::{BlockReference, StatementBlock};
 use kvnc_types::hash::Hash;
-use kvnc_types::{Address, AuthorityIndex, PublicKey, Round, Signature, SigningKey, Stake};
+use kvnc_types::{Address, AuthorityIndex, PublicKey, Round, Signature, SigningKey, Stake, Transaction};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -385,6 +385,10 @@ impl MockBlockManager {
 
 impl BlockManagerTrait for MockBlockManager {
     fn propose_block(&self, round: Round) -> Result<StatementBlock, BlockManagerError> {
+        self.propose_block_with_txs(round, Vec::new())
+    }
+
+    fn propose_block_with_txs(&self, round: Round, _transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
         let parents = Vec::new();
         let transactions = Vec::new();
         let digest = StatementBlock::compute_digest(self.authority, round, &parents, &transactions);
@@ -476,6 +480,7 @@ pub fn make_engine(
         dag.clone(),
         manager.clone(),
         signing_key,
+        None, // No mempool for tests
     );
     (engine, dag, manager)
 }

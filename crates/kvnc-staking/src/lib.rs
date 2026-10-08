@@ -15,7 +15,7 @@
 
 #![deny(unsafe_code)]
 
-use kvnc_types::{Address, Stake};
+use kvnc_types::{Address, PublicKey, Stake};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -249,6 +249,10 @@ pub struct ValidatorInfo {
     pub active: bool,
     /// Address that receives block rewards (defaults to `address`).
     pub payout_address: Address,
+    /// Public key for consensus voting (optional for backward compatibility;
+    /// required for active validators in the committee).
+    #[serde(default)]
+    pub public_key: Option<PublicKey>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -303,6 +307,7 @@ impl StakingState {
         stake: Stake,
         commission_bps: u16,
         payout_address: Option<Address>,
+        public_key: Option<PublicKey>,
     ) -> Result<(), StakingError> {
         if stake < MIN_VALIDATOR_STAKE {
             return Err(StakingError::InsufficientStake);
@@ -317,6 +322,7 @@ impl StakingState {
             commission_bps,
             active: true,
             payout_address: payout_address.unwrap_or(address),
+            public_key,
         });
         self.total_staked += stake;
         Ok(())
@@ -532,7 +538,7 @@ mod tests {
                 let validator = Address([address_byte; 32]);
                 let payout = Address([address_byte.wrapping_add(128); 32]);
                 state
-                    .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout))
+                    .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout), None)
                     .expect("generated validator setup is valid");
             }
 
@@ -667,7 +673,7 @@ mod tests {
         let validator = Address([1u8; 32]);
         let payout = Address([2u8; 32]);
         state
-            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, Some(payout), None)
             .unwrap();
 
         let outcome = state.on_leader_committed(0).unwrap();
@@ -683,5 +689,29 @@ mod tests {
             state.on_leader_committed(9),
             Err(StakingError::NotValidator)
         ));
+    }
+
+    #[test]
+    fn staking_state_bincode_roundtrip() {
+        let mut state = StakingState::new();
+        state.init_treasury(Address([42u8; 32]));
+        
+        for i in 0..3u8 {
+            let addr = Address([i + 1; 32]);
+            let payout = Address([i + 11; 32]);
+            state.join_validator(addr, MIN_VALIDATOR_STAKE, 0, Some(payout), None).unwrap();
+        }
+        
+        let bytes = bincode::serialize(&state).expect("serialize");
+        let decoded: StakingState = bincode::deserialize(&bytes).expect("deserialize");
+        
+        assert_eq!(state.validators.len(), decoded.validators.len());
+        for (a, b) in state.validators.iter().zip(decoded.validators.iter()) {
+            assert_eq!(a.address, b.address);
+            assert_eq!(a.stake, b.stake);
+            assert_eq!(a.public_key, b.public_key);
+        }
+        assert_eq!(state.committed_leader_height, decoded.committed_leader_height);
+        assert_eq!(state.total_mining_issued, decoded.total_mining_issued);
     }
 }

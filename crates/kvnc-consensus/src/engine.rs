@@ -7,13 +7,14 @@
 use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, is_leader_round, linearizer::Linearizer};
 use kvnc_crypto::sign;
-use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, Round, Stake};
+use kvnc_mempool::Mempool;
+use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, Round, Stake, Transaction, MAX_TXS_PER_BLOCK};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -109,6 +110,11 @@ pub trait BlockManagerTrait: Send + Sync {
         &self,
         round: kvnc_types::Round,
     ) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::BlockManagerError>;
+    fn propose_block_with_txs(
+        &self,
+        round: kvnc_types::Round,
+        transactions: Vec<kvnc_types::Transaction>,
+    ) -> Result<kvnc_types::block::StatementBlock, kvnc_dag::BlockManagerError>;
     fn process_block(
         &self,
         block: &kvnc_types::block::StatementBlock,
@@ -183,9 +189,13 @@ where
     commit_sender: RwLock<Option<mpsc::UnboundedSender<kvnc_types::CommittedSubDag>>>,
     block_broadcaster: RwLock<Option<Arc<dyn BlockBroadcaster>>>,
     vote_broadcaster: RwLock<Option<Arc<dyn VoteBroadcaster>>>,
+    /// Watch channel sender for round changes.
+    round_sender: RwLock<Option<watch::Sender<Round>>>,
     /// Serializes decision construction, durable marking, state publication,
     /// and execution delivery across all commit triggers.
     commit_trigger_lock: Mutex<()>,
+    /// Mempool for transaction selection during block proposal.
+    mempool: Option<Arc<Mempool>>,
 }
 
 impl<D, B> ConsensusEngine<D, B>
@@ -200,6 +210,7 @@ where
         dag_store: Arc<D>,
         block_manager: Arc<RwLock<B>>,
         signing_key: kvnc_types::SigningKey,
+        mempool: Option<Arc<Mempool>>,
     ) -> Self {
         let our_authority = block_manager.read().our_authority();
         let our_stake = committee.stake_of(our_authority).unwrap_or(0);
@@ -213,6 +224,9 @@ where
             let leader = committee.leader(round);
             leader_schedule.insert(round, leader);
         }
+
+        // Create watch channel for round notifications
+        let (round_tx, _round_rx) = watch::channel(0);
 
         Self {
             config,
@@ -235,7 +249,9 @@ where
             commit_sender: RwLock::new(None),
             block_broadcaster: RwLock::new(None),
             vote_broadcaster: RwLock::new(None),
+            round_sender: RwLock::new(Some(round_tx)),
             commit_trigger_lock: Mutex::new(()),
+            mempool,
         }
     }
 
@@ -285,6 +301,11 @@ where
 
             // Advance to next round
             *self.current_round.write() = next_round;
+
+            // Broadcast round change to subscribers
+            if let Some(tx) = self.round_sender.read().as_ref() {
+                let _ = tx.send(next_round);
+            }
 
             // Update our validator state
             let is_leader = self.is_leader_for_round(next_round);
@@ -339,7 +360,14 @@ where
     async fn propose_block(&self, round: Round) -> Result<(), ConsensusError> {
         info!("Proposing block for round {}", round);
 
-        match self.block_manager.read().propose_block(round) {
+        // Get transactions from mempool if available
+        let transactions = if let Some(mempool) = &self.mempool {
+            mempool.get_next_transactions(MAX_TXS_PER_BLOCK)
+        } else {
+            Vec::new()
+        };
+
+        match self.block_manager.read().propose_block_with_txs(round, transactions) {
             Ok(block) => {
                 // Update committer with leader info
                 let leader_info = LeaderInfo {
@@ -354,7 +382,7 @@ where
                 // Mark as proposed
                 self.state.write().proposed = true;
 
-                info!("Proposed block {} at round {}", block.digest, round);
+                info!("Proposed block {} at round {} with {} transactions", block.digest, round, block.transactions.len());
 
                 // Broadcast the block to the network
                 if let Some(broadcaster) = self.block_broadcaster.read().as_ref() {
@@ -527,6 +555,16 @@ where
     /// Get the current round.
     pub fn current_round(&self) -> Round {
         *self.current_round.read()
+    }
+
+    /// Subscribe to round changes.
+    /// Returns a receiver that will be notified when the consensus round advances.
+    pub fn subscribe_round(&self) -> watch::Receiver<Round> {
+        self.round_sender
+            .read()
+            .as_ref()
+            .expect("round sender should be initialized in new()")
+            .subscribe()
     }
 
     /// Get our validator state.
@@ -756,6 +794,14 @@ mod tests {
             &self,
             round: Round,
         ) -> Result<kvnc_types::StatementBlock, kvnc_dag::BlockManagerError> {
+            self.propose_block_with_txs(round, Vec::new())
+        }
+
+        fn propose_block_with_txs(
+            &self,
+            round: Round,
+            _transactions: Vec<kvnc_types::Transaction>,
+        ) -> Result<kvnc_types::StatementBlock, kvnc_dag::BlockManagerError> {
             let digest = kvnc_types::StatementBlock::compute_digest(0, round, &[], &[]);
             let block = kvnc_types::StatementBlock {
                 author: 0,
@@ -824,6 +870,7 @@ mod tests {
             dag.clone(),
             manager,
             key.clone(),
+            None, // No mempool for tests
         );
         (engine, dag, key)
     }
@@ -1083,5 +1130,51 @@ mod tests {
 
         let result = engine.process_block(&bad_digest_block);
         assert!(result.is_err(), "Block with mismatched digest should be rejected");
+    }
+
+    #[tokio::test]
+    async fn leader_proposes_only_once_per_round_no_duplicate_proposals() {
+        // This test ensures that the consensus engine produces exactly one block
+        // per leader round, preventing the duplicate proposal issue where both
+        // the engine's round_loop and a separate builder task would produce blocks.
+        let (engine, dag, _key) = test_engine(100);
+        let engine = Arc::new(engine);
+
+        // Manually trigger the round loop logic for round 3 (leader round for authority 0)
+        // First, advance to round 3 and check if we're leader
+        engine.state.write().current_round = 3;
+        assert!(engine.is_leader_for_round(3), "Should be leader at round 3");
+
+        // Call propose_block - this simulates the round_loop calling propose_block
+        engine.propose_block(3).await.unwrap();
+        let block1 = dag.blocks.read().values().find(|b| b.round == 3).cloned();
+        assert!(block1.is_some(), "First proposal should exist");
+        let first_proposal_digest = block1.unwrap().digest;
+
+        // Call propose_block again for the same round - should not produce a duplicate
+        // (the engine tracks proposed state and should not re-propose)
+        engine.state.write().proposed = false; // Reset to simulate a bug scenario
+        engine.propose_block(3).await.unwrap();
+
+        // Verify only one block exists at round 3
+        let blocks_at_round3: Vec<_> = dag.blocks.read().values().filter(|b| b.round == 3).cloned().collect();
+        assert_eq!(
+            blocks_at_round3.len(),
+            1,
+            "Only one block should be produced per leader round, but found {} blocks (duplicate proposal bug)",
+            blocks_at_round3.len()
+        );
+
+        // Verify the block is the same one (no equivocation)
+        assert_eq!(
+            blocks_at_round3[0].digest,
+            first_proposal_digest,
+            "Block digest should not change between proposals"
+        );
+
+        // Verify the block has the correct author (our authority)
+        assert_eq!(blocks_at_round3[0].author, 0, "Block author should be our authority");
+
+        engine.stop();
     }
 }

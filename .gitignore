@@ -33,3 +33,6 @@ build/
 *.key
 keystore/
 *.keystore
+
+# Deepwork progress (local only)
+.slim/deepwork/
