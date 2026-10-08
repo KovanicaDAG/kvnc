@@ -14,7 +14,8 @@ fn fast_config() -> ConsensusConfig {
         round_duration_ms: 5,
         lookahead_rounds: 3,
         max_pending_rounds: 100,
-        use_mysticghost: false,
+        use_mysticghost: true,
+        leader_timeout_ms: 3000,
         prune_window_waves: 100,
     }
 }
