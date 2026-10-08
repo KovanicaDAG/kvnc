@@ -20,7 +20,7 @@
 - [x] **Merkle roots** — `merkle_root` na `StatementBlock` za tx inclusion proofs
 - [x] Round / AuthorityIndex arithmetic traits
 - [~] Committee types — postoje; leader selection **stake-weighted completed** (17.1, types.rs)
-- [x] Address derivation (blake3 pubkey → address)
+- [x] Address derivation (raw Ed25519 pubkey = address; kanonski `kvnc<hex>dag` encoding s blake3 checksumom)
 - [x] **Hash domain separation** — odvojeni domain tagovi za block / tx / state / vote
 
 **Tips**
