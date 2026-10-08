@@ -8,6 +8,7 @@ license.workspace = true
 kvnc-types = { path = "../kvnc-types" }
 kvnc-dag = { path = "../kvnc-dag" }
 kvnc-mempool = { path = "../kvnc-mempool" }
+kvnc-crypto = { path = "../kvnc-crypto" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

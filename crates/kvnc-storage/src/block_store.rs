@@ -56,6 +56,24 @@ impl BlockStore {
         transactions: &[Transaction],
     ) -> Result<(), BlockStoreError> {
         let block_hash = hash_to_bytes(&block.digest);
+        // Basic validation: digest must match recomputed hash; parent round consistency (audit 3.1)
+        let computed = StatementBlock::compute_digest(
+            block.author,
+            block.round,
+            &block.parents,
+            &block.transactions,
+        );
+        if computed != block.digest {
+            return Err(BlockStoreError::NotFound(
+                "block digest mismatch".into(),
+            ));
+        }
+        // Parent round consistency check (parent exists? skip — needs full DAG; at least round advances correctly)
+        for p in &block.parents {
+            if p.round + 1 != block.round {
+                return Err(BlockStoreError::NotFound("bad parent round".into()));
+            }
+        }
         let round = block.round;
         let author = block.author;
 

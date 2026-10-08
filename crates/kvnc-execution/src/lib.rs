@@ -218,6 +218,7 @@ impl ExecutionContext {
             committed_leader_height: self.staking.committed_leader_height,
             total_mining_issued: self.staking.total_mining_issued,
             treasury: self.staking.treasury.clone(),
+            unbonding_queue: self.staking.unbonding_queue.clone(),
         };
         let reward = candidate_staking.on_leader_committed(subdag.leader_author)?;
         storage

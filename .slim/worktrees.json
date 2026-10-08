@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-10-07T00:00:00Z",
+  "lanes": [
+    {
+      "slug": "tasklist-completion",
+      "branch": "omos/tasklist-completion",
+      "path": ".slim/worktrees/tasklist-completion",
+      "base": "main",
+      "purpose": "Implement unchecked tasklist items in safety-gated phases",
+      "owner": "orchestrator",
+      "status": "active",
+      "areas": [
+        "crates/kvnc-consensus",
+        "crates/kvnc-dag",
+        "crates/kvnc-node",
+        "crates/kvnc-execution"
+      ],
+      "createdAt": "2026-10-07T00:00:00Z"
+    }
+  ]
+}

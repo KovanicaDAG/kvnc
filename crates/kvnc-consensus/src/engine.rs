@@ -150,7 +150,7 @@ impl Default for ConsensusConfig {
             round_duration_ms: 2000, // 2 seconds per round (target block time)
             lookahead_rounds: 3,
             max_pending_rounds: 100,
-            use_mysticghost: false,
+            use_mysticghost: true,
             prune_window_waves: 100,
             leader_timeout_ms: 3000,
         }

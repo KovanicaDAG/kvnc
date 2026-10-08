@@ -17,7 +17,7 @@ mod service;
 mod sync;
 pub mod topics;
 
-pub use block_sync::{BlockRequest, BlockResponse, BlockSyncRequestEvent, BlockSyncResponseEvent, BLOCK_SYNC_PROTOCOL};
+pub use block_sync::{BlockSyncRequest, BlockSyncResponse, BlockSyncRequestEvent, BlockSyncResponseEvent, BLOCK_SYNC_PROTOCOL};
 pub use error::NetworkError;
 pub use service::NetworkService;
 pub use sync::SyncRequest;
@@ -55,7 +55,7 @@ pub enum NetworkEvent {
         /// The request ID this response corresponds to.
         request_id: libp2p::request_response::OutboundRequestId,
         /// The response.
-        response: BlockResponse,
+        response: BlockSyncResponse,
     },
     /// A consensus vote was received.
     VoteReceived {

@@ -359,7 +359,7 @@ impl StateStore {
             for entry in table.iter()? {
                 let (key_bytes, value_bytes) = entry?;
                 let mut leaf_key = key_bytes.value().to_vec();
-                leaf_key.extend_from_slice(value_bytes.value());
+                leaf_key.extend_from_slice(value_bytes.value().as_slice());
                 entries.insert(key_bytes.value().to_vec(), leaf_key);
             }
         }
@@ -370,9 +370,9 @@ impl StateStore {
             for entry in table.iter()? {
                 let (key_bytes, value_bytes) = entry?;
                 let mut leaf_key = b"code:".to_vec();
-                leaf_key.extend_from_slice(key_bytes.value());
+                leaf_key.extend_from_slice(&key_bytes.value().to_vec());
                 let mut combined = leaf_key.clone();
-                combined.extend_from_slice(value_bytes.value());
+                combined.extend_from_slice(value_bytes.value().as_slice());
                 entries.insert(leaf_key, combined);
             }
         }
@@ -382,7 +382,7 @@ impl StateStore {
             let table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
             for entry in table.iter()? {
                 let (key_pair_bytes, value_bytes) = entry?;
-                let key_pair: ([u8; 32], [u8; 32]) = bincode::deserialize(key_pair_bytes.value())?;
+                let key_pair: ([u8; 32], [u8; 32]) = bincode::deserialize(&bincode::serialize(&key_pair_bytes.value()).unwrap_or_default()[..])?;
                 let mut leaf_key = b"storage:"
                     .iter()
                     .cloned()
@@ -390,7 +390,7 @@ impl StateStore {
                 leaf_key.extend_from_slice(&key_pair.0);
                 leaf_key.extend_from_slice(&key_pair.1);
                 let mut combined = leaf_key.clone();
-                combined.extend_from_slice(value_bytes.value());
+                combined.extend_from_slice(value_bytes.value().as_slice());
                 entries.insert(leaf_key, combined);
             }
         }
@@ -404,9 +404,9 @@ impl StateStore {
                     .iter()
                     .cloned()
                     .collect::<Vec<u8>>();
-                leaf_key.extend_from_slice(key_bytes.value());
+                leaf_key.extend_from_slice(key_bytes.value().as_bytes());
                 let mut combined = leaf_key.clone();
-                combined.extend_from_slice(value_bytes.value());
+                combined.extend_from_slice(value_bytes.value().as_slice());
                 entries.insert(leaf_key, combined);
             }
         }
@@ -523,7 +523,8 @@ impl StateStore {
             let table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
             let keys: Vec<([u8; 32], [u8; 32])> = table.iter()?.filter_map(|e| e.ok()).map(|(k,_)| {
                 let b = k.value();
-                bincode::deserialize(&b[..]).unwrap_or_default()
+                let serialized = bincode::serialize(&b).unwrap_or_default();
+                bincode::deserialize(&serialized[..]).unwrap_or_default()
             }).collect();
             drop(table);
             let mut table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;

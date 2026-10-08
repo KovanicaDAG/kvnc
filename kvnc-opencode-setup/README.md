@@ -40,13 +40,3 @@ Kad aktiviraš Grok pretplatu, workflow postaje:
 ---
 
 *Generirano za kvnc projekt – ne miješati s kovanica-protocol.*
-
----
-## Aktualni status (2026-10-08)
-- `use_mysticghost` = `true` (default) — eksperimentalni flag.
-- `init_genesis` proširen: `founder_premine.hex` + `validators.json` load.
-- `kvnc-staking` batch verify (`verify_batch`) i `Address` sort popravljeni.
-- `kvnc-storage` state root (sorted KV Merkle) + snapshot + `STAKING_STATE` / `CONTRACT_STORAGE` serijalizacija popravljena.
-- `TASKLIST.md` ažuriran za završene faze (1.1, 2.2, 4.3/4.4, 5.1/5.2, 8.2, 9.1, 14, 16).
-- Preostali `cargo test -p kvnc-node --test multi_node_integration`: blokiran preostalim `kvnc-execution` (`unbonding_queue`) i `kvnc-network` greškama (ne u mom edit opsegu).
-- Tokenomics zaključan: `90.2M`, `200k premine`, `8M treasury`, `10 KVNC`, `2.05M era`, `×¾ decay`.

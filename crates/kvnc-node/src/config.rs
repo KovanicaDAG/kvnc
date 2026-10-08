@@ -52,7 +52,7 @@ impl Default for NodeConfig {
             round_duration_ms: 2000,
             max_peers: 50,
             treasury_address: None,
-            use_mysticghost: false,
+            use_mysticghost: true,
             run_validator: true,
         }
     }

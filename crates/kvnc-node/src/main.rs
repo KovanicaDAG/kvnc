@@ -130,6 +130,39 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
+    // Load full validator set from validators.json (Phase 14 ceremony) if present.
+    let validators_json_path = config.data_dir.join("validators.json");
+    if validators_json_path.exists() {
+        let text = std::fs::read_to_string(&validators_json_path)
+            .with_context(|| format!("reading {}", validators_json_path.display()))?;
+        let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", validators_json_path.display()))?;
+        for v in validators_input {
+            let address = parse_address_hex(Some(&v.address))?;
+            let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
+            let stake = v.stake.unwrap_or(kvnc_staking::MIN_VALIDATOR_STAKE);
+            staking.join_validator(address, stake, 0, Some(address), pk)?;
+        }
+        info!(count = validators_input.len(), "loaded validators.json");
+    }
+
+    // Begin write transaction early (needed for premine + staking save)
+    let txn = state_storage.begin_write()?;
+
+    // Founder premine (200_000 KVNC) — write to state store if founder file present.
+    let premine_path = config.data_dir.join("founder_premine.hex");
+    if premine_path.exists() {
+        let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
+        if !hex.is_empty() {
+            let founder = parse_address_hex(Some(&hex))?;
+            use kvnc_storage::state_store::Account;
+            let state = state_storage.state();
+            let acct = Account { balance: kvnc_staking::FOUNDER_PREMINE, nonce: 0, code_hash: [0;32], code: vec![] };
+            state.set_account(&txn, &founder, &acct)?;
+            info!(address = %founder, "founder premine applied");
+        }
+    }
+
     // Join each validator
     for v in validators_input {
         let address = parse_address_hex(Some(&v.address))?;
@@ -485,6 +518,39 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
+    // Load full validator set from validators.json (Phase 14 ceremony) if present.
+    let validators_json_path = config.data_dir.join("validators.json");
+    if validators_json_path.exists() {
+        let text = std::fs::read_to_string(&validators_json_path)
+            .with_context(|| format!("reading {}", validators_json_path.display()))?;
+        let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", validators_json_path.display()))?;
+        for v in validators_input {
+            let address = parse_address_hex(Some(&v.address))?;
+            let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
+            let stake = v.stake.unwrap_or(kvnc_staking::MIN_VALIDATOR_STAKE);
+            staking.join_validator(address, stake, 0, Some(address), pk)?;
+        }
+        info!(count = validators_input.len(), "loaded validators.json");
+    }
+
+    // Begin write transaction early (needed for premine + staking save)
+    let txn = state_storage.begin_write()?;
+
+    // Founder premine (200_000 KVNC) — write to state store if founder file present.
+    let premine_path = config.data_dir.join("founder_premine.hex");
+    if premine_path.exists() {
+        let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
+        if !hex.is_empty() {
+            let founder = parse_address_hex(Some(&hex))?;
+            use kvnc_storage::state_store::Account;
+            let state = state_storage.state();
+            let acct = Account { balance: kvnc_staking::FOUNDER_PREMINE, nonce: 0, code_hash: [0;32], code: vec![] };
+            state.set_account(&txn, &founder, &acct)?;
+            info!(address = %founder, "founder premine applied");
+        }
+    }
+
     // Load 4-node validator set from genesis file if present (Phase 16.6).
     let genesis_validators_path = config.data_dir.join("genesis_validators.toml");
     if genesis_validators_path.exists() {
@@ -505,10 +571,6 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
         info!(count = count, "loaded genesis validator set");
     }
 
-    // TODO: apply the founder premine and the genesis validator set once the
-    // genesis ceremony format is finalised. For now the treasury address is the
-    // only allocation recorded at genesis.
-    let txn = state_storage.begin_write()?;
     state_storage.state().save_staking_state(&txn, &staking)?;
     txn.commit()?;
 

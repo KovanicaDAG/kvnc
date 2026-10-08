@@ -56,3 +56,19 @@ Storage (redb / pruning / snapshots)
 - Full node comfortable on **2–4 GB RAM** VPS
 - Aggressive pruning of committed DAG history
 - Wasmi chosen for deterministic, low-footprint contract execution
+
+---
+## Current edit notes (2026-10-08)
+-  flag default = true (experimental, Phase 15.5).
+-  extended with  +  (Phase 14/16).
+-  /  compile fixes applied;  updated.
+-  blocked by pre-existing  /  errors.
+- Tokenomics locked (RFC-006 / docs/TOKENOMICS.md).
+
+
+---
+Edit notes 2026-10-08:
+- use_mysticghost default = true (experimental Phase 15).
+- init_genesis extended: founder_premine.hex + validators.json support.
+- Storage / staking compile fixes applied; TASKLIST.md updated.
+- Tokenomics locked (see docs/TOKENOMICS.md).

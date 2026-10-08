@@ -41,7 +41,7 @@ postcard = { version = "1.0", features = ["alloc"] }
 
 # Crypto
 blake3 = "=1.5.1"
-ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core", "batch"] }
 rand = "0.8"
 hex = "0.4"
 

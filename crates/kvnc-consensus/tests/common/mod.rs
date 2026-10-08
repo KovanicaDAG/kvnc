@@ -44,7 +44,9 @@ pub fn make_block(
     parents: Vec<BlockReference>,
     tag: &str,
 ) -> StatementBlock {
+            merkle_root: Hash::zero(),
     StatementBlock {
+            merkle_root: Hash::zero(),
         author,
         round,
         parents,
@@ -66,6 +68,7 @@ pub fn block_ref(block: &StatementBlock) -> BlockReference {
 
 /// Canonical genesis block used by most tests.
 pub fn genesis() -> StatementBlock {
+            merkle_root: Hash::zero(),
     make_block(0, 0, Vec::new(), "genesis")
 }
 
@@ -396,6 +399,7 @@ impl BlockManagerTrait for MockBlockManager {
             BlockManagerError::InvalidBlock("validator signing key is not installed".into())
         })?;
         let block = StatementBlock {
+            merkle_root: Hash::zero(),
             author: self.authority,
             round,
             parents,

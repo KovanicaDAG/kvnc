@@ -2,7 +2,7 @@
 
 use crate::{
     behaviour::{self, Behaviour},
-    block_sync::{BlockRequest, BlockResponse},
+    block_sync::{BlockSyncRequest, BlockSyncResponse},
     error::NetworkError,
     sync::SyncRequest,
     topics, NetworkConfig, NetworkEvent,
@@ -10,6 +10,7 @@ use crate::{
 use futures::StreamExt;
 use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolError};
+use kvnc_crypto::{self as crypto};
 use kvnc_types::{StatementBlock, Transaction, Vote};
 use libp2p::{
     gossipsub, identify, kad, request_response,
@@ -67,6 +68,8 @@ pub struct NetworkService {
     /// Addresses learned for a peer (from Kademlia), used to evict banned peers
     /// from the routing table.
     peer_addresses: Mutex<HashMap<PeerId, Vec<Multiaddr>>>,
+    /// Rate-limited block sync request timestamps per peer (audit 6.2).
+    sync_requests: Mutex<HashMap<PeerId, Instant>>,
     /// Bootstrap transport attempts survive cancellation/re-entry of `start`.
     bootstrap: Mutex<BootstrapMaintenance>,
 }
@@ -239,6 +242,7 @@ impl NetworkService {
                 ping_failures: Mutex::new(HashMap::new()),
                 invalid_block_failures: Mutex::new(HashMap::new()),
                 peer_addresses: Mutex::new(HashMap::new()),
+                sync_requests: Mutex::new(HashMap::new()),
                 bootstrap: Mutex::new(bootstrap),
             },
             event_rx,
@@ -388,8 +392,8 @@ impl NetworkService {
     /// Respond to a block sync request.
     pub fn respond_block_sync(
         &self,
-        channel: request_response::ResponseChannel<BlockResponse>,
-        response: BlockResponse,
+        channel: request_response::ResponseChannel<BlockSyncResponse>,
+        response: BlockSyncResponse,
     ) -> Result<(), NetworkError> {
         let mut swarm = self.swarm();
         swarm
@@ -403,7 +407,7 @@ impl NetworkService {
     pub fn request_block_sync(
         &self,
         peer: PeerId,
-        request: BlockRequest,
+        request: BlockSyncRequest,
     ) -> Result<request_response::OutboundRequestId, NetworkError> {
         let mut swarm = self.swarm();
         let request_id = swarm
@@ -411,6 +415,33 @@ impl NetworkService {
             .block_sync
             .send_request(&peer, request);
         Ok(request_id)
+    }
+
+    /// Process a block; when a parent is missing, enqueue a sync request.
+    /// Requests are rate-limited to 1 per peer per 500 ms (audit 6.2).
+    pub fn process_block(&self, block: &StatementBlock, peer: PeerId) -> Result<(), NetworkError> {
+        // Check for missing parents via DAG store
+        for parent in &block.parents {
+            if !self.dag_store.has_block(&parent.digest).unwrap_or(false) {
+                // Rate limit: allow at most 1 request per 500 ms per peer
+                let now = Instant::now();
+                let allowed = {
+                    let mut reqs = lock(&self.sync_requests);
+                    let last = reqs.get(&peer); 
+                    let ok = last.map_or(true, |t| now.duration_since(*t) >= Duration::from_millis(500));
+                    if ok {
+                        reqs.insert(peer, now);
+                    }
+                    ok
+                };
+                if allowed {
+                    let request = BlockSyncRequest::ByHash(parent.digest.clone());
+                    debug!(%peer, ?request, "missing parent -> enqueue sync request");
+                    self.request_block_sync(peer, request)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Forward an event to the caller. A dropped receiver only means nobody is
@@ -602,7 +633,7 @@ impl NetworkService {
     /// Handle request-response events (block sync).
     fn handle_request_response_event(
         &self,
-        event: request_response::Event<BlockRequest, BlockResponse>,
+        event: request_response::Event<BlockSyncRequest, BlockSyncResponse>,
     ) -> Result<(), NetworkError> {
         match event {
             request_response::Event::Message { peer, message, connection_id: _ } => match message {
@@ -614,17 +645,17 @@ impl NetworkService {
                     debug!(%peer, ?request, "block sync request received");
                     // Automatically respond using the DAG store
                     let response = match request {
-                        BlockRequest::ByHash(hash) => {
+                        BlockSyncRequest::ByHash(hash) => {
                             match self.dag_store.get_block(&hash) {
-                                Ok(block) => BlockResponse::Block(block),
-                                Err(_) => BlockResponse::NotFound,
+                                Ok(block) => BlockSyncResponse::Block(block),
+                                Err(_) => BlockSyncResponse::NotFound,
                             }
                         }
-                        BlockRequest::ByAuthorRound { author, round } => {
+                        BlockSyncRequest::ByAuthorRound { author, round } => {
                             match self.dag_store.get_block_by_author_round(author, round) {
-                                Ok(Some(block)) => BlockResponse::Block(block),
-                                Ok(None) => BlockResponse::NotFound,
-                                Err(_) => BlockResponse::InvalidRequest,
+                                Ok(Some(block)) => BlockSyncResponse::Block(block),
+                                Ok(None) => BlockSyncResponse::NotFound,
+                                Err(_) => BlockSyncResponse::InvalidRequest,
                             }
                         }
                     };
@@ -659,7 +690,7 @@ impl NetworkService {
                 self.emit(NetworkEvent::BlockSyncResponse {
                     peer,
                     request_id,
-                    response: BlockResponse::InvalidRequest,
+                    response: BlockSyncResponse::InvalidRequest,
                 });
             }
             request_response::Event::InboundFailure {
@@ -688,6 +719,11 @@ impl NetworkService {
                 return Ok(());
             }
         };
+        // Hot-path validation (audit 3.1): verify block signature before emission
+        if let Err(e) = kvnc_crypto::verify_batch(&[block.clone()]) {
+            warn!(digest = %block.digest, error = %e, "rejected invalid block at network ingress");
+            return Ok(());
+        }
         let (round, digest) = (block.round, block.digest);
         info!(round, %digest, "block received over gossip");
         self.emit(NetworkEvent::BlockReceived(block));

@@ -580,7 +580,7 @@ impl StakingState {
                 shares.push((addr, share));
             }
         }
-        shares.sort_by(|a, b| a.0.cmp(&b.0));
+        shares.sort_by(|a, b| a.0.0.cmp(&b.0.0));
         shares
     }
 

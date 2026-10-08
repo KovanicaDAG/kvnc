@@ -360,11 +360,11 @@ pub enum MempoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvnc_crypto::{generate_keypair, SigningKey};
-    use kvnc_crypto::PublicKey;
+    use kvnc_crypto::{generate_keypair};
     use kvnc_storage::Storage;
     use kvnc_storage::state_store::Account;
     use kvnc_types::{Address, Signature};
+    use kvnc_types::crypto::{PublicKey, SigningKey};
     use std::{fs, path::PathBuf};
 
     const STRESS_TX_COUNT: usize = 10_000;
@@ -374,37 +374,33 @@ mod tests {
         nonce: u64,
         kind: TransactionKind,
         fee: u64,
-        signing_key: &kvnc_crypto::SigningKey,
+        signing_key: &SigningKey,
     ) -> Transaction {
-        use kvnc_types::{hash::Hash};
-        
-        // Compute deterministic hash over signable fields
-        let encoder = bincode::serialize(&(sender.clone(), nonce, kind.clone(), fee)).expect("encode");
-        let hash = Hash::new(&encoder);
-        
-        // Sign the hash
-        let signature = kvnc_crypto::sign(signing_key, hash.as_ref());
-        
-        Transaction {
-            sender,
+        let kind_for_tx = kind.clone();
+        let mut tx = Transaction {
+            sender: sender.clone(),
             nonce,
-            kind,
+            kind: kind_for_tx,
             fee,
-            signature,
-            hash,
-        }
+            signature: Signature([0; 64]),
+            hash: Hash::zero(),
+        };
+        
+        let signing_hash = tx.signing_hash();
+        let signature = kvnc_crypto::sign(signing_key, signing_hash.as_ref());
+        
+        tx.signature = signature;
+        tx.hash = signing_hash;
+        tx
     }
 
-    fn stress_keypair() -> (kvnc_crypto::SigningKey, kvnc_types::crypto::PublicKey) {
+    fn stress_keypair() -> (SigningKey, PublicKey) {
         let (sk, vk) = kvnc_crypto::generate_keypair();
-        let pk = kvnc_types::crypto::PublicKey::from(vk);
+        let pk = PublicKey::from(vk);
         (sk, pk)
     }
 
-    fn stress_transaction(index: usize, (signing_key, _public_key): (kvnc_crypto::SigningKey, kvnc_types::crypto::PublicKey)) -> Transaction {
-        let mut hash = [0; 32];
-        hash[..8].copy_from_slice(&(index as u64).to_le_bytes());
-
+    fn stress_transaction(index: usize, (signing_key, _public_key): (SigningKey, PublicKey)) -> Transaction {
         let mut recipient = [0; 32];
         recipient[..8].copy_from_slice(&(index as u64).to_be_bytes());
 
@@ -417,21 +413,20 @@ mod tests {
         };
 
         // Build signed transaction - nonce = 0 since all are submitted simultaneously
-        let tx = build_signed_tx(sender.clone(), 0, kind.clone(), 1, &signing_key);
-
-        // Override the hash to maintain deterministic pattern
-        // The hash from build_signed is computed from signable fields; we set a custom one
-        // for the stress test pattern
-        let mut tx = tx;
-        tx.hash = Hash(hash);
-
+        let fee = 1;
+        let mut tx = build_signed_tx(sender.clone(), 0, kind.clone(), fee, &signing_key);
+        
         // Keep the fee rate in ten deterministic buckets while ensuring every
-        // transaction has a nonzero fee and the same serialized size.
+        // transaction has a non-zero fee and the same serialized size.
         let size = bincode::serialize(&tx)
             .expect("serialize stress transaction")
             .len();
-        let mut tx = tx;
         tx.fee = size as u64 * (1 + (index % 10) as u64);
+        
+        // Re-sign with updated fee since fee is part of the signing hash
+        let signing_hash = tx.signing_hash();
+        tx.signature = kvnc_crypto::sign(&signing_key, signing_hash.as_ref());
+        tx.hash = signing_hash;
         tx
     }
 
@@ -541,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_transaction_validation_edge_cases() {
-        use kvnc_crypto::{generate_keypair, sign};
+        use kvnc_crypto::{generate_keypair};
         use kvnc_types::transaction::TransactionKind;
         
         let db_path = std::env::temp_dir().join(format!("kvnc-mempool-validation-test-{}.redb", std::process::id()));
@@ -581,7 +576,7 @@ mod tests {
             &signing_key,
         );
         
-        assert!(pool.add_transaction(valid_tx.clone()).is_ok(), "Valid transaction should be accepted");
+        assert!(pool.add_transaction(valid_tx.clone()).is_ok(), "Valid transaction accepted");
         
         // Test 2: Transaction with invalid signature should be rejected
         let mut invalid_sig_tx = valid_tx.clone();
