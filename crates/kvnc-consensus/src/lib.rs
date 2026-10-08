@@ -25,8 +25,10 @@ pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorStat
 pub use kvnc_types::Vote;
 pub use linearizer::Linearizer;
 pub use metrics::{
-    record_colouring_duration_ms, record_mergeset_size, record_pruned_blocks, record_pruned_waves,
-    registry, update_dag_blocks_in_memory,
+    metrics_text, record_block_height, record_commit_latency, record_mergeset_size_metric,
+    record_mempool_size, record_peer_count, record_rss_proxy, record_colouring_duration_ms,
+    record_mergeset_size, record_pruned_blocks, record_pruned_waves, registry,
+    update_dag_blocks_in_memory,
 };
 pub use types::{
     AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo,

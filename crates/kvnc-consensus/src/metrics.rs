@@ -6,6 +6,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::encoding::text::{encode, encode_eof};
 use prometheus_client::registry::{Registry, Unit};
 use std::sync::Mutex;
 
@@ -108,6 +109,122 @@ pub fn record_pruned_blocks(count: u64) {
 /// Record pruned waves count.
 pub fn record_pruned_waves(count: u64) {
     MYSTICGHOST_PRUNED_WAVES_TOTAL.inc_by(count);
+}
+
+/// Current block height.
+static BLOCK_HEIGHT: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "block_height",
+        "Current chain block height",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Number of connected peers.
+static PEER_COUNT: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "peer_count",
+        "Number of connected P2P peers",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Size of the mempool (pending transactions).
+static MEMPOOL_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "mempool_size",
+        "Number of pending transactions in mempool",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Commit latency in milliseconds.
+static COMMIT_LATENCY: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "commit_latency",
+        "Commit latency in milliseconds (proxy)",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Mergeset size.
+static MERGESET_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "mergeset_size",
+        "Number of blocks in the mergeset (proxy)",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// RSS memory proxy (MB).
+static RSS_PROXY: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "rss_proxy",
+        "Approximate RSS memory footprint in MB (proxy)",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Record block height.
+pub fn record_block_height(height: i64) {
+    BLOCK_HEIGHT.set(height);
+}
+
+/// Record peer count.
+pub fn record_peer_count(count: i64) {
+    PEER_COUNT.set(count);
+}
+
+/// Record mempool size.
+pub fn record_mempool_size(size: i64) {
+    MEMPOOL_SIZE.set(size);
+}
+
+/// Record commit latency (ms).
+pub fn record_commit_latency(ms: f64) {
+    COMMIT_LATENCY.set(ms as i64);
+}
+
+/// Record mergeset size.
+pub fn record_mergeset_size_metric(size: usize) {
+    MERGESET_SIZE.set(size as i64);
+}
+
+/// Record RSS proxy (MB).
+pub fn record_rss_proxy(mb: i64) {
+    RSS_PROXY.set(mb);
+}
+
+/// Encode the metrics registry to the Prometheus text format.
+pub fn metrics_text() -> String {
+    let mut buffer = String::new();
+    let reg = REGISTRY.lock().unwrap();
+    let _ = encode(&mut buffer, &*reg);
+    buffer
+}
+
+/// Encode registry content (without EOF) for streaming responses.
+pub fn metrics_text_stream(buffer: &mut String) {
+    let reg = REGISTRY.lock().unwrap();
+    let _ = encode(buffer, &*reg);
 }
 
 /// Update DAG blocks in memory gauge.

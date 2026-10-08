@@ -140,6 +140,8 @@ pub struct ConsensusConfig {
     /// Number of waves to keep before pruning old waves.
     /// Default: 100 waves.
     pub prune_window_waves: u64,
+    /// Leader timeout in milliseconds; skip leader if no block arrives.
+    pub leader_timeout_ms: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -150,6 +152,7 @@ impl Default for ConsensusConfig {
             max_pending_rounds: 100,
             use_mysticghost: false,
             prune_window_waves: 100,
+            leader_timeout_ms: 3000,
         }
     }
 }
@@ -196,6 +199,8 @@ where
     commit_trigger_lock: Mutex<()>,
     /// Mempool for transaction selection during block proposal.
     mempool: Option<Arc<Mempool>>,
+    /// Timeout deadline for the current leader slot (round, instant).
+    leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
 }
 
 impl<D, B> ConsensusEngine<D, B>
@@ -252,6 +257,7 @@ where
             round_sender: RwLock::new(Some(round_tx)),
             commit_trigger_lock: Mutex::new(()),
             mempool,
+            leader_deadline: RwLock::new(None),
         }
     }
 
@@ -294,6 +300,17 @@ where
         let mut round_interval = interval(Duration::from_millis(self.config.round_duration_ms));
 
         while *self.running.read() {
+            // Timeout check: skip leader if no block after leader_timeout_ms
+            {
+                let deadline_opt = *self.leader_deadline.read();
+                if let Some((round, instant)) = deadline_opt {
+                    if std::time::Instant::now().duration_since(instant).as_millis() >= self.config.leader_timeout_ms as u128 {
+                        self.skip_leader(round)?;
+                        *self.leader_deadline.write() = None;
+                    }
+                }
+            }
+
             round_interval.tick().await;
 
             let current_round = *self.current_round.read();
@@ -319,9 +336,13 @@ where
             // Try to commit any pending leaders
             self.try_commit_and_deliver()?;
 
-            // If we're the leader, propose a block
+            // If we're the leader, propose a block and start timeout timer
             if is_leader {
                 self.propose_block(next_round).await?;
+                *self.leader_deadline.write() = Some((next_round, std::time::Instant::now()));
+            } else if crate::is_leader_round(next_round) {
+                // Non-leader: start timeout for the scheduled leader of this round
+                *self.leader_deadline.write() = Some((next_round, std::time::Instant::now()));
             }
 
             // If this is a vote round, produce a vote for the previous leader round
@@ -333,6 +354,24 @@ where
             self.cleanup_old_rounds(next_round);
         }
 
+        Ok(())
+    }
+
+    /// Skip a leader slot (timeout or fork resolution).
+    fn skip_leader(&self, round: Round) -> Result<(), ConsensusError> {
+        if let Some(leader) = self.scheduled_leader_for_round(round) {
+            let info = LeaderInfo {
+                round,
+                author: leader,
+                block_hash: None,
+                status: LeaderStatus::Skip,
+                votes: HashMap::new(),
+            };
+            self.committer.update_leader(info);
+            info!("Leader round {} skipped (timeout/fork)", round);
+        }
+        // Try to commit after skip so downstream can progress
+        self.try_commit_and_deliver()?;
         Ok(())
     }
 
@@ -465,6 +504,31 @@ where
         &self,
         block: &kvnc_types::block::StatementBlock,
     ) -> Result<(), ConsensusError> {
+        // Fork resolution for scheduled leader slots: first-valid digest wins.
+        // Deterministic lookup by round/author (no HashMap iteration order).
+        if self.scheduled_leader_for_round(block.round) == Some(block.author) {
+            if let Ok(Some(existing)) = self.dag_store.get_block_by_author_round(block.author, block.round) {
+                if existing.digest != block.digest {
+                    return Err(ConsensusError::InvalidVote(format!(
+                        "fork/equivocation at round {} author {}: existing={}, new={}",
+                        block.round, block.author, existing.digest, block.digest
+                    )));
+                }
+                // Same digest: idempotent; skip duplicate processing if already in store.
+                // Clear timeout and try commit; do not put/re-register.
+                {
+                    let mut dl = self.leader_deadline.write();
+                    if let Some((r, _)) = *dl {
+                        if r == block.round && self.scheduled_leader_for_round(r) == Some(block.author) {
+                            *dl = None;
+                        }
+                    }
+                }
+                self.try_commit_and_deliver()?;
+                return Ok(());
+            }
+        }
+
         // Validate the block
         self.block_manager.read().process_block(block)?;
 
@@ -472,6 +536,7 @@ where
         // of an offset-zero round represents a leader slot. In particular,
         // ordinary vote/decision-round blocks must not overwrite leader state.
         if self.scheduled_leader_for_round(block.round) == Some(block.author) {
+            // After validation/store, register leader (pre-check already rejected forks).
             let leader_info = LeaderInfo {
                 round: block.round,
                 author: block.author,
@@ -480,6 +545,16 @@ where
                 votes: HashMap::new(),
             };
             self.committer.update_leader(leader_info);
+        }
+
+        // Clear timeout if this block resolves the current leader slot
+        {
+            let mut dl = self.leader_deadline.write();
+            if let Some((r, _)) = *dl {
+                if r == block.round && self.scheduled_leader_for_round(r) == Some(block.author) {
+                    *dl = None;
+                }
+            }
         }
 
         // Try to commit after processing
@@ -1176,5 +1251,81 @@ mod tests {
         assert_eq!(blocks_at_round3[0].author, 0, "Block author should be our authority");
 
         engine.stop();
+    }
+
+    #[test]
+    fn timeout_skips_leader_after_deadline() {
+        let (engine, _dag, _key) = test_engine(100);
+        // Manually set a leader deadline in the past for round 3
+        *engine.leader_deadline.write() = Some((3, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        // Skip should mark leader as Skip without panic
+        engine.skip_leader(3).unwrap();
+    }
+
+    #[test]
+    fn fork_first_valid_digest_wins_deterministic() {
+        let (engine, dag, key) = test_engine(100);
+        let digest_a = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[]);
+        let block_a = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest_a.as_ref()),
+            digest: digest_a,
+        };
+        engine.process_block(&block_a).unwrap();
+
+        // Second block with different digest for same round/author should fail (fork)
+        let digest_b = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[kvnc_types::block::BlockReference { author: 0, round: 2, digest: kvnc_types::Hash::zero() }]);
+        let block_b = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest_b.as_ref()),
+            digest: digest_b,
+        };
+        let result = engine.process_block(&block_b);
+        assert!(result.is_err(), "Fork/equivocation with different digest must be rejected");
+        assert!(result.unwrap_err().to_string().contains("fork/equivocation"));
+    }
+
+    #[test]
+    fn fork_same_digest_is_idempotent() {
+        let (engine, _dag, key) = test_engine(100);
+        let digest = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[]);
+        let block = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest.as_ref()),
+            digest,
+        };
+        engine.process_block(&block).unwrap();
+        // Same digest again must succeed (idempotent)
+        engine.process_block(&block).unwrap();
+    }
+
+    #[tokio::test]
+    async fn leader_timeout_timer_cleared_on_valid_block() {
+        let (engine, _dag, key) = test_engine(100);
+        let digest = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[]);
+        let block = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest.as_ref()),
+            digest,
+        };
+        *engine.leader_deadline.write() = Some((3, std::time::Instant::now()));
+        engine.process_block(&block).unwrap();
+        assert!(engine.leader_deadline.read().is_none(), "Deadline should be cleared when block arrives");
     }
 }
