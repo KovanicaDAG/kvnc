@@ -157,10 +157,56 @@ impl UniversalCommitter {
         }
     }
 
+    /// Explicitly register a skip for a leader (timeout resolution).
+    /// Persists Skip in both leaders and decided maps when appropriate.
+    pub fn register_skip(&self, round: Round, author: AuthorityIndex) {
+        let info = LeaderInfo {
+            round,
+            author,
+            block_hash: None,
+            status: LeaderStatus::Skip,
+            votes: HashMap::new(),
+        };
+        self.update_leader(info.clone());
+        // Ensure decided map reflects Skip (persisted in decided map per spec)
+        let mut decided = self.decided_leaders.write();
+        decided.insert(round, info);
+        let mut last = self.last_decided_round.write();
+        if round > *last {
+            *last = round;
+        }
+    }
+
     /// Update leader information for a round.
+    /// Deterministic tie-break (fork): same (round, author) with different
+    /// digest keeps the lexicographically smaller digest; larger rejected.
     pub fn update_leader(&self, leader_info: LeaderInfo) {
         let mut leaders = self.leaders.write();
-        leaders.insert(leader_info.round, leader_info);
+        let key = leader_info.round;
+        if let Some(existing) = leaders.get(&key) {
+            if existing.author == leader_info.author {
+                match (existing.block_hash.as_ref(), leader_info.block_hash.as_ref()) {
+                    (Some(old_hash), Some(new_hash)) => {
+                        if new_hash.0 < old_hash.0 {
+                            leaders.insert(key, leader_info);
+                        }
+                        return;
+                    }
+                    (None, Some(_)) => {
+                        leaders.insert(key, leader_info);
+                        return;
+                    }
+                    (Some(_), None) => return,
+                    (None, None) => {
+                        if leader_info.status == LeaderStatus::Skip && existing.status != LeaderStatus::Skip {
+                            leaders.insert(key, leader_info);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        leaders.insert(key, leader_info);
     }
 
     /// Mark a leader as decided.

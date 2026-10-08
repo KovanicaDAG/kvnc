@@ -201,6 +201,10 @@ where
     mempool: Option<Arc<Mempool>>,
     /// Timeout deadline for the current leader slot (round, instant).
     leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
+    /// Last round where this engine proposed a leader block.
+    last_proposed_round: RwLock<Round>,
+    /// Timeout factor (rounds) after which a missing leader is skipped.
+    timeout_factor: u64,
 }
 
 impl<D, B> ConsensusEngine<D, B>
@@ -258,6 +262,8 @@ where
             commit_trigger_lock: Mutex::new(()),
             mempool,
             leader_deadline: RwLock::new(None),
+            last_proposed_round: RwLock::new(0),
+            timeout_factor: 3,
         }
     }
 
@@ -300,11 +306,28 @@ where
         let mut round_interval = interval(Duration::from_millis(self.config.round_duration_ms));
 
         while *self.running.read() {
+            // Timeout check via timeout_factor: when current_round advances past
+            // last_proposed_round + timeout_factor, emit Skip for missing leader.
+            {
+                let current = *self.current_round.read();
+                let last_prop = *self.last_proposed_round.read();
+                if current > last_prop + self.timeout_factor {
+                    let target = last_prop + self.timeout_factor;
+                    if let Some(leader_author) = self.scheduled_leader_for_round(target) {
+                        self.committer.register_skip(target, leader_author);
+                    }
+                    *self.last_proposed_round.write() = current;
+                }
+            }
+
             // Timeout check: skip leader if no block after leader_timeout_ms
             {
                 let deadline_opt = *self.leader_deadline.read();
                 if let Some((round, instant)) = deadline_opt {
                     if std::time::Instant::now().duration_since(instant).as_millis() >= self.config.leader_timeout_ms as u128 {
+                        if let Some(leader_author) = self.scheduled_leader_for_round(round) {
+                            self.committer.register_skip(round, leader_author);
+                        }
                         self.skip_leader(round)?;
                         *self.leader_deadline.write() = None;
                     }
@@ -418,7 +441,8 @@ where
                 };
                 self.committer.update_leader(leader_info);
 
-                // Mark as proposed
+                // Mark as proposed and record last proposed round for timeout
+                *self.last_proposed_round.write() = round;
                 self.state.write().proposed = true;
 
                 info!("Proposed block {} at round {} with {} transactions", block.digest, round, block.transactions.len());
@@ -1327,5 +1351,72 @@ mod tests {
         *engine.leader_deadline.write() = Some((3, std::time::Instant::now()));
         engine.process_block(&block).unwrap();
         assert!(engine.leader_deadline.read().is_none(), "Deadline should be cleared when block arrives");
+    }
+
+    #[test]
+    fn timeout_and_fork_deterministic() {
+        // 4.3 Timeout + 4.4 Fork: skip via timeout_factor and lexicographic min-digest wins.
+        use crate::committer::UniversalCommitter;
+        use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
+        use kvnc_types::{hash::Hash, AuthorityIndex};
+
+        let committee = CommitteeInfo::try_new(
+            0,
+            vec![
+                crate::types::AuthorityInfo {
+                    index: 0,
+                    stake: 100,
+                    public_key: kvnc_crypto::generate_keypair().0,
+                    address: kvnc_types::Address::default(),
+                    network_address: String::new(),
+                }
+            ],
+        ).expect("valid");
+
+        let committer = UniversalCommitter::new(committee, false, 100);
+        let round: Round = 7;
+        let author: AuthorityIndex = 0;
+
+        // First digest (larger lexicographically) registered.
+        let larger_digest = Hash([255u8; 32]);
+        committer.update_leader(LeaderInfo {
+            round,
+            author,
+            block_hash: Some(larger_digest),
+            status: LeaderStatus::Undecided,
+            votes: std::collections::HashMap::new(),
+        });
+
+        // Second digest (smaller lexicographically) must win deterministically.
+        let smaller_digest = Hash([1u8; 32]);
+        committer.update_leader(LeaderInfo {
+            round,
+            author,
+            block_hash: Some(smaller_digest),
+            status: LeaderStatus::Undecided,
+            votes: std::collections::HashMap::new(),
+        });
+
+        let leader = committer.get_leader(round).expect("leader exists");
+        assert_eq!(
+            leader.block_hash,
+            Some(smaller_digest),
+            "min_digest (lexicographic) must win"
+        );
+        assert_ne!(
+            leader.block_hash,
+            Some(larger_digest),
+            "larger digest must be rejected"
+        );
+
+        // 4.3 Timeout: register_skip must persist Skip in decided map.
+        committer.register_skip(7, 0);
+        let decided = committer.get_all_decided_leaders();
+        assert!(decided.contains_key(&7), "skip must be persisted in decided map");
+        assert_eq!(
+            decided.get(&7).unwrap().status,
+            LeaderStatus::Skip,
+            "Skip status must be persisted"
+        );
     }
 }
