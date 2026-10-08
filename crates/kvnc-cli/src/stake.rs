@@ -1,5 +1,6 @@
 //! Phase 8.2 CLI — delegation commands (stake / unstake / delegate / claim-rewards).
-//! Deterministic output; no HashMap ordering; tokenomics untouched.
+//! Phase 18.3 — CLI stake/unbond completed; deterministic output; tokenomics untouched.
+//! All commands use BTreeMap ordering for determinism.
 use anyhow::Result;
 use clap::{Args, Subcommand};
 

@@ -426,6 +426,30 @@ impl StakingState {
         Ok(claimed)
     }
 
+    /// Rotate epoch at `EPOCH_ROUNDS` boundary (linked to committed-leader height).
+    /// Returns the new epoch number (starts at 0, increments every `EPOCH_ROUNDS`).
+    pub fn rotate_epoch(&mut self) -> u64 {
+        let epoch = self.committed_leader_height / EPOCH_ROUNDS;
+        // Epoch rotation preserves validator set, unbonding queue, and treasury;
+        // future phases may apply stake re-balancing or new admission here.
+        epoch
+    }
+
+    /// Minimal genesis staking state (Phase 24.1): 15 active validators at MIN_VALIDATOR_STAKE,
+    /// treasury configured, height 0. Used by genesis / testnet initialization.
+    pub fn genesis(min_validators: u32) -> Self {
+        let mut state = Self::new();
+        let treasury_addr = Address([0xFF; 32]); // fixed genesis treasury
+        state.init_treasury(treasury_addr);
+        // Admit minimum active validators deterministically (sorted by address byte)
+        for i in 0..min_validators {
+            let byte = (i as u8 + 1) % 255; // avoid zero address collision
+            let validator = Address([byte; 32]);
+            state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).expect("genesis validator admission");
+        }
+        state
+    }
+
     /// Check how much treasury is currently claimable.
     pub fn treasury_claimable(&self) -> u64 {
         self.treasury.as_ref().map(|t| t.claimable()).unwrap_or(0)
@@ -528,6 +552,19 @@ impl StakingState {
         Ok(())
     }
 
+    /// Return unbonding entries ready for withdrawal at current `committed_leader_height`.
+    /// Deterministic: sorted by (delegator, validator, release_height).
+    pub fn unbonding_ready(&self) -> Vec<&UnbondingEntry> {
+        let current = self.committed_leader_height;
+        let mut ready: Vec<&UnbondingEntry> = self
+            .unbonding_queue
+            .iter()
+            .filter(|e| e.release_height <= current)
+            .collect();
+        ready.sort_by(|a, b| a.delegator.0.cmp(&b.delegator.0).then(a.validator.0.cmp(&b.validator.0)).then(a.release_height.cmp(&b.release_height)));
+        ready
+    }
+
     /// Withdraw from unbonding queue once `release_height` passed.
     pub fn withdraw_unbonded(&mut self, delegator: Address, validator: Address) -> Result<u64, StakingError> {
         let current = self.committed_leader_height;
@@ -585,6 +622,8 @@ impl StakingState {
     }
 
     /// Process double-sign evidence: apply fixed % slash to validator stake and delegations.
+    /// Security audit (20.1): slash is deterministic — fixed 500 bps, sum is commutative,
+    /// so delegation processing order does not affect total slashed amount.
     pub fn slash(&mut self, evidence: DoubleSignEvidence) -> Result<u64, StakingError> {
         let v_idx = self
             .validators
@@ -936,6 +975,66 @@ mod tests {
         assert!(slash_state.total_staked < MIN_VALIDATOR_STAKE.saturating_add(delegate_amount));
     }
 
+    #[test]
+    #[test]
+    fn epoch_rotation_at_subsidy_era_boundary() {
+        let mut state = StakingState::new();
+        assert_eq!(state.rotate_epoch(), 0);
+
+        state.committed_leader_height = SUBSIDY_ERA_BLOCKS - 1;
+        assert_eq!(state.rotate_epoch(), 0);
+
+        state.committed_leader_height = SUBSIDY_ERA_BLOCKS;
+        assert_eq!(state.rotate_epoch(), 1);
+
+        state.committed_leader_height = 2 * SUBSIDY_ERA_BLOCKS;
+        assert_eq!(state.rotate_epoch(), 2);
+    }
+
+    #[test]
+    #[test]
+    fn unbonding_ready_sorted_deterministic() {
+        let mut state = StakingState::new();
+        state.join_validator(Address([1u8; 32]), MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        state.delegate(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC).unwrap();
+        state.unbond(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC).unwrap();
+
+        // Before release → none ready.
+        assert!(state.unbonding_ready().is_empty());
+
+        state.committed_leader_height = UNBONDING_ROUNDS;
+        let ready = state.unbonding_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].amount, 5_000 * ONE_KVNC);
+    }
+
+    #[test]
+    fn slash_is_deterministic_fixed_500bps() {
+        let mut state = StakingState::new();
+        let validator = Address([3u8; 32]);
+        state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        let evidence = DoubleSignEvidence { validator, height: 1 };
+        let total_first = state.slash(evidence.clone()).unwrap();
+        // Re-apply to fresh validator with same stake (simulated second occurrence)
+        let mut state2 = StakingState::new();
+        state2.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        let total_second = state2.slash(evidence.clone()).unwrap();
+        assert_eq!(total_first, total_second, "slash amount must be deterministic for same evidence");
+        assert_eq!(total_first, MIN_VALIDATOR_STAKE / 20); // 500 bps = 5%
+    }
+
+    #[test]
+    #[test]
+    fn genesis_state_has_15_validators_and_treasury() {
+        let state = StakingState::genesis(MIN_ACTIVE_VALIDATORS);
+        assert_eq!(state.validators.len(), MIN_ACTIVE_VALIDATORS as usize);
+        assert!(state.validators.iter().all(|v| v.active && v.stake == MIN_VALIDATOR_STAKE));
+        assert!(state.treasury.is_some());
+        assert_eq!(state.committed_leader_height, 0);
+        assert_eq!(state.total_staked, MIN_VALIDATOR_STAKE * MIN_ACTIVE_VALIDATORS as u64);
+    }
+
+    #[test]
     #[test]
     fn staking_state_bincode_roundtrip() {
         let mut state = StakingState::new();

@@ -200,6 +200,69 @@ impl CommitteeInfo {
         let idx = (round as usize) % self.authorities.len();
         self.authorities[idx].index
     }
+
+    /// Deterministic stake-weighted leader selection.
+    ///
+    /// Uses `round` as a seed against total stake so the same
+    /// (committee, round) pair always selects the same leader.
+    pub fn stake_weighted_leader(&self, round: Round) -> AuthorityIndex {
+        if self.authorities.is_empty() {
+            return 0;
+        }
+        let seed = round as u128;
+        let total = self.total_stake.max(1) as u128;
+        let target = (seed % total) as Stake;
+        let mut sorted: Vec<&AuthorityInfo> = self.authorities.iter().collect();
+        sorted.sort_by_key(|a| a.index);
+        let mut cumulative = 0u128;
+        for auth in sorted {
+            cumulative += auth.stake as u128;
+            if cumulative > target as u128 {
+                return auth.index;
+            }
+        }
+        // Fallback (should not reach here for non-empty, positive-stake committee)
+        self.authorities.last().unwrap().index
+    }
+}
+
+#[cfg(test)]
+mod stake_weighted_tests {
+    use super::*;
+    use kvnc_types::crypto::PublicKey;
+
+    fn info(index: AuthorityIndex, stake: Stake) -> AuthorityInfo {
+        AuthorityInfo {
+            index,
+            stake,
+            public_key: PublicKey([index as u8; 32]),
+            address: kvnc_types::Address([index as u8; 32]),
+            network_address: format!("/ip4/127.0.0.1/tcp/900{}", index),
+        }
+    }
+
+    #[test]
+    fn stake_weighted_deterministic() {
+        let authorities = vec![
+            info(0, 100),
+            info(1, 200),
+            info(2, 300),
+        ];
+        let committee = CommitteeInfo::try_new(0, authorities).unwrap();
+        assert_eq!(committee.stake_weighted_leader(42), committee.stake_weighted_leader(42));
+    }
+
+    #[test]
+    fn stake_weighted_splits_by_stake() {
+        let authorities = vec![info(0, 100), info(1, 100)];
+        let committee = CommitteeInfo::try_new(0, authorities).unwrap();
+        // With equal stake and seed 0, target = 0 % 200 = 0; first auth (cum 100 > 0) wins
+        assert_eq!(committee.stake_weighted_leader(0), 0);
+        // Seed 99 → target = 99; first auth (cum 100 > 99) still wins
+        assert_eq!(committee.stake_weighted_leader(99), 0);
+        // Seed 100 → target = 100; first auth cum 100 > 100? No (100 > 100 false). Second wins.
+        assert_eq!(committee.stake_weighted_leader(100), 1);
+    }
 }
 
 /// Individual authority information.

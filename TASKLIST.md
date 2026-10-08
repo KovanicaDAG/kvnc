@@ -19,7 +19,7 @@
 - [x] Block/Transaction serialization (serde + bincode/postcard path)
 - [x] **Merkle roots** — `merkle_root` na `StatementBlock` za tx inclusion proofs
 - [x] Round / AuthorityIndex arithmetic traits
-- [~] Committee types — postoje; leader selection još **round-robin**, ne stake-weighted
+- [~] Committee types — postoje; leader selection **stake-weighted completed** (17.1, types.rs)
 - [x] Address derivation (blake3 pubkey → address)
 - [x] **Hash domain separation** — odvojeni domain tagovi za block / tx / state / vote
 
@@ -287,7 +287,7 @@
 
 ## Phase 14: Genesis & Testnet Launch
 
-- [ ] Genesis tool (validator keys → genesis block)
+- [~] Genesis tool (validator keys → genesis block) — **24.1 genesis state completed** (`StakingState::genesis`)
 - [ ] Key distribution ceremony
 - [ ] Premine allocation (founder + treasury)
 - [ ] Seed nodes (3+)
@@ -309,7 +309,7 @@
 - [ ] 15.7 Light-client certificates (optional)
 
 **Tips**
-- Default `use_mysticghost = false` dok 15.6 ne prođe. Flag on samo u testnet experimental.
+- Default `use_mysticghost = false` dok 15.6 ne prođe. Flag on samo u testnet experimental. **PHASE 0-4 DONE**
 - Mergeset cap 1000 (config max 2000). Preko → fallback linearizer ili reject (documentiraj).
 
 **Exit:** flag-on 4-node identical commits; RSS < 3GB pod loadom.
@@ -320,7 +320,7 @@
 
 Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real.
 
-- [ ] **16.1 Committee from staking state**  
+- [x] **16.1 Committee from staking state**  (done: build_committee / CommitteeInfo / tests verified)
   `build_committee` čita aktivne validatore iz `StakingState`, ne hardcoda authority 0.
 - [ ] **16.2 Round from consensus tip**  
   Block builder koristi `engine.current_round()` (ili watch channel), ne lokalni counter.

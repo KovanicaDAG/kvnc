@@ -17,7 +17,7 @@ pub struct MysticGhostConfig {
     /// GHOSTDAG parameter k (must be 3 for the current safety argument).
     pub k: usize,
     /// Maximum number of blocks allowed in a mergeset before we refuse to colour.
-    /// Protects the resource budget.
+    /// Phase 5 hard guard: production cap 1_000 blocks.
     pub max_mergeset_blocks: usize,
 }
 
