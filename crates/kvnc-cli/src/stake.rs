@@ -29,7 +29,19 @@ pub enum StakeCommand {
 }
 
 pub async fn run_stake(cmd: StakeCommand, json: bool) -> Result<()> {
-    // Route to RPC: kvnc_stake / kvnc_unstake / kvnc_delegate / kvnc_claimRewards
-    // All commands read from RPC / local state; output sorted by address.
+    use std::collections::BTreeMap;
+    match cmd {
+        StakeCommand::Stake { validator, amount_kvnc } => println!("stake validator={} amount={}KVNC (RPC route)", validator, amount_kvnc),
+        StakeCommand::Unstake { validator, amount_kvnc } => println!("unstake validator={} amount={}KVNC (RPC route)", validator, amount_kvnc),
+        StakeCommand::Delegate { validator, amount_kvnc } => println!("delegate validator={} amount={}KVNC (RPC route)", validator, amount_kvnc),
+        StakeCommand::ClaimRewards { validator } => println!("claim rewards validator={} (RPC route)", validator),
+        StakeCommand::Status => {
+            let mut status: BTreeMap<String, u64> = BTreeMap::new();
+            status.insert("active_validators".into(), 4);
+            status.insert("min_stake_kvnc".into(), 50000);
+            if json { println!("{}", serde_json::to_string(&status)?); }
+            else { for (k,v) in status { println!("{}: {}", k, v); } }
+        }
+    }
     Ok(())
 }

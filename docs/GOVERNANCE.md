@@ -1,0 +1,5 @@
+# Phase 25 — Governance (post-mainnet, kvnc)
+- Parameter change proposals: open (`docs/GOV.md` — off-chain signal v1)
+- On-chain voting (stake-weighted): open (requires Phase 18 stable)
+- Treasury spend proposals: open (`StakingState` treasury init exists)
+- Upgrade signaling: open (epoch boundary only)
