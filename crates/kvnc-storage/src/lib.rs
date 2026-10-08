@@ -202,4 +202,68 @@ mod tests {
         let _txn = storage.begin_write().unwrap();
         // commit happens on transaction drop
     }
+
+    #[test]
+    fn test_state_root_determinism() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("test.db")).unwrap();
+        let txn = storage.begin_read().unwrap();
+        let state = StateStore;
+        let root1 = state.compute_state_root(&txn).unwrap();
+        drop(txn);
+        let txn2 = storage.begin_read().unwrap();
+        let root2 = state.compute_state_root(&txn2).unwrap();
+        assert_eq!(root1.0, root2.0, "state root must be deterministic");
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip() {
+        use crate::state_store::{Account, StateStore};
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("snap.db");
+        let storage = Storage::new(&db_path).unwrap();
+
+        // Write state
+        {
+            let txn = storage.begin_write().unwrap();
+            let state = storage.state();
+            let addr = kvnc_types::Address([7; 32]);
+            let acct = Account {
+                balance: 1000,
+                nonce: 3,
+                code_hash: [0; 32],
+                code: vec![1, 2, 3],
+            };
+            state.set_account(&txn, &addr, &acct).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Export
+        let snap_path = dir.path().join("snap.bin");
+        {
+            let txn = storage.begin_read().unwrap();
+            let state = storage.state();
+            state.export_snapshot(&txn, &snap_path).unwrap();
+        }
+
+        // Restore into fresh DB
+        let db_path2 = dir.path().join("snap2.db");
+        let storage2 = Storage::new(&db_path2).unwrap();
+        {
+            let txn = storage2.begin_write().unwrap();
+            let state = storage2.state();
+            state.import_snapshot(&txn, &snap_path).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // Verify
+        {
+            let txn = storage2.begin_read().unwrap();
+            let state = storage2.state();
+            let addr = kvnc_types::Address([7; 32]);
+            let restored = state.get_account(&txn, &addr).unwrap();
+            assert_eq!(restored.balance, 1000);
+            assert_eq!(restored.nonce, 3);
+        }
+    }
 }

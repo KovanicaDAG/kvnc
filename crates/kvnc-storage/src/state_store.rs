@@ -7,7 +7,7 @@ use kvnc_staking::{Delegation, StakingState, TreasuryState, ValidatorInfo};
 use kvnc_types::{Address, Stake};
 use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 
 /// Errors specific to state store operations.
@@ -336,4 +336,235 @@ impl StateStore {
         }
         Ok(latest)
     }
+
+
+    // ============================================================
+    // Sorted KV Merkle root
+    // ============================================================
+
+    /// Compute a deterministic sorted key-value Merkle root over all
+    /// state tables (accounts, contract code, contract storage,
+    /// staking state). Each leaf = H(key || value) using BLAKE3.
+    /// Keys are sorted lexicographically (as byte arrays) before
+    /// hashing so the result is deterministic.
+    pub fn compute_state_root(
+        &self,
+        txn: &ReadTransaction,
+    ) -> Result<kvnc_types::hash::Hash, StateStoreError> {
+        let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        // Accounts table
+        {
+            let table = txn.open_table(crate::tables::ACCOUNTS)?;
+            for entry in table.iter()? {
+                let (key_bytes, value_bytes) = entry?;
+                let mut leaf_key = key_bytes.value().to_vec();
+                leaf_key.extend_from_slice(value_bytes.value());
+                entries.insert(key_bytes.value().to_vec(), leaf_key);
+            }
+        }
+
+        // Contract code table
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_CODE)?;
+            for entry in table.iter()? {
+                let (key_bytes, value_bytes) = entry?;
+                let mut leaf_key = b"code:".to_vec();
+                leaf_key.extend_from_slice(key_bytes.value());
+                let mut combined = leaf_key.clone();
+                combined.extend_from_slice(value_bytes.value());
+                entries.insert(leaf_key, combined);
+            }
+        }
+
+        // Contract storage table
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
+            for entry in table.iter()? {
+                let (key_pair_bytes, value_bytes) = entry?;
+                let key_pair: ([u8; 32], [u8; 32]) = bincode::deserialize(key_pair_bytes.value())?;
+                let mut leaf_key = b"storage:"
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<u8>>();
+                leaf_key.extend_from_slice(&key_pair.0);
+                leaf_key.extend_from_slice(&key_pair.1);
+                let mut combined = leaf_key.clone();
+                combined.extend_from_slice(value_bytes.value());
+                entries.insert(leaf_key, combined);
+            }
+        }
+
+        // Staking state table
+        {
+            let table = txn.open_table(crate::tables::STAKING_STATE)?;
+            for entry in table.iter()? {
+                let (key_bytes, value_bytes) = entry?;
+                let mut leaf_key = b"staking:"
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<u8>>();
+                leaf_key.extend_from_slice(key_bytes.value());
+                let mut combined = leaf_key.clone();
+                combined.extend_from_slice(value_bytes.value());
+                entries.insert(leaf_key, combined);
+            }
+        }
+
+        let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(entries.len());
+        for (_, combined) in entries {
+            let hash = kvnc_types::hash::Hash::new(&combined);
+            leaves.push(hash.0);
+        }
+        Ok(kvnc_types::hash::Hash(merkle_root(leaves)))
+    }
+
+    /// Export a snapshot of all state data to a file using bincode.
+    pub fn export_snapshot<P: AsRef<std::path::Path>>(
+        &self,
+        txn: &ReadTransaction,
+        path: P,
+    ) -> Result<(), StateStoreError> {
+        use std::fs::File;
+        use std::io::Write;
+
+        #[derive(Serialize, Deserialize, Debug, Default)]
+        struct SnapshotData {
+            accounts: Vec<(Vec<u8>, Vec<u8>)>,
+            contract_code: Vec<(Vec<u8>, Vec<u8>)>,
+            contract_storage: Vec<(Vec<u8>, Vec<u8>)>,
+            staking_state: Vec<(Vec<u8>, Vec<u8>)>,
+        }
+
+        let mut data = SnapshotData::default();
+        {
+            let table = txn.open_table(crate::tables::ACCOUNTS)?;
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                data.accounts.push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_CODE)?;
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                data.contract_code.push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                let k_bytes = bincode::serialize(&k.value()).unwrap();
+                data.contract_storage.push((k_bytes, v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::STAKING_STATE)?;
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                data.staking_state.push((k.value().as_bytes().to_vec(), v.value().to_vec()));
+            }
+        }
+
+        let bytes = bincode::serialize(&data)?;
+        let mut file = File::create(path.as_ref()).map_err(|e| {
+            StateStoreError::NotFound(format!("snapshot file error: {e}"))
+        })?;
+        file.write_all(&bytes)
+            .map_err(|e| StateStoreError::NotFound(format!("snapshot write error: {e}")))?;
+        Ok(())
+    }
+
+    /// Restore a snapshot from a file. Requires a write transaction.
+    pub fn import_snapshot<P: AsRef<std::path::Path>>(
+        &self,
+        txn: &WriteTransaction,
+        path: P,
+    ) -> Result<(), StateStoreError> {
+        use std::fs;
+
+        #[derive(Serialize, Deserialize, Debug, Default)]
+        struct SnapshotData {
+            accounts: Vec<(Vec<u8>, Vec<u8>)>,
+            contract_code: Vec<(Vec<u8>, Vec<u8>)>,
+            contract_storage: Vec<(Vec<u8>, Vec<u8>)>,
+            staking_state: Vec<(Vec<u8>, Vec<u8>)>,
+        }
+
+        let bytes = fs::read(path.as_ref()).map_err(|e| {
+            StateStoreError::NotFound(format!("snapshot read error: {e}"))
+        })?;
+        let data: SnapshotData = bincode::deserialize(&bytes)?;
+
+        {
+            let table = txn.open_table(crate::tables::ACCOUNTS)?;
+            let keys: Vec<[u8; 32]> = table.iter()?.filter_map(|e| e.ok()).map(|(k,_)| k.value()).collect();
+            drop(table);
+            let mut table = txn.open_table(crate::tables::ACCOUNTS)?;
+            for k in keys { table.remove(k)?; }
+            for (k, v) in data.accounts {
+                let k32: [u8; 32] = k.try_into().unwrap_or([0; 32]);
+                table.insert(k32, v)?;
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_CODE)?;
+            let keys: Vec<[u8; 32]> = table.iter()?.filter_map(|e| e.ok()).map(|(k,_)| k.value()).collect();
+            drop(table);
+            let mut table = txn.open_table(crate::tables::CONTRACT_CODE)?;
+            for k in keys { table.remove(k)?; }
+            for (k, v) in data.contract_code {
+                let k32: [u8; 32] = k.try_into().unwrap_or([0; 32]);
+                table.insert(k32, v)?;
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
+            let keys: Vec<([u8; 32], [u8; 32])> = table.iter()?.filter_map(|e| e.ok()).map(|(k,_)| {
+                let b = k.value();
+                bincode::deserialize(&b[..]).unwrap_or_default()
+            }).collect();
+            drop(table);
+            let mut table = txn.open_table(crate::tables::CONTRACT_STORAGE)?;
+            for k in keys { table.remove(k)?; }
+            for (k, v) in data.contract_storage {
+                let k_tuple: ([u8; 32], [u8; 32]) = bincode::deserialize(&k)?;
+                table.insert(k_tuple, v)?;
+            }
+        }
+        {
+            let table = txn.open_table(crate::tables::STAKING_STATE)?;
+            let keys: Vec<String> = table.iter()?.filter_map(|e| e.ok()).map(|(k,_)| k.value().to_string()).collect();
+            drop(table);
+            let mut table = txn.open_table(crate::tables::STAKING_STATE)?;
+            for k in keys { table.remove(k.as_str())?; }
+            for (k, v) in data.staking_state {
+                table.insert("staking", v)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+
+/// Compute binary Merkle root from sorted leaf hashes.
+fn merkle_root(mut leaves: Vec<[u8; 32]>) -> [u8; 32] {
+    if leaves.is_empty() {
+        return [0u8; 32];
+    }
+    while leaves.len() > 1 {
+        if leaves.len() % 2 == 1 {
+            leaves.push(leaves[leaves.len() - 1]);
+        }
+        let mut next_level = Vec::with_capacity(leaves.len() / 2);
+        for pair in leaves.chunks(2) {
+            let mut combined = pair[0].to_vec();
+            combined.extend_from_slice(&pair[1]);
+            let hash = kvnc_types::hash::Hash::new(&combined);
+            next_level.push(hash.0);
+        }
+        leaves = next_level;
+    }
+    leaves[0]
 }
