@@ -42,7 +42,7 @@ use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
 use kvnc_rpc::{EventBus, RpcServer, RpcState};
-use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE, MAX_ACTIVE_VALIDATORS};
+use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE, MAX_ACTIVE_VALIDATORS, FOUNDER_PREMINE, ONE_KVNC};
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
@@ -53,11 +53,37 @@ use kvnc_types::{
 #[derive(Parser, Debug)]
 #[command(name = "kvnc-node")]
 #[command(about = "Kovanica (KVNC) full node", long_about = None)]
+#[command(subcommand_required = false, arg_required_else_help = false)]
 struct Args {
-    /// Path to config file
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Path to config file (used when running node)
     #[arg(short, long, default_value = "config.toml")]
     config: String,
 }
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Genesis ceremony: build genesis block + staking state from validator keys
+    Genesis(GenesisArgs),
+}
+
+#[derive(Args, Debug)]
+struct GenesisArgs {
+    /// Path to validators JSON file (array: {address, public_key?, stake?})
+    #[arg(long, value_name = "FILE", default_value = "validators.json")]
+    validators: String,
+
+    /// Treasury address (32-byte hex)
+    #[arg(long, value_name = "HEX")]
+    treasury_address: String,
+
+    /// Output genesis JSON file
+    #[arg(long, value_name = "FILE", default_value = "genesis.json")]
+    output: String,
+}
+
 
 /// Outbound network commands handled by the network task.
 enum NetworkCommand {
@@ -76,10 +102,94 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let args = Args::parse();
-    let config = NodeConfig::load(&args.config)?;
-    info!(data_dir = %config.data_dir.display(), "starting KVNC node");
+    match args.command {
+        Some(Commands::Genesis(g)) => {
+            return run_genesis(g);
+        }
+        None => {
+            let config = NodeConfig::load(&args.config)?;
+            info!(data_dir = %config.data_dir.display(), "starting KVNC node");
+            run_node(config, shutdown_signal()).await
+        }
+    }
+}
 
-    run_node(config, shutdown_signal()).await
+/// Run the genesis ceremony: read validators.json, build staking state
+/// and write genesis.json (genesis block + staking state).
+fn run_genesis(args: GenesisArgs) -> Result<()> {
+    use std::fs;
+
+    // Read validators JSON
+    let text = fs::read_to_string(&args.validators)
+        .with_context(|| format!("reading validators {}", args.validators))?;
+    let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", args.validators))?;
+
+    // Build treasury
+    let treasury = parse_address_hex(Some(&args.treasury_address))?;
+    let mut staking = StakingState::new();
+    staking.init_treasury(treasury);
+
+    // Join each validator
+    for v in validators_input {
+        let address = parse_address_hex(Some(&v.address))?;
+        let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
+        let stake = v.stake.unwrap_or(MIN_VALIDATOR_STAKE);
+        staking.join_validator(address, stake, 0, Some(address), pk)
+            .with_context(|| format!("joining validator {}", v.address))?;
+    }
+
+    info!(validators = staking.validators.len(), treasury = %treasury, "genesis allocations computed");
+
+    // Build genesis StatementBlock
+    let digest = StatementBlock::compute_digest(0, 0, &[], &[]);
+    let genesis_block = StatementBlock {
+        author: 0,
+        round: 0,
+        parents: Vec::new(),
+        transactions: Vec::new(),
+        statements: Vec::new(),
+        signature: Signature([0u8; 64]),
+        digest,
+    };
+
+    // Serialize output JSON
+    let output = serde_json::json!({
+        "genesis_block": {
+            "author": genesis_block.author,
+            "round": genesis_block.round,
+            "digest_hex": hex::encode(genesis_block.digest.0),
+            "signature_hex": hex::encode(genesis_block.signature.0),
+            "transactions": genesis_block.transactions,
+            "statements": genesis_block.statements,
+            "parents": genesis_block.parents,
+        },
+        "staking_state": staking,
+        "allocations": {
+            "treasury_address_hex": args.treasury_address,
+            "treasury_address_bytes": hex::encode(treasury.0),
+            "validators": staking.validators.iter().map(|v| serde_json::json!({
+                "address_hex": hex::encode(v.address.0),
+                "stake": v.stake,
+                "public_key_hex": v.public_key.as_ref().map(|pk| hex::encode(pk.0)),
+            })).collect::<Vec<_>>(),
+            "founder_premine_atoms": FOUNDER_PREMINE,
+            "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
+        },
+    });
+
+    fs::write(&args.output, serde_json::to_string_pretty(&output)?)
+        .with_context(|| format!("writing genesis {}", args.output))?;
+    info!(file = %args.output, validators = staking.validators.len(), "genesis file written");
+    Ok(())
+}
+
+/// Validator entry read from validators.json
+#[derive(Debug, Deserialize)]
+struct GenesisValidatorInput {
+    address: String,
+    public_key: Option<String>,
+    stake: Option<u64>,
 }
 
 /// Install the tracing subscriber, honouring `RUST_LOG` when set.

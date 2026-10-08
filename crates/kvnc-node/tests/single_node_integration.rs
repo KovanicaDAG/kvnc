@@ -25,7 +25,7 @@ use kvnc_execution::ExecutionContext;
 use kvnc_staking::MIN_VALIDATOR_STAKE;
 use kvnc_storage::Storage;
 use kvnc_types::block::StatementBlock;
-use kvnc_types::{Address, CommittedSubDag};
+use kvnc_types::{Address, CommittedSubDag, PublicKey};
 use std::sync::Arc;
 
 /// Fast, deterministic config: rounds only matter for the async loop, which the
@@ -96,7 +96,7 @@ fn execute_and_credit(subdag: &CommittedSubDag) -> (u64, Address) {
     for i in 0..4u8 {
         let payout = Address([100 + i; 32]);
         ctx.staking
-            .join_validator(Address([i + 1; 32]), MIN_VALIDATOR_STAKE, 0, Some(payout))
+            .join_validator(Address([i + 1; 32]), MIN_VALIDATOR_STAKE, 0, Some(payout), Some(PublicKey([i + 1; 32])))
             .expect("genesis validator");
         payouts.push(payout);
     }
