@@ -262,6 +262,26 @@ pub struct Delegation {
     pub amount: Stake,
 }
 
+/// Fixed slash percentage (basis points); 500 bps = 5%.
+pub const SLASH_PCT_BPS: u16 = 500;
+
+/// Unbonding queue entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnbondingEntry {
+    pub delegator: Address,
+    pub validator: Address,
+    pub amount: Stake,
+    /// Committed-leader height at which the unbond becomes withdrawable.
+    pub release_height: u64,
+}
+
+/// Double-sign evidence (skeleton — fixed % slash applied).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DoubleSignEvidence {
+    pub validator: Address,
+    pub height: u64,
+}
+
 #[derive(Error, Debug)]
 pub enum StakingError {
     #[error("Insufficient stake")]
@@ -272,6 +292,12 @@ pub enum StakingError {
     NotValidator,
     #[error("Still unbonding")]
     StillUnbonding,
+    #[error("No delegation found")]
+    NoDelegation,
+    #[error("Unbonding not complete")]
+    UnbondNotComplete,
+    #[error("Evidence already processed")]
+    EvidenceProcessed,
     #[error("Treasury has insufficient available balance")]
     TreasuryInsufficient,
 }
@@ -286,13 +312,23 @@ pub struct StakingState {
     pub committed_leader_height: u64,
     /// Total mining rewards issued so far.
     pub total_mining_issued: u64,
+    /// Unbonding queue: delegations being withdrawn.
+    pub unbonding_queue: Vec<UnbondingEntry>,
     /// Treasury vesting state (None until genesis configures it).
     pub treasury: Option<TreasuryState>,
 }
 
 impl StakingState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            validators: Vec::new(),
+            delegations: Vec::new(),
+            total_staked: 0,
+            committed_leader_height: 0,
+            total_mining_issued: 0,
+            unbonding_queue: Vec::new(),
+            treasury: None,
+        }
     }
 
     /// Configure treasury at genesis.
@@ -396,6 +432,142 @@ impl StakingState {
     pub fn treasury_address(&self) -> Option<Address> {
         self.treasury.as_ref().map(|t| t.treasury_address)
     }
+
+    // ============================================================
+    // Delegation + unbonding (Phase 8.2)
+    // ============================================================
+
+    /// Delegate `amount` from `delegator` to `validator`.
+    pub fn delegate(
+        &mut self,
+        delegator: Address,
+        validator: Address,
+        amount: Stake,
+    ) -> Result<(), StakingError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let v_idx = self
+            .validators
+            .iter()
+            .position(|v| v.address == validator && v.active)
+            .ok_or(StakingError::NotValidator)?;
+        self.validators[v_idx].stake = self.validators[v_idx].stake.saturating_add(amount);
+        self.delegations.push(Delegation {
+            delegator,
+            validator,
+            amount,
+        });
+        self.total_staked = self.total_staked.saturating_add(amount);
+        Ok(())
+    }
+
+    /// Start unbonding `amount` for `delegator` from `validator`.
+    pub fn unbond(
+        &mut self,
+        delegator: Address,
+        validator: Address,
+        amount: Stake,
+    ) -> Result<(), StakingError> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let mut remaining = amount;
+        let mut updates: Vec<(usize, u64, bool)> = Vec::new(); // (idx, take, full_consumed)
+        for (i, d) in self.delegations.iter().enumerate() {
+            if d.delegator == delegator && d.validator == validator && remaining > 0 {
+                let take = remaining.min(d.amount);
+                remaining -= take;
+                updates.push((i, take, take == d.amount));
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        // Apply validator stake reduction and delegation adjustments.
+        for (idx, take, full) in &updates {
+            if let Some(v_idx) = self.validators.iter().position(|v| v.address == validator) {
+                self.validators[v_idx].stake = self.validators[v_idx].stake.saturating_sub(*take);
+            }
+            self.total_staked = self.total_staked.saturating_sub(*take);
+            if !full {
+                self.delegations[*idx].amount -= *take;
+            }
+        }
+        if remaining > 0 {
+            // Undo validator stake changes (simplified skeleton: assume match)
+            for (idx, take, full) in &updates {
+                if let Some(v_idx) = self.validators.iter().position(|v| v.address == validator) {
+                    self.validators[v_idx].stake = self.validators[v_idx].stake.saturating_add(*take);
+                }
+                self.total_staked = self.total_staked.saturating_add(*take);
+                if !full {
+                    self.delegations[*idx].amount += *take;
+                }
+            }
+            return Err(StakingError::NoDelegation);
+        }
+        // Remove fully consumed delegations (highest index first).
+        let to_remove: Vec<usize> = updates.iter().filter(|(_, _, f)| *f).map(|(i, _, _)| *i).collect();
+        let mut sorted = to_remove;
+        sorted.sort_by(|a, b| b.cmp(a));
+        sorted.dedup();
+        for idx in sorted {
+            self.delegations.remove(idx);
+        }
+        let release_height = self.committed_leader_height.saturating_add(UNBONDING_ROUNDS);
+        self.unbonding_queue.push(UnbondingEntry {
+            delegator,
+            validator,
+            amount,
+            release_height,
+        });
+        Ok(())
+    }
+
+    /// Withdraw from unbonding queue once `release_height` passed.
+    pub fn withdraw_unbonded(&mut self, delegator: Address, validator: Address) -> Result<u64, StakingError> {
+        let current = self.committed_leader_height;
+        let mut withdrawn = 0u64;
+        let mut to_remove = Vec::new();
+        for (i, entry) in self.unbonding_queue.iter().enumerate() {
+            if entry.delegator == delegator && entry.validator == validator && entry.release_height <= current {
+                withdrawn = withdrawn.saturating_add(entry.amount);
+                to_remove.push(i);
+            }
+        }
+        if withdrawn == 0 {
+            return Err(StakingError::UnbondNotComplete);
+        }
+        to_remove.sort_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            self.unbonding_queue.remove(idx);
+        }
+        Ok(withdrawn)
+    }
+
+    /// Process double-sign evidence: apply fixed % slash to validator stake and delegations.
+    pub fn slash(&mut self, evidence: DoubleSignEvidence) -> Result<u64, StakingError> {
+        let v_idx = self
+            .validators
+            .iter()
+            .position(|v| v.address == evidence.validator)
+            .ok_or(StakingError::NotValidator)?;
+        let original = self.validators[v_idx].stake;
+        let slash_amount = original.saturating_mul(SLASH_PCT_BPS as u64).saturating_div(10_000);
+        self.validators[v_idx].stake = original.saturating_sub(slash_amount);
+        let mut total_slash_delegations = 0u64;
+        for d in self.delegations.iter_mut() {
+            if d.validator == evidence.validator && d.amount > 0 {
+                let d_slash = d.amount.saturating_mul(SLASH_PCT_BPS as u64).saturating_div(10_000);
+                d.amount = d.amount.saturating_sub(d_slash);
+                total_slash_delegations = total_slash_delegations.saturating_add(d_slash);
+            }
+        }
+        self.total_staked = self.total_staked.saturating_sub(slash_amount).saturating_sub(total_slash_delegations);
+        Ok(slash_amount.saturating_add(total_slash_delegations))
+    }
+
 }
 
 #[cfg(test)]
@@ -689,6 +861,41 @@ mod tests {
             state.on_leader_committed(9),
             Err(StakingError::NotValidator)
         ));
+    }
+
+    #[test]
+    fn delegate_unbond_wait_withdraw_and_slash_reduces_stake() {
+        let mut state = StakingState::new();
+        let validator = Address([1u8; 32]);
+        let delegator = Address([2u8; 32]);
+        state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        let delegate_amount = 10_000 * ONE_KVNC;
+        state.delegate(delegator, validator, delegate_amount).unwrap();
+        assert_eq!(state.delegations.len(), 1);
+
+        state.unbond(delegator, validator, delegate_amount).unwrap();
+        assert_eq!(state.delegations.len(), 0);
+        assert_eq!(state.unbonding_queue.len(), 1);
+
+        assert!(matches!(
+            state.withdraw_unbonded(delegator, validator),
+            Err(StakingError::UnbondNotComplete)
+        ));
+
+        let entry = state.unbonding_queue[0].clone();
+        state.committed_leader_height = entry.release_height;
+        let withdrawn = state.withdraw_unbonded(delegator, validator).unwrap();
+        assert_eq!(withdrawn, delegate_amount);
+        assert!(state.unbonding_queue.is_empty());
+
+        // Slash reduces validator stake (fixed %) — fresh state for isolation
+        let mut slash_state = StakingState::new();
+        slash_state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        slash_state.delegate(delegator, validator, delegate_amount).unwrap();
+        let evidence = DoubleSignEvidence { validator, height: 1 };
+        let slashed = slash_state.slash(evidence).unwrap();
+        assert!(slashed > 0);
+        assert!(slash_state.total_staked < MIN_VALIDATOR_STAKE.saturating_add(delegate_amount));
     }
 
     #[test]
