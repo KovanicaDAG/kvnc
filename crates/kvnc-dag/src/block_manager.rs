@@ -116,20 +116,34 @@ impl BlockManager {
         txs
     }
 
-    /// Propose a new block for the given round.
+    /// Propose a new block for the given round (pulls from tx_pool).
     pub fn propose_block(&self, round: Round) -> Result<StatementBlock, BlockManagerError> {
-        self.propose_block_with_txs(round, Vec::new())
+        let txs = self.get_next_transactions();
+        self.propose_block_with_txs(round, txs)
     }
 
     /// Propose a new block for the given round with specific transactions.
-    pub fn propose_block_with_txs(&self, round: Round, transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
-        // Wire mempool feed into block proposal (audit 3.1): feed pending txs via add_transaction
-        for tx in &transactions { self.add_transaction(tx.clone()); }
+    /// Pulls from the internal tx_pool (-fed by add_transaction) and merges
+    /// with any explicitly provided transactions. Sorted deterministically.
+    pub fn propose_block_with_txs(
+        &self,
+        round: Round,
+        transactions: Vec<Transaction>,
+    ) -> Result<StatementBlock, BlockManagerError> {
+        // Pull from mempool feed (audit 3.2 close)
+        let mut txs = self.get_next_transactions();
+        txs.extend(transactions);
+        // Deterministic order + dedup for audit-safe consensus
+        txs.sort_by(|a, b| a.hash.0.cmp(&b.hash.0));
+        txs.dedup_by(|a, b| a.hash == b.hash);
+        if txs.len() > MAX_TXS_PER_BLOCK {
+            txs.truncate(MAX_TXS_PER_BLOCK);
+        }
         // Get parent blocks from previous round with stake/validity filtering
         let parents = self.select_parents(round)?;
 
         // Create the block (without signature first)
-        let block = self.create_block(round, parents, transactions)?;
+        let block = self.create_block(round, parents, txs)?;
 
         // Sign the block
         let signed_block = self.sign_block(block)?;
@@ -603,11 +617,7 @@ mod tests {
         let (key2, pk2) = crypto::generate_keypair();
 
         // Set up committee with 3 authorities, but authority 2 has zero stake
-        manager.set_authority_keys(HashMap::from([
-            (0, pk0),
-            (1, pk1),
-            (2, pk2),
-        ]));
+        manager.set_authority_keys(HashMap::from([(0, pk0), (1, pk1), (2, pk2)]));
         manager.set_authority_stakes(HashMap::from([
             (0, 100),
             (1, 200),
@@ -640,7 +650,10 @@ mod tests {
             parents: parents.clone(),
             transactions: Vec::new(),
             statements: Vec::new(),
-            signature: crypto::sign(&key0, StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref()),
+            signature: crypto::sign(
+                &key0,
+                StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref(),
+            ),
             digest: StatementBlock::compute_digest(0, 1, &parents, &[]),
         };
         let block1 = StatementBlock {
@@ -649,7 +662,10 @@ mod tests {
             parents: parents.clone(),
             transactions: Vec::new(),
             statements: Vec::new(),
-            signature: crypto::sign(&key1, StatementBlock::compute_digest(1, 1, &parents, &[]).as_ref()),
+            signature: crypto::sign(
+                &key1,
+                StatementBlock::compute_digest(1, 1, &parents, &[]).as_ref(),
+            ),
             digest: StatementBlock::compute_digest(1, 1, &parents, &[]),
         };
         let block2 = StatementBlock {
@@ -658,7 +674,10 @@ mod tests {
             parents: parents.clone(),
             transactions: Vec::new(),
             statements: Vec::new(),
-            signature: crypto::sign(&key2, StatementBlock::compute_digest(2, 1, &parents, &[]).as_ref()),
+            signature: crypto::sign(
+                &key2,
+                StatementBlock::compute_digest(2, 1, &parents, &[]).as_ref(),
+            ),
             digest: StatementBlock::compute_digest(2, 1, &parents, &[]),
         };
         store.put_block(&block0).unwrap();
@@ -668,7 +687,8 @@ mod tests {
         // Select parents for round 2 - should only include authorities 0 and 1 (stake > 0)
         let parents_round2 = manager.select_parents(2).unwrap();
         assert_eq!(parents_round2.len(), 2);
-        let authors: std::collections::HashSet<_> = parents_round2.iter().map(|p| p.author).collect();
+        let authors: std::collections::HashSet<_> =
+            parents_round2.iter().map(|p| p.author).collect();
         assert!(authors.contains(&0));
         assert!(authors.contains(&1));
         assert!(!authors.contains(&2));
@@ -716,7 +736,10 @@ mod tests {
                 parents: parents.clone(),
                 transactions: Vec::new(),
                 statements: Vec::new(),
-                signature: crypto::sign(key, StatementBlock::compute_digest(author, 1, &parents, &[]).as_ref()),
+                signature: crypto::sign(
+                    key,
+                    StatementBlock::compute_digest(author, 1, &parents, &[]).as_ref(),
+                ),
                 digest: StatementBlock::compute_digest(author, 1, &parents, &[]),
             };
             store.put_block(&block).unwrap();
@@ -765,7 +788,10 @@ mod tests {
             parents: parents.clone(),
             transactions: Vec::new(),
             statements: Vec::new(),
-            signature: crypto::sign(&key0, StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref()),
+            signature: crypto::sign(
+                &key0,
+                StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref(),
+            ),
             digest: StatementBlock::compute_digest(0, 1, &parents, &[]),
         };
         store.put_block(&block0).unwrap();
@@ -778,7 +804,10 @@ mod tests {
             parents: parents.clone(),
             transactions: Vec::new(),
             statements: Vec::new(),
-            signature: crypto::sign(&key99, StatementBlock::compute_digest(99, 1, &parents, &[]).as_ref()),
+            signature: crypto::sign(
+                &key99,
+                StatementBlock::compute_digest(99, 1, &parents, &[]).as_ref(),
+            ),
             digest: StatementBlock::compute_digest(99, 1, &parents, &[]),
         };
         store.put_block(&block99).unwrap();
@@ -787,5 +816,52 @@ mod tests {
         let parents_round2 = manager.select_parents(2).unwrap();
         assert_eq!(parents_round2.len(), 1);
         assert_eq!(parents_round2[0].author, 0);
+    }
+
+    #[test]
+    fn add_transaction_feeds_propose_block() {
+        use kvnc_types::transaction::TransactionKind;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (key, public_key) = crypto::generate_keypair();
+        manager.set_authority(0);
+        manager.set_authority_keys(HashMap::from([(0, public_key)]));
+        manager.set_authority_stakes(HashMap::from([(0, 100)]));
+        manager.set_signing_key(key);
+
+        // Store genesis so select_parents works for round 1
+        let genesis = StatementBlock {
+            author: 0,
+            round: 0,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+        };
+        store.put_block(&genesis).unwrap();
+
+        // Build a dummy transaction (hash not required to match for proposal; block creation doesn't validate)
+        let tx_hash = Hash::new(b"feed-test");
+        let tx = Transaction {
+            sender: kvnc_types::address::Address([0; 32]),
+            nonce: 1,
+            kind: TransactionKind::Transfer {
+                to: kvnc_types::address::Address([1; 32]),
+                amount: 1,
+            },
+            fee: 1,
+            signature: Signature([0; 64]),
+            hash: tx_hash,
+        };
+
+        manager.add_transaction(tx.clone());
+        assert_eq!(manager.pending_count(), 1);
+
+        let block = manager.propose_block(1).expect("propose with fed tx");
+        assert_eq!(block.transactions.len(), 1);
+        assert_eq!(block.transactions[0].hash, tx_hash);
     }
 }
