@@ -40,7 +40,7 @@ use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
-use kvnc_rpc::{RpcServer, RpcState};
+use kvnc_rpc::{EventBus, RpcServer, RpcState};
 use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
@@ -188,12 +188,16 @@ where
     // consensus queries therefore observe the state database; wiring them to the
     // DAG database requires exposing `DagStore`'s inner `Arc<Storage>`.
     let rpc_socket = config.rpc_socket_addr()?;
+    // Fan-out bus for WebSocket subscription events (newHeads,
+    // newCommittedLeader, pendingTransactions).
+    let events = EventBus::new();
     let rpc_state = RpcState {
         storage: state_storage.clone(),
         mempool: mempool.clone(),
         staking: Arc::new(tokio::sync::RwLock::new(staking_state)),
         committee: committee.clone(),
         peer_count,
+        events: events.clone(),
     };
     let rpc_server = RpcServer::new(rpc_socket, rpc_state).await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
@@ -266,6 +270,7 @@ where
         mempool.clone(),
         engine.clone(),
         network_cmd_tx.clone(),
+        events.clone(),
         shutdown_rx.clone(),
     ));
     let builder_task = tokio::spawn(run_block_builder(
@@ -274,11 +279,13 @@ where
         mempool.clone(),
         network_cmd_tx.clone(),
         signing_key,
+        events.clone(),
         shutdown_rx.clone(),
     ));
     let exec_task = tokio::spawn(run_execution(
         exec_rx,
         state_storage.clone(),
+        events.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -422,20 +429,22 @@ async fn run_network(
 
 /// Ingest events emitted by the network layer into the DAG store and mempool.
 async fn run_event_handler(
-    mut events: mpsc::UnboundedReceiver<NetworkEvent>,
+    mut network_events: mpsc::UnboundedReceiver<NetworkEvent>,
     mempool: Arc<Mempool>,
     engine: Arc<ConsensusEngine<NodeDagStore, NodeBlockManager>>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
+    events: EventBus,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
-            maybe = events.recv() => match maybe {
+            maybe = network_events.recv() => match maybe {
                 Some(event) => handle_network_event(
                     event,
                     &mempool,
                     &engine,
                     &network_cmd_tx,
+                    &events,
                 ),
                 None => break,
             },
@@ -454,16 +463,21 @@ fn handle_network_event(
     mempool: &Mempool,
     engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
     network_cmd_tx: &mpsc::UnboundedSender<NetworkCommand>,
+    events: &EventBus,
 ) {
     match event {
         NetworkEvent::BlockReceived(block) => match engine.process_block(&block) {
-            Ok(()) => debug!(digest = %block.digest, "validated received block into consensus"),
+            Ok(()) => {
+                debug!(digest = %block.digest, "validated received block into consensus");
+                events.publish_new_head(&block);
+            }
             Err(e) => {
                 warn!(digest = %block.digest, error = %e, "rejected received consensus block")
             }
         },
         NetworkEvent::TransactionReceived(tx) => match mempool.add_transaction(tx.clone()) {
             Ok(()) => {
+                events.publish_pending_transaction(&tx);
                 // Re-gossip locally-accepted transactions.
                 let _ = network_cmd_tx.send(NetworkCommand::BroadcastTransaction(tx));
             }
@@ -501,6 +515,7 @@ async fn run_block_builder(
     mempool: Arc<Mempool>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
     signing_key: SigningKey,
+    events: EventBus,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let author: AuthorityIndex = 0;
@@ -534,6 +549,7 @@ async fn run_block_builder(
                 match dag_store.put_block(&block) {
                     Ok(()) => {
                         info!(round, digest = %block.digest, "produced block");
+                        events.publish_new_head(&block);
                         let _ = network_cmd_tx.send(NetworkCommand::BroadcastBlock(block));
                     }
                     Err(e) => warn!(error = %e, "failed to store produced block"),
@@ -553,6 +569,7 @@ async fn run_block_builder(
 async fn run_execution(
     mut subdags: mpsc::UnboundedReceiver<kvnc_consensus::CommittedSubDag>,
     state_storage: Arc<Storage>,
+    events: EventBus,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ctx = ExecutionContext::new();
@@ -568,11 +585,14 @@ async fn run_execution(
         tokio::select! {
             maybe = subdags.recv() => match maybe {
                 Some(subdag) => match ctx.execute_committed_subdag(&subdag, &state_storage) {
-                    Ok(result) => info!(
-                        round = subdag.leader_round,
-                        txs = result.txs_applied,
-                        "executed committed sub-DAG"
-                    ),
+                    Ok(result) => {
+                        info!(
+                            round = subdag.leader_round,
+                            txs = result.txs_applied,
+                            "executed committed sub-DAG"
+                        );
+                        events.publish_committed_leader(&subdag);
+                    }
                     Err(e) => {
                         error!(
                             error = %e,
@@ -667,6 +687,18 @@ impl DagStoreTrait for NodeDagStore {
 
     fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, DagStoreError> {
         self.inner.get_decided_rounds(max_round)
+    }
+
+    fn prune_non_blue(
+        &self,
+        blue_hashes: &[Hash],
+        committed_wave: u64,
+    ) -> Result<u64, DagStoreError> {
+        self.inner.prune_non_blue(blue_hashes, committed_wave)
+    }
+
+    fn prune_waves_before(&self, wave: u64, prune_window_waves: u64) -> Result<u64, DagStoreError> {
+        self.inner.prune_waves_before(wave, prune_window_waves)
     }
 }
 
@@ -1161,7 +1193,12 @@ mod tests {
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         engine.set_commit_sender(exec_tx);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let execution = tokio::spawn(run_execution(exec_rx, state_storage.clone(), shutdown_rx));
+        let execution = tokio::spawn(run_execution(
+            exec_rx,
+            state_storage.clone(),
+            EventBus::new(),
+            shutdown_rx,
+        ));
 
         let leader_round = 3;
         let digest = StatementBlock::compute_digest(0, leader_round, &[], &[]);
@@ -1246,7 +1283,7 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        run_execution(exec_rx, state_storage.clone(), shutdown_rx).await;
+        run_execution(exec_rx, state_storage.clone(), EventBus::new(), shutdown_rx).await;
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();

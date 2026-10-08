@@ -181,7 +181,7 @@ pub trait BincodeSerialize: Serialize + for<'de> Deserialize<'de> {
 impl<T: Serialize + for<'de> Deserialize<'de>> BincodeSerialize for T {}
 
 /// Serialize a Hash to bytes for table keys.
-fn hash_to_bytes(hash: &Hash) -> [u8; 32] {
+pub fn hash_to_bytes(hash: &Hash) -> [u8; 32] {
     hash.0
 }
 

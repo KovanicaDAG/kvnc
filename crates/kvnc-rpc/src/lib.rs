@@ -11,7 +11,10 @@ use std::sync::{
 };
 
 use axum::{
-    extract::{Extension, Json},
+    extract::{
+        ws::WebSocketUpgrade,
+        Extension, Json,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,8 +34,10 @@ use tracing::{info, warn};
 
 mod chain_methods;
 mod rpc_methods;
+mod subscriptions;
 pub use chain_methods::*;
 pub use rpc_methods::*;
+pub use subscriptions::{EventBus, SubscriptionKind};
 
 #[derive(Error, Debug)]
 pub enum RpcError {
@@ -104,6 +109,8 @@ pub struct RpcState {
     pub committee: CommitteeInfo,
     /// Shared distinct connected-peer count maintained by the network service.
     pub peer_count: Arc<AtomicUsize>,
+    /// Fan-out bus for WebSocket subscription events.
+    pub events: EventBus,
 }
 
 #[derive(Clone)]
@@ -238,9 +245,11 @@ impl RpcServer {
     pub async fn start(self) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
         let app = Router::new()
             .route("/rpc", post(rpc_handler))
+            .route("/ws", get(ws_handler))
             .route("/health", get(health_check))
             .layer(Extension(self.methods))
-            .layer(Extension(self.state.peer_count.clone()));
+            .layer(Extension(self.state.peer_count.clone()))
+            .layer(Extension(self.state.clone()));
 
         let listener = TcpListener::bind(self.addr).await?;
         let actual_addr = listener.local_addr()?;
@@ -259,6 +268,14 @@ impl RpcServer {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+}
+
+/// Upgrades an HTTP request to a WebSocket and drives the subscription loop.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Extension(state): Extension<RpcState>,
+) -> Response {
+    ws.on_upgrade(move |socket| subscriptions::serve_connection(socket, state))
 }
 
 async fn rpc_handler(

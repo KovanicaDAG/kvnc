@@ -162,7 +162,7 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
 }
 
 /// Serialise a transaction into JSON (without block context).
-fn transaction_to_json(tx: &Transaction) -> Value {
+pub(crate) fn transaction_to_json(tx: &Transaction) -> Value {
     json!({
         "hash": to_hex(&tx.hash.0),
         "sender": to_hex(&tx.sender.0),
@@ -174,7 +174,7 @@ fn transaction_to_json(tx: &Transaction) -> Value {
 }
 
 /// Serialise a block into JSON.
-fn block_to_json(block: &StatementBlock) -> Value {
+pub(crate) fn block_to_json(block: &StatementBlock) -> Value {
     json!({
         "hash": to_hex(&block.digest.0),
         "digest": to_hex(&block.digest.0),
@@ -261,10 +261,12 @@ pub async fn handle_send_raw_transaction(
         .map_err(|e| RpcError::InvalidParams(format!("raw transaction: invalid encoding: {e}")))?;
 
     let hash = tx.hash;
+    let event_tx = tx.clone();
     state
         .mempool
         .add_transaction(tx)
         .map_err(|e| RpcError::ExecutionError(e.to_string()))?;
+    state.events.publish_pending_transaction(&event_tx);
 
     Ok(json!(to_hex(&hash.0)))
 }
@@ -590,6 +592,7 @@ mod tests {
             staking: Arc::new(RwLock::new(StakingState::new())),
             committee: CommitteeInfo::try_new(0, vec![authority]).expect("test committee is valid"),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            events: crate::EventBus::new(),
         }
     }
 

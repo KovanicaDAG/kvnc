@@ -37,3 +37,17 @@ secrets
 # Other generated output
 dist
 **/dist
+
+# Not needed by the image build (keeps the build context small)
+zips
+kvnc-next-steps
+brand-assets
+docs
+*.JPG
+*.jpeg
+*.png
+README.md
+tasklist.md
+docker-compose.yml
+opencode.json
+config.example.toml

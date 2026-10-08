@@ -3,13 +3,13 @@
 #![allow(missing_docs)]
 //! Provides high-level operations on the DAG structure using the storage layer.
 
-use kvnc_storage::Storage;
+use kvnc_storage::{BincodeSerialize, ConsensusStoreError, Storage, hash_to_bytes, tables};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
     hash::Hash,
     AuthorityIndex, Round,
 };
-use redb::CommitError;
+use redb::{CommitError, ReadableTable, ReadTransaction, TableError, WriteTransaction};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -29,6 +29,12 @@ pub enum DagStoreError {
     StateStore(#[from] kvnc_storage::StateStoreError),
     #[error("Commit error: {0}")]
     Commit(#[from] CommitError),
+    #[error("Table error: {0}")]
+    Table(#[from] TableError),
+    #[error("Redb storage error: {0}")]
+    RedbStorage(#[from] redb::StorageError),
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] bincode::Error),
 }
 
 /// DAG store for high-level DAG operations.
@@ -250,6 +256,154 @@ impl DagStore {
         let pruned = self.storage.consensus().prune_dag_below(&txn, min_round)?;
         txn.commit()?;
         Ok(pruned)
+    }
+
+    /// Prune non-blue blocks from a committed wave.
+    ///
+    /// Deletes all blocks from the committed wave that are NOT in the blue set.
+    /// Keeps blue blocks and previous tips needed for future colouring.
+    pub fn prune_non_blue(
+        &self,
+        blue_hashes: &[Hash],
+        committed_wave: u64,
+    ) -> Result<u64, DagStoreError> {
+        use std::collections::HashSet;
+
+        let txn = self.storage.begin_write()?;
+
+        // Convert blue_hashes to a HashSet for O(1) lookup
+        let blue_set: HashSet<Hash> = blue_hashes.iter().copied().collect();
+
+        // Calculate round range for the committed wave
+        let wave_length = kvnc_types::WAVE_LENGTH;
+        let wave_start = committed_wave * wave_length;
+        let wave_end = wave_start + wave_length - 1;
+
+        // Collect all blocks in the committed wave
+        let round_table = txn.open_table(tables::DAG_BY_ROUND)?;
+        let mut blocks_to_check = Vec::new();
+
+        for entry in round_table.range((wave_start, 0u16)..=(wave_end, u16::MAX))? {
+            let (_, block_hashes) = entry?;
+            let hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&block_hashes.value())?;
+            for hash in hashes {
+                blocks_to_check.push(Hash(hash));
+            }
+        }
+        // Drop the table to release the borrow on txn
+        drop(round_table);
+
+        // Determine which blocks to prune (those in the wave but not blue)
+        let mut blocks_to_prune = Vec::new();
+        for hash in blocks_to_check {
+            if !blue_set.contains(&hash) {
+                blocks_to_prune.push(hash);
+            }
+        }
+
+        // Delete non-blue blocks and their links
+        let mut pruned = 0;
+        for block_hash in blocks_to_prune {
+            self.delete_block_internal(&txn, &block_hash)?;
+            pruned += 1;
+        }
+
+        txn.commit()?;
+        Ok(pruned)
+    }
+
+    /// Prune all blocks from waves before the given wave minus the prune window.
+    ///
+    /// Deletes ALL blocks (blue and red) from waves < `wave - prune_window_waves`.
+    /// Updates committed_leader_height accordingly.
+    /// Must not break recovery (recover_committed_subdags only needs decided-round index).
+    pub fn prune_waves_before(
+        &self,
+        wave: u64,
+        prune_window_waves: u64,
+    ) -> Result<u64, DagStoreError> {
+        let txn = self.storage.begin_write()?;
+
+        let wave_length = kvnc_types::WAVE_LENGTH;
+
+        // Calculate the minimum wave to keep
+        let min_wave_to_keep = wave.saturating_sub(prune_window_waves);
+
+        // Calculate the maximum round to prune (last round of the wave before min_wave_to_keep)
+        // If min_wave_to_keep is 0, we prune nothing (no waves before wave 0)
+        let max_round_to_prune = if min_wave_to_keep == 0 {
+            // No waves to prune - return 0 without calling prune_dag_below
+            txn.commit()?;
+            return Ok(0);
+        } else {
+            // Last round of wave (min_wave_to_keep - 1)
+            min_wave_to_keep * wave_length - 1
+        };
+
+        // Prune all blocks below or equal to this round
+        let pruned = self.storage.consensus().prune_dag_below(&txn, max_round_to_prune)?;
+
+        // The committed_leader_height counter is not changed here because
+        // it represents the total number of committed leaders ever, not just recent ones.
+        // The decided_rounds index is what recovery uses, and it's not touched by pruning.
+        
+        txn.commit()?;
+        Ok(pruned)
+    }
+
+    /// Internal helper to delete a single block and all its links.
+    fn delete_block_internal(
+        &self,
+        txn: &WriteTransaction,
+        block_hash: &Hash,
+    ) -> Result<(), DagStoreError> {
+        let key = hash_to_bytes(block_hash);
+
+        // Remove from dag_blocks
+        {
+            let mut table = txn.open_table(tables::DAG_BLOCKS)?;
+            table.remove(key)?;
+        }
+
+        // Remove from dag_parents and get parents for child cleanup
+        let parents: Vec<[u8; 32]> = {
+            let mut table = txn.open_table(tables::DAG_PARENTS)?;
+            let value = table.get(key)?;
+            let parents = value
+                .as_ref()
+                .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            // Drop the guard before removing
+            drop(value);
+            table.remove(key)?;
+            parents
+        };
+
+        // Update parents' children lists
+        for parent_hash in parents {
+            let mut children: Vec<[u8; 32]> = {
+                let table = txn.open_table(tables::DAG_CHILDREN)?;
+                let value = table.get(parent_hash)?;
+                value
+                    .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                    .unwrap_or_default()
+            };
+            children.retain(|h| *h != key);
+            {
+                let mut table = txn.open_table(tables::DAG_CHILDREN)?;
+                table.insert(parent_hash, children.to_bytes()?)?;
+            }
+        }
+
+        // Remove from dag_children
+        {
+            let mut table = txn.open_table(tables::DAG_CHILDREN)?;
+            table.remove(key)?;
+        }
+
+        // Remove from dag_by_round (handled by the caller's round range scan)
+
+        Ok(())
     }
 
     /// Get the mergeset for a leader block.

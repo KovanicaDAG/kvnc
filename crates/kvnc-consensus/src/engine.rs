@@ -93,6 +93,14 @@ pub trait DagStoreTrait: Send + Sync {
     fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     /// Get all decided rounds up to a maximum.
     fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, kvnc_dag::DagStoreError>;
+    /// Prune non-blue blocks from a committed wave.
+    fn prune_non_blue(
+        &self,
+        blue_hashes: &[Hash],
+        committed_wave: u64,
+    ) -> Result<u64, kvnc_dag::DagStoreError>;
+    /// Prune all blocks from waves before the given wave minus the prune window.
+    fn prune_waves_before(&self, wave: u64, prune_window_waves: u64) -> Result<u64, kvnc_dag::DagStoreError>;
 }
 
 /// Trait for block manager operations needed by consensus.
@@ -123,6 +131,9 @@ pub struct ConsensusConfig {
     /// Scaffold only: nothing consumes this yet, so the flag has no
     /// behavioural effect until the committer wiring lands.
     pub use_mysticghost: bool,
+    /// Number of waves to keep before pruning old waves.
+    /// Default: 100 waves.
+    pub prune_window_waves: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -132,6 +143,7 @@ impl Default for ConsensusConfig {
             lookahead_rounds: 3,
             max_pending_rounds: 100,
             use_mysticghost: false,
+            prune_window_waves: 100,
         }
     }
 }
@@ -192,7 +204,7 @@ where
         let our_authority = block_manager.read().our_authority();
         let our_stake = committee.stake_of(our_authority).unwrap_or(0);
 
-        let committer = UniversalCommitter::new(committee.clone(), config.use_mysticghost);
+        let committer = UniversalCommitter::new(committee.clone(), config.use_mysticghost, config.prune_window_waves);
         let linearizer = Linearizer::new();
 
         let mut leader_schedule = HashMap::new();
@@ -712,6 +724,24 @@ mod tests {
                 .filter(|(r, _)| *r <= max_round)
                 .map(|(r, _)| *r)
                 .collect())
+        }
+
+        fn prune_non_blue(
+            &self,
+            _blue_hashes: &[Hash],
+            _committed_wave: u64,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            // Test implementation: no-op
+            Ok(0)
+        }
+
+        fn prune_waves_before(
+            &self,
+            _wave: u64,
+            _prune_window_waves: u64,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            // Test implementation: no-op
+            Ok(0)
         }
     }
 
