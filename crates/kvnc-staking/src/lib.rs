@@ -546,6 +546,41 @@ impl StakingState {
         Ok(withdrawn)
     }
 
+    /// Reward sharing for delegated stake (commission-based, deterministic).
+    /// Splits `reward_amount` between validator (commission %) and delegators (pro-rata share).
+    /// Delegators processed in address-sorted order for determinism.
+    pub fn reward_share(
+        &self,
+        validator_address: Address,
+        reward_amount: u64,
+        commission_bps: u16,
+    ) -> Vec<(Address, u64)> {
+        let v_idx = self.validators.iter().position(|v| v.address == validator_address);
+        if v_idx.is_none() {
+            return Vec::new();
+        }
+        let mut shares: Vec<(Address, u64)> = Vec::new();
+        let validator_cut = reward_amount.saturating_mul(commission_bps as u64).saturating_div(10_000);
+        shares.push((validator_address, validator_cut));
+        let remaining = reward_amount.saturating_sub(validator_cut);
+        let mut delegator_shares: Vec<(Address, u64, Stake)> = self
+            .delegations
+            .iter()
+            .filter(|d| d.validator == validator_address && d.amount > 0)
+            .map(|d| (d.delegator, d.amount, d.amount))
+            .collect();
+        delegator_shares.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        let total_delegated: Stake = delegator_shares.iter().map(|(_, _, s)| s).sum();
+        if total_delegated > 0 {
+            for (addr, _, stake) in delegator_shares {
+                let share = remaining.saturating_mul(stake as u64).saturating_div(total_delegated as u64);
+                shares.push((addr, share));
+            }
+        }
+        shares.sort_by(|a, b| a.0.cmp(&b.0));
+        shares
+    }
+
     /// Process double-sign evidence: apply fixed % slash to validator stake and delegations.
     pub fn slash(&mut self, evidence: DoubleSignEvidence) -> Result<u64, StakingError> {
         let v_idx = self
