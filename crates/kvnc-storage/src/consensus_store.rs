@@ -353,18 +353,23 @@ impl ConsensusStore {
         txn: &WriteTransaction,
         min_round: Round,
     ) -> Result<u64, ConsensusStoreError> {
-        let table = txn.open_table(crate::tables::DAG_BY_ROUND)?;
         let mut pruned = 0;
 
-        // Collect blocks to prune
+        // Collect blocks to prune and round index keys to remove
         let mut blocks_to_prune = Vec::new();
-        for entry in table.range((0u64, 0u16)..=(min_round, u16::MAX))? {
-            let (_, block_hashes) = entry?;
-            let hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&block_hashes.value())?;
-            for hash in hashes {
-                blocks_to_prune.push(hash);
+        let mut round_keys_to_remove = Vec::new();
+
+        {
+            let table = txn.open_table(crate::tables::DAG_BY_ROUND)?;
+            for entry in table.range((0u64, 0u16)..=(min_round, u16::MAX))? {
+                let (key, block_hashes) = entry?;
+                let hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&block_hashes.value())?;
+                for hash in hashes {
+                    blocks_to_prune.push(hash);
+                }
+                round_keys_to_remove.push(key.value());
             }
-        }
+        } // table is dropped here
 
         // Delete blocks and their links
         for block_hash in blocks_to_prune {
@@ -399,12 +404,7 @@ impl ConsensusStore {
         // Clean up round index
         {
             let mut round_table = txn.open_table(crate::tables::DAG_BY_ROUND)?;
-            let mut keys_to_remove = Vec::new();
-            for entry in round_table.range((0u64, 0u16)..=(min_round, u16::MAX))? {
-                let (key, _) = entry?;
-                keys_to_remove.push(key.value());
-            }
-            for key in keys_to_remove {
+            for key in round_keys_to_remove {
                 round_table.remove(key)?;
             }
         }

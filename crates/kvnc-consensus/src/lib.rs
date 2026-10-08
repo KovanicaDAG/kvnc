@@ -16,6 +16,7 @@ pub mod committer_mysticghost;
 pub mod engine;
 pub mod ghostdag_scoped;
 pub mod linearizer;
+pub mod metrics;
 pub mod mysticghost;
 pub mod types;
 
@@ -23,6 +24,10 @@ pub use committer::{BaseCommitter, UniversalCommitter};
 pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState, BlockBroadcaster, VoteBroadcaster};
 pub use kvnc_types::Vote;
 pub use linearizer::Linearizer;
+pub use metrics::{
+    record_colouring_duration_ms, record_mergeset_size, record_pruned_blocks, record_pruned_waves,
+    registry, update_dag_blocks_in_memory,
+};
 pub use types::{
     AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo,
     LeaderStatus,

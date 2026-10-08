@@ -16,6 +16,8 @@ parking_lot = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 rand = { workspace = true }
+prometheus-client = { workspace = true }
+once_cell = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

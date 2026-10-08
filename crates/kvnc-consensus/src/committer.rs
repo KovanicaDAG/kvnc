@@ -6,11 +6,13 @@
 
 use crate::engine::DagStoreTrait;
 use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
+use crate::metrics::{record_pruned_blocks, record_pruned_waves};
 use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, CommittedSubDag, Round};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 /// Basic committer that tracks leader decisions.
@@ -129,6 +131,8 @@ pub struct UniversalCommitter {
     base: BaseCommitter,
     /// Whether to use MysticGhost (scoped GHOSTDAG) ordering for committed waves.
     use_mysticghost: bool,
+    /// Number of waves to keep before pruning old waves.
+    prune_window_waves: u64,
     /// Last decided round.
     last_decided_round: RwLock<Round>,
     /// Map of leader info by round.
@@ -141,10 +145,11 @@ pub struct UniversalCommitter {
 
 impl UniversalCommitter {
     /// Create a new universal committer.
-    pub fn new(committee: CommitteeInfo, use_mysticghost: bool) -> Self {
+    pub fn new(committee: CommitteeInfo, use_mysticghost: bool, prune_window_waves: u64) -> Self {
         Self {
             base: BaseCommitter::new(committee),
             use_mysticghost,
+            prune_window_waves,
             last_decided_round: RwLock::new(0),
             leaders: RwLock::new(HashMap::new()),
             decided_leaders: RwLock::new(HashMap::new()),
@@ -373,7 +378,80 @@ impl UniversalCommitter {
         // This existing same-wave bookkeeping is committed only after the
         // later leader's durable mark succeeded.
         self.decide_earlier_in_wave(dag_store, subdag.leader_round);
+
+        // Pruning after successful commit
+        let leader_wave = subdag.leader_round / kvnc_types::WAVE_LENGTH;
+
+        // Prune non-blue blocks from the committed wave (only for MysticGhost)
+        if self.use_mysticghost {
+            // We need to re-run colouring to get the blue set, or we could
+            // return it from build_committed_subdag_mysticghost.
+            // For now, we'll compute the mergeset and re-colour to get blue hashes.
+            // This is a bit redundant but keeps the logic clean.
+            let colouring_start = Instant::now();
+            if let Some(colouring) = self.get_colouring_for_pruning(dag_store, &subdag) {
+                let colouring_duration = colouring_start.elapsed().as_secs_f64() * 1000.0;
+                crate::metrics::record_colouring_duration_ms(colouring_duration, "success");
+                crate::metrics::record_mergeset_size(colouring.blue.len());
+
+                let blue_hashes: Vec<Hash> = colouring.blue.clone();
+                match dag_store.prune_non_blue(&blue_hashes, leader_wave) {
+                    Ok(pruned) => {
+                        info!("Pruned {} non-blue blocks from wave {}", pruned, leader_wave);
+                        record_pruned_blocks(pruned);
+                    }
+                    Err(e) => {
+                        warn!("Failed to prune non-blue blocks: {}", e);
+                    }
+                }
+            } else {
+                crate::metrics::record_colouring_duration_ms(0.0, "fallback");
+            }
+        }
+
+        // Prune old waves (both MysticGhost and linearizer paths)
+        match dag_store.prune_waves_before(leader_wave, self.prune_window_waves) {
+            Ok(pruned) => {
+                if pruned > 0 {
+                    info!("Pruned {} blocks from waves before {}", pruned, leader_wave);
+                    record_pruned_waves(1); // One wave pruning event
+                }
+            }
+            Err(e) => {
+                warn!("Failed to prune old waves: {}", e);
+            }
+        }
+
         Ok(Some(subdag))
+    }
+
+    /// Get the colouring result for pruning (re-runs colouring on the committed wave).
+    fn get_colouring_for_pruning<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+        subdag: &CommittedSubDag,
+    ) -> Option<crate::ghostdag_scoped::ColouringResult> {
+        // 1. Get mergeset hashes
+        let mergeset_hashes = dag_store.mergeset(&subdag.leader.digest).ok()?;
+
+        // 2. Get mergeset blocks
+        let mergeset_blocks = dag_store.get_blocks(&mergeset_hashes).ok()?;
+
+        // 3. Get previous tips (decided leaders' blocks)
+        let previous_tips = self.get_previous_tips(dag_store).ok()?;
+
+        // 4. Configure MysticGhost
+        let mg_config = crate::mysticghost::MysticGhostConfig {
+            enabled: true,
+            k: 3,
+            max_mergeset_blocks: 2_000,
+        };
+
+        // 5. Run MysticGhost ordering
+        match crate::mysticghost::order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
+            crate::mysticghost::MysticGhostOrder::Ghost { colouring } => Some(colouring),
+            crate::mysticghost::MysticGhostOrder::Fallback => None,
+        }
     }
 
     /// Build a committed sub-DAG from a leader and its causal history.
@@ -429,6 +507,9 @@ impl UniversalCommitter {
         // 2. Get mergeset blocks
         let mergeset_blocks = dag_store.get_blocks(&mergeset_hashes).ok()?;
 
+        // Record mergeset size metric
+        crate::metrics::record_mergeset_size(mergeset_blocks.len());
+
         // 3. Get previous tips (decided leaders' blocks)
         let previous_tips = self.get_previous_tips(dag_store).ok()?;
 
@@ -439,9 +520,14 @@ impl UniversalCommitter {
             max_mergeset_blocks: 2_000,
         };
 
-        // 5. Run MysticGhost ordering
-        match order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
+        // 5. Run MysticGhost ordering with timing
+        let colouring_start = std::time::Instant::now();
+        let result = order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips);
+        let colouring_duration = colouring_start.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
             MysticGhostOrder::Ghost { colouring } => {
+                crate::metrics::record_colouring_duration_ms(colouring_duration, "success");
                 // Use the blue-set order from GHOSTDAG
                 let blue_ordered = colouring.blue_ordered();
                 
@@ -471,6 +557,7 @@ impl UniversalCommitter {
                 })
             }
             MysticGhostOrder::Fallback => {
+                crate::metrics::record_colouring_duration_ms(colouring_duration, "fallback");
                 // Fall back to original linearizer
                 self.build_committed_subdag_linearizer(dag_store, leader_block)
             }

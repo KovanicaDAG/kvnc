@@ -321,6 +321,24 @@ impl DagStoreTrait for MockDag {
             .map(|(r, _)| *r)
             .collect())
     }
+
+    fn prune_non_blue(
+        &self,
+        _blue_hashes: &[Hash],
+        _committed_wave: u64,
+    ) -> Result<u64, DagStoreError> {
+        // Test implementation: no-op
+        Ok(0)
+    }
+
+    fn prune_waves_before(
+        &self,
+        _wave: u64,
+        _prune_window_waves: u64,
+    ) -> Result<u64, DagStoreError> {
+        // Test implementation: no-op
+        Ok(0)
+    }
 }
 
 /// In-memory block manager for `kvnc_consensus::ConsensusEngine` tests.

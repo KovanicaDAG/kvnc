@@ -15,6 +15,7 @@ fn fast_config() -> ConsensusConfig {
         lookahead_rounds: 3,
         max_pending_rounds: 100,
         use_mysticghost: false,
+        prune_window_waves: 100,
     }
 }
 

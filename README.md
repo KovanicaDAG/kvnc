@@ -181,29 +181,56 @@ The node will:
 4. Start JSON-RPC on `127.0.0.1:8545`
 5. Begin consensus participation
 
-### Docker (Build Only)
+### Docker
+
+Build the image:
 
 ```bash
-# Build the node image locally; this does not start a node.
 docker build -t kvnc-node:local .
 ```
 
+Run a local 4-node devnet with Compose:
+
+```bash
+docker compose up --build
+```
+
+Compose brings up four nodes (`node1`–`node4`), each with its own data volume and RPC
+port, wired together over the container network. Only `node1`'s RPC is published
+(loopback `127.0.0.1:8545`); node2–node4 listen on 8546–8548 internally. Full usage,
+port table, and how to add/remove a validator are in
+[`ops/docker/README.md`](ops/docker/README.md).
+
 The image's default command is `kvnc-node --help`; it will not start a node on a plain
 `docker run`. Starting a node requires explicitly supplying its intended configuration
-(a config file or deliberate `KVNC_*` overrides). The built-in defaults include a
-bootstrap peer and can initialize genesis state, so do not rely on defaults. For
-container access to JSON-RPC, configure `rpc_addr` / `KVNC_RPC_ADDR` to bind to an
-appropriate container interface (typically `0.0.0.0`); the default is loopback-only.
-The image includes a Docker health check against `/health`. That endpoint reports
-HTTP/RPC liveness with `status: "ok"` and the current distinct connected-peer count;
-`peer_count` is informational, and zero peers is healthy. This build-only setup does
-not provide Docker Compose or deployment configuration.
+(a config file or deliberate `KVNC_*` overrides). The built image is the only thing
+needed; runtime config is supplied via `KVNC_*` environment variables.
+
+No genesis file is required: the node writes genesis state into its data directory on
+first start. The entrypoint generates a persistent validator seed inside the data
+volume on first boot (nothing is committed to the repo). For container RPC access set
+`KVNC_RPC_ADDR=0.0.0.0`; the default is loopback-only. The image includes a health
+check against `/health`, which reports liveness plus the distinct connected-peer count
+(`peer_count` is informational; zero peers is healthy).
 
 ---
 
 ## JSON-RPC API Reference
 
-KVNC implements **JSON-RPC 2.0** over HTTP (WebSocket support planned). All endpoints are served at `/rpc`.
+KVNC implements **JSON-RPC 2.0** over HTTP (`POST /rpc`) and over WebSocket (`GET /ws`). A `GET /health` endpoint reports liveness.
+
+### WebSocket Subscriptions
+
+Connect to `ws://<host>:<port>/ws` and use `subscribe`/`unsubscribe`:
+
+| Subscription | Emitted when |
+|--------------|--------------|
+| `newHeads` | A block is produced or accepted |
+| `newCommittedLeader` | A leader is committed (post-execution) |
+| `pendingTransactions` | A transaction enters the mempool (RPC or network ingest) |
+| `logs` | Accepted but no event source is wired yet (no notifications) |
+
+Server→client notifications use the `kvnc_subscription` method with a per-connection subscription id. Event delivery is best-effort: a consumer lagging past the 1024-event channel capacity drops missed events rather than stalling the publisher. `/ws` is unauthenticated, consistent with `/rpc`.
 
 ### Chain Methods
 
