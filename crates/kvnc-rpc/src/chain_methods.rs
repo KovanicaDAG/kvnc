@@ -87,6 +87,18 @@ fn parse_hash(value: &Value, what: &str) -> Result<Hash, RpcError> {
 
 /// Parse an account address parameter.
 fn parse_address(value: &Value, what: &str) -> Result<Address, RpcError> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| RpcError::InvalidParams(format!("{what}: expected an address string")))?;
+    let raw = raw.trim();
+    // Canonical `kvnc…dag` encoding (checksum verified) or a raw 32-byte hex.
+    if raw.starts_with(kvnc_types::address::ADDRESS_PREFIX)
+        || raw.ends_with(kvnc_types::address::ADDRESS_SUFFIX)
+    {
+        return raw
+            .parse::<Address>()
+            .map_err(|e| RpcError::InvalidParams(format!("{what}: {e}")));
+    }
     Ok(Address(parse_bytes32(value, what)?))
 }
 
