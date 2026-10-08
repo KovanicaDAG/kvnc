@@ -99,19 +99,19 @@ pub async fn status(client: &RpcClient, json_output: bool) -> Result<()> {
 pub async fn balance(client: &RpcClient, address: &str, json_output: bool) -> Result<()> {
     let address = parse_address(address, "address")?;
     let value = client
-        .call("kvnc_getBalance", json!([address.to_hex()]))
+        .call("kvnc_getBalance", json!([address.to_string()]))
         .await?;
     let balance = parse_quantity(&value)?;
 
     if json_output {
         return print_json(&json!({
-            "address": address.to_hex(),
+            "address": address.to_string(),
             "balance": balance,
         }));
     }
 
     print_kv(&[
-        ("Address", address.to_hex()),
+        ("Address", address.to_string()),
         ("Balance", format!("{balance} atoms")),
     ]);
     Ok(())

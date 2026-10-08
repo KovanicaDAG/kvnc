@@ -295,7 +295,7 @@ fn cmd_keygen(args: KeygenArgs, json_output: bool) -> Result<()> {
     }
 
     println!("Keystore written to {}", args.out.display());
-    println!("Address:    {}", keystore.address);
+    println!("Address:    {}", wallet::address(&keystore)?);
     println!("Public key: {}", keystore.public_key);
     Ok(())
 }
@@ -312,7 +312,7 @@ fn cmd_import(args: KeystoreArgs, json_output: bool) -> Result<()> {
 
     let public_key = wallet::public_key(&keystore)?;
     println!("Keystore:   {}", args.keystore.display());
-    println!("Address:    {}", keystore.address);
+    println!("Address:    {}", wallet::address(&keystore)?);
     println!("Public key: {}", hex::encode(public_key.as_bytes()));
     println!("Encrypted:  {}", keystore.encrypted);
     Ok(())
@@ -354,7 +354,7 @@ fn keystore_summary_json(
     let public_key = wallet::public_key(keystore)?;
     Ok(json!({
         "keystore": path.display().to_string(),
-        "address": keystore.address,
+        "address": wallet::address(keystore)?.to_string(),
         "publicKey": hex::encode(public_key.as_bytes()),
         "encrypted": keystore.encrypted,
     }))
@@ -371,7 +371,7 @@ fn cmd_sign(args: SignArgs, json_output: bool) -> Result<()> {
         args.message.clone().into_bytes()
     };
 
-    let signer = wallet::address(&keystore)?.to_hex();
+    let signer = wallet::address(&keystore)?.to_string();
     let message_digest = hex::encode(kvnc_types::Hash::new(&message).0);
     eprintln!("{UNSAFE_SIGN_WARNING}");
     eprintln!("Signer: {signer}");
@@ -384,7 +384,7 @@ fn cmd_sign(args: SignArgs, json_output: bool) -> Result<()> {
 
     if json_output {
         return output::print_json(&json!({
-            "address": keystore.address,
+            "address": wallet::address(&keystore)?.to_string(),
             "message": args.message,
             "messageHex": hex::encode(&message),
             "messageDigest": message_digest,
@@ -405,7 +405,7 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
 
     // The account nonce is the next unused nonce, so it is used as-is.
     let nonce_value = client
-        .call("kvnc_getNonce", json!([sender.to_hex()]))
+        .call("kvnc_getNonce", json!([sender.to_string()]))
         .await?;
     let nonce = rpc::parse_quantity(&nonce_value)?;
 
@@ -422,8 +422,8 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
     if json_output {
         return output::print_json(&json!({
             "transactionHash": tx_hash,
-            "sender": sender.to_hex(),
-            "to": recipient.to_hex(),
+            "sender": sender.to_string(),
+            "to": recipient.to_string(),
             "amount": args.amount,
             "fee": args.fee,
             "nonce": nonce,
@@ -431,8 +431,8 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
     }
 
     println!("Submitted transaction {tx_hash}");
-    println!("  from:   {}", sender.to_hex());
-    println!("  to:     {}", recipient.to_hex());
+    println!("  from:   {}", sender);
+    println!("  to:     {}", recipient);
     println!("  amount: {} atoms", args.amount);
     println!("  fee:    {} atoms", args.fee);
     println!("  nonce:  {nonce}");
@@ -465,7 +465,7 @@ fn cmd_import_key(args: ImportKeyArgs, json_output: bool) -> Result<()> {
         wallet::save(&args.out, &keystore)?;
     }
     println!("Encrypted keystore written to {}", args.out.display());
-    println!("Address: {}", keystore.address);
+    println!("Address: {}", wallet::address(&keystore)?);
     Ok(())
 }
 
@@ -609,6 +609,8 @@ mod wallet_cli_security_tests {
         let value = keystore_summary_json(std::path::Path::new("wallet.json"), &keystore).unwrap();
         assert!(value.get("address").is_some());
         assert!(value.get("publicKey").is_some());
+        let address = value["address"].as_str().unwrap();
+        assert!(address.starts_with("kvnc") && address.ends_with("dag"));
         for secret_field in ["secret_key", "secretKey", "privateKey", "seed", "mnemonic"] {
             assert!(value.get(secret_field).is_none());
         }

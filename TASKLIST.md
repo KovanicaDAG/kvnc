@@ -13,6 +13,16 @@
 
 ---
 
+## Recent (2026-10-08) — build-green + canonical addresses
+
+- [x] Workspace build restored: `merkle_root` na `StatementBlock`, `cargo fmt --check` + `cargo clippy --all-targets` clean, `cargo test --workspace` zelen (339 passed).
+- [x] **Signature verification hot-path** — `kvnc_crypto::verify_batch` sada vraća `Err(VerificationFailed)` za nevalidan potpis (ranije `Ok(false)` koji su hot-pathovi ignorirali → nevalidni blokovi su prolazili). Validacijski autoritet je node hot-path; network ingress samo emitira dekodirani blok.
+- [x] **Canonical address format** — `Address` = raw Ed25519 pubkey (obavezno za `verify_signature`); string `kvnc<hex(32B payload ‖ 4B blake3 checksum)>dag`. `Display`/`FromStr`; parser prihvata i stari bare/`0x` hex.
+- [x] **Mempool admission** — zero-fee tx (osim `Stake`, fee-free by design) se odbija (`MempoolError::ZeroFee`).
+- [x] CLI keystore i RPC odgovori (sender/to/contract/validator/committee) emitiraju kanonski format.
+
+---
+
 ## Phase 1: Core Types & Crypto (`kvnc-types`, `kvnc-crypto`)
 
 ### 1.1 kvnc-types — Complete Data Structures
@@ -27,12 +37,13 @@
 - Merkle: binary Merkle nad `tx.hash` listom; prazan block → fixed zero root. Jedna funkcija `merkle_root(hashes: &[Hash]) -> Hash`.
 - Domain separation: `blake3::Hasher::new_keyed(b"KVNC-BLOCK-v1")` (ili `hash_with_prefix(b"block", bytes)`). Nikad isti hash path za različite objekte.
 - Stake-weighted leader: `leader = cumulative_stake_select(round_seed, committee)`. Zadrži round-robin kao fallback iza feature flaga dok testovi ne prođu.
+- Address: `Address(pub [u8;32])` = raw pubkey. Kanonski string: `kvnc` + hex(32B ‖ blake3[..4]) + `dag`; `encode`/`decode` + `FromStr` (hex backward compat). Ne mijenjati u hash-pubkey jer `verify_signature` koristi `sender` kao pubkey.
 
 **Exit:** svi hash constructori imaju domain; block ima `merkle_root`; unit testovi za prazan/1/3 tx.
 
 ### 1.2 kvnc-crypto — Production Ready
 - [x] Keypair persistence (Argon2id + XChaCha20-Poly1305 keystore u `kvnc-cli`)
-- [x] **Batch verification** — Ed25519 batch verify za block signaturee
+- [x] **Batch verification** — Ed25519 batch verify za block signaturee; vraća `Err(VerificationFailed)`, ne `Ok(false)`, za nevalidan potpis
 - [ ] Key derivation — BIP32-style HD (optional, low priority)
 - [ ] VRF za leader selection (samo ako stake-weighted + randomness zahtijeva)
 
@@ -126,7 +137,7 @@
 
 ### 5.1 Core Mempool
 - [x] Tx pool (priority by fee rate)
-- [x] **Admission control** — nonce, balance, signature, gas limit
+- [x] **Admission control** — nonce, balance, signature, gas limit; zero-fee odbijen osim `Stake`
 - [x] Eviction policy
 - [x] Rebroadcast
 
@@ -233,6 +244,7 @@
 - [x] WebSocket subscriptions
 - [ ] **API client** (TypeScript) — Phase 22
 - [~] `logs` subscription accepted ali event source nije fully wired
+- [x] Adrese u odgovorima (sender/to/contract/validator/committee) u kanonskom `kvnc…dag` formatu; parser prihvata hex i kanonski
 
 **Tips**
 - Logs: publish iz `ExecutionContext` event buffera u `EventBus` pri commit. Jedan `publish_logs(receipts)`.
@@ -244,6 +256,7 @@
 ## Phase 11: CLI (`kvnc-cli`)
 
 - [x] Wallet (keygen, import/export, sign)
+- [x] Kanonski `kvnc…dag` format adrese (keystore + output); `parse_address` prihvata i stari hex
 - [ ] **Node operations** — status, sync, peers
 - [ ] **Staking commands** — stake/unstake/delegate/claim
 - [ ] Governance commands (Phase 25)
