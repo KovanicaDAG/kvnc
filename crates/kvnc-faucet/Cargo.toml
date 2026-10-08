@@ -1,0 +1,28 @@
+[package]
+name = "kvnc-faucet"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kvnc-faucet"
+path = "src/main.rs"
+
+[dependencies]
+kvnc-cli = { path = "../kvnc-cli" }
+kvnc-types = { path = "../kvnc-types" }
+kvnc-crypto = { path = "../kvnc-crypto" }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core", "batch"] }
+thiserror = { workspace = true }

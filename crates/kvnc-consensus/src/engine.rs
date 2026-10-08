@@ -6,6 +6,7 @@
 
 use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, is_leader_round, linearizer::Linearizer};
+use crate::metrics::{record_block_height, record_commit_latency, record_mergeset_size_metric};
 use kvnc_crypto::sign;
 use kvnc_mempool::Mempool;
 use kvnc_types::{
@@ -356,6 +357,9 @@ where
             // Advance to next round
             *self.current_round.write() = next_round;
 
+            // Record current round metric
+            record_block_height(next_round as i64);
+
             // Broadcast round change to subscribers
             if let Some(tx) = self.round_sender.read().as_ref() {
                 let _ = tx.send(next_round);
@@ -669,6 +673,13 @@ where
         // reconstructs committed sub-DAGs from the decided-round index and
         // execution deduplicates by leader digest in the state database.
         info!("Committed leader at round {}", subdag.leader_round);
+
+        // Record metrics for committed leader
+        let committed_height = subdag.leader_round; // proxy for height
+        record_block_height(committed_height as i64);
+        record_mergeset_size_metric(subdag.blocks.len());
+        record_commit_latency(0.0); // placeholder; actual latency measured in execution
+
         if let Some(sender) = self.commit_sender.read().as_ref() {
             if sender.send(subdag).is_err() {
                 warn!("execution receiver is unavailable; commit remains persisted for replay");

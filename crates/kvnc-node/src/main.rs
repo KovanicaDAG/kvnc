@@ -22,7 +22,7 @@
 mod config;
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +37,7 @@ use config::NodeConfig;
 
 use kvnc_consensus::engine::{BlockManagerTrait, DagStoreTrait};
 use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
+use kvnc_consensus::metrics::{record_mempool_size, record_peer_count};
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
@@ -82,9 +83,21 @@ struct GenesisArgs {
     #[arg(long, value_name = "HEX")]
     treasury_address: String,
 
+    /// Founder premine address (32-byte hex, receives 200,000 KVNC)
+    #[arg(long, value_name = "HEX")]
+    founder_address: String,
+
     /// Output genesis JSON file
     #[arg(long, value_name = "FILE", default_value = "genesis.json")]
     output: String,
+
+    /// Output validator key files directory (optional)
+    #[arg(long, value_name = "DIR")]
+    validator_keys_out: Option<String>,
+
+    /// Overwrite existing output files
+    #[arg(long)]
+    force: bool,
 }
 
 /// Outbound network commands handled by the network task.
@@ -129,8 +142,12 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
 
     // Build treasury
     let treasury = parse_address_hex(Some(&args.treasury_address))?;
+    let founder = parse_address_hex(Some(&args.founder_address))?;
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
+
+    // Founder premine (200,000 KVNC) - included in genesis allocations output
+    // Actual balance set when genesis block is executed on first run
 
     // Join each validator
     for v in validators_input {
@@ -146,7 +163,27 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             .with_context(|| format!("joining validator {}", v.address))?;
     }
 
-    info!(validators = staking.validators.len(), treasury = %treasury, "genesis allocations computed");
+    // Generate validator keys if output directory specified
+    let mut validator_keys = Vec::new();
+    if let Some(keys_dir) = &args.validator_keys_out {
+        use std::path::Path;
+        fs::create_dir_all(keys_dir)?;
+        for (i, v) in staking.validators.iter().enumerate() {
+            let (sk, pk) = kvnc_crypto::generate_keypair();
+            let seed = sk.to_bytes();
+            let key_file = format!("{}/validator{}.key", keys_dir, i + 1);
+            fs::write(&key_file, hex::encode(seed))?;
+            validator_keys.push(serde_json::json!({
+                "index": i,
+                "address_hex": hex::encode(v.address.0),
+                "public_key_hex": hex::encode(pk.0),
+                "key_file": key_file,
+            }));
+            info!("Generated validator {} key: {}", i + 1, key_file);
+        }
+    }
+
+    info!(validators = staking.validators.len(), treasury = %treasury, founder = %founder, "genesis allocations computed");
 
     // Build genesis StatementBlock
     let digest = StatementBlock::compute_digest(0, 0, &[], &[]);
@@ -176,18 +213,29 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
         "allocations": {
             "treasury_address_hex": args.treasury_address,
             "treasury_address_bytes": hex::encode(treasury.0),
+            "founder_address_hex": args.founder_address,
+            "founder_address_bytes": hex::encode(founder.0),
+            "founder_premine_atoms": FOUNDER_PREMINE,
+            "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
                 "public_key_hex": v.public_key.as_ref().map(|pk| hex::encode(pk.0)),
             })).collect::<Vec<_>>(),
-            "founder_premine_atoms": FOUNDER_PREMINE,
-            "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
         },
+        "validator_keys": validator_keys,
     });
 
-    fs::write(&args.output, serde_json::to_string_pretty(&output)?)
-        .with_context(|| format!("writing genesis {}", args.output))?;
+    // Write output with optional force
+    if args.force {
+        fs::write(&args.output, serde_json::to_string_pretty(&output)?)
+            .with_context(|| format!("writing genesis {}", args.output))?;
+    } else if fs::metadata(&args.output).is_ok() {
+        anyhow::bail!("output file {} exists; use --force to overwrite", args.output);
+    } else {
+        fs::write(&args.output, serde_json::to_string_pretty(&output)?)
+            .with_context(|| format!("writing genesis {}", args.output))?;
+    }
     info!(file = %args.output, validators = staking.validators.len(), "genesis file written");
     Ok(())
 }
@@ -318,6 +366,7 @@ where
         NetworkService::new(network_config, dag_store.clone(), mempool.clone())
             .context("creating network service")?;
     let peer_count = network.peer_count_handle();
+    let peer_count_for_rpc = peer_count.clone();
     let (network_cmd_tx, network_cmd_rx) = mpsc::unbounded_channel::<NetworkCommand>();
 
     // ------------------------------------------------------------------
@@ -337,7 +386,7 @@ where
         mempool: mempool.clone(),
         staking: Arc::new(tokio::sync::RwLock::new(staking_state)),
         committee: committee.clone(),
-        peer_count,
+        peer_count: peer_count_for_rpc,
         events: events.clone(),
     };
     let rpc_server = RpcServer::new(rpc_socket, rpc_state).await;
@@ -454,6 +503,32 @@ where
     let engine_task = tokio::spawn(async move {
         if let Err(e) = engine_for_task.start().await {
             error!(error = %e, "consensus engine stopped with an error");
+        }
+    });
+
+    // Background task: periodically update Prometheus metrics from node state
+    let mempool_for_metrics = mempool.clone();
+    let peer_count_for_metrics = peer_count.clone();
+    let mut shutdown_for_metrics = shutdown_rx.clone();
+    let _metrics_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Update mempool size
+                    let mempool_size = mempool_for_metrics.len() as i64;
+                    record_mempool_size(mempool_size);
+
+                    // Update peer count
+                    let peer_count_val = peer_count_for_metrics.load(Ordering::Relaxed) as i64;
+                    record_peer_count(peer_count_val);
+                }
+                _ = shutdown_for_metrics.changed() => {
+                    if *shutdown_for_metrics.borrow() {
+                        break;
+                    }
+                }
+            }
         }
     });
 
