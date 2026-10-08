@@ -5,8 +5,9 @@
 //! for wave-based uncertified DAG consensus.
 
 use crate::engine::DagStoreTrait;
+use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
 use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
-use kvnc_types::{hash::Hash, AuthorityIndex, CommittedSubDag, Round};
+use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, CommittedSubDag, Round};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -126,6 +127,8 @@ impl BaseCommitter {
 /// Universal committer that also handles indirect decisions.
 pub struct UniversalCommitter {
     base: BaseCommitter,
+    /// Whether to use MysticGhost (scoped GHOSTDAG) ordering for committed waves.
+    use_mysticghost: bool,
     /// Last decided round.
     last_decided_round: RwLock<Round>,
     /// Map of leader info by round.
@@ -138,9 +141,10 @@ pub struct UniversalCommitter {
 
 impl UniversalCommitter {
     /// Create a new universal committer.
-    pub fn new(committee: CommitteeInfo) -> Self {
+    pub fn new(committee: CommitteeInfo, use_mysticghost: bool) -> Self {
         Self {
             base: BaseCommitter::new(committee),
+            use_mysticghost,
             last_decided_round: RwLock::new(0),
             leaders: RwLock::new(HashMap::new()),
             decided_leaders: RwLock::new(HashMap::new()),
@@ -381,8 +385,23 @@ impl UniversalCommitter {
         let leader_hash = leader_info.block_hash?;
         let leader_block = dag_store.get_block(&leader_hash).ok()?;
 
+        if self.use_mysticghost {
+            // MysticGhost path: use scoped GHOSTDAG colouring
+            self.build_committed_subdag_mysticghost(dag_store, &leader_block, leader_info.round)
+        } else {
+            // Original linearizer path (bit-identical to current behaviour)
+            self.build_committed_subdag_linearizer(dag_store, &leader_block)
+        }
+    }
+
+    /// Original linearizer path (Mysticeti).
+    fn build_committed_subdag_linearizer<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+        leader_block: &StatementBlock,
+    ) -> Option<CommittedSubDag> {
         // Get all ancestors of this leader (causal history)
-        let ancestors = dag_store.get_ancestors(&leader_hash, 0).ok()?;
+        let ancestors = dag_store.get_ancestors(&leader_block.digest, 0).ok()?;
 
         // Get the actual blocks for ancestors
         let mut history = Vec::new();
@@ -392,8 +411,92 @@ impl UniversalCommitter {
 
         // Linearize the sub-DAG
         let linearizer = crate::linearizer::Linearizer::new();
-        let subdag = linearizer.linearize(leader_block, history);
+        let subdag = linearizer.linearize(leader_block.clone(), history);
 
         Some(subdag)
+    }
+
+    /// MysticGhost path: scoped GHOSTDAG colouring of the mergeset.
+    fn build_committed_subdag_mysticghost<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+        leader_block: &StatementBlock,
+        leader_round: Round,
+    ) -> Option<CommittedSubDag> {
+        // 1. Get mergeset hashes
+        let mergeset_hashes = dag_store.mergeset(&leader_block.digest).ok()?;
+
+        // 2. Get mergeset blocks
+        let mergeset_blocks = dag_store.get_blocks(&mergeset_hashes).ok()?;
+
+        // 3. Get previous tips (decided leaders' blocks)
+        let previous_tips = self.get_previous_tips(dag_store).ok()?;
+
+        // 4. Configure MysticGhost
+        let mg_config = MysticGhostConfig {
+            enabled: true,
+            k: 3,
+            max_mergeset_blocks: 2_000,
+        };
+
+        // 5. Run MysticGhost ordering
+        match order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
+            MysticGhostOrder::Ghost { colouring } => {
+                // Use the blue-set order from GHOSTDAG
+                let blue_ordered = colouring.blue_ordered();
+                
+                // Build blocks in blue order, filtering to only those in mergeset
+                let block_map: std::collections::HashMap<Hash, StatementBlock> = mergeset_blocks
+                    .into_iter()
+                    .map(|b| (b.digest, b))
+                    .collect();
+                
+                let mut ordered_blocks = Vec::new();
+                for hash in blue_ordered {
+                    if let Some(block) = block_map.get(&hash) {
+                        ordered_blocks.push(block.clone());
+                    }
+                }
+                
+                // Ensure leader is included (should be blue)
+                if !ordered_blocks.iter().any(|b| b.digest == leader_block.digest) {
+                    ordered_blocks.push(leader_block.clone());
+                }
+
+                Some(CommittedSubDag {
+                    blocks: ordered_blocks,
+                    leader: leader_block.clone(),
+                    leader_round,
+                    leader_author: leader_block.author,
+                })
+            }
+            MysticGhostOrder::Fallback => {
+                // Fall back to original linearizer
+                self.build_committed_subdag_linearizer(dag_store, leader_block)
+            }
+        }
+    }
+
+    /// Get previous committed tips for MysticGhost colouring.
+    fn get_previous_tips<D: DagStoreTrait>(
+        &self,
+        dag_store: &D,
+    ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
+        let decided_rounds = dag_store.get_decided_rounds(u64::MAX)?;
+        let mut tips = Vec::new();
+        
+        for round in decided_rounds {
+            let leaders = dag_store.get_decided_leaders(round)?;
+            for leader_hash in leaders {
+                // Verify the leader block exists and matches
+                if let Ok(block) = dag_store.get_block(&leader_hash) {
+                    if block.round == round && block.digest == leader_hash {
+                        tips.push(leader_hash);
+                    }
+                }
+            }
+        }
+        
+        Ok(tips)
     }
 }

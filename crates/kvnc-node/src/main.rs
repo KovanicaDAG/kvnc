@@ -35,7 +35,7 @@ use tracing::{debug, error, info, warn};
 use config::NodeConfig;
 
 use kvnc_consensus::engine::{BlockManagerTrait, DagStoreTrait};
-use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine};
+use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
@@ -65,6 +65,8 @@ enum NetworkCommand {
     BroadcastBlock(StatementBlock),
     /// Gossip a newly accepted transaction.
     BroadcastTransaction(Transaction),
+    /// Gossip a consensus vote.
+    BroadcastVote(Vote),
     /// Ask the network task to stop.
     Shutdown,
 }
@@ -211,6 +213,13 @@ where
             .map(|authority| (authority.index, authority.public_key))
             .collect(),
     );
+    block_manager.set_authority_stakes(
+        committee
+            .authorities()
+            .iter()
+            .map(|authority| (authority.index, authority.stake))
+            .collect(),
+    );
     let engine = Arc::new(ConsensusEngine::new(
         ConsensusConfig {
             round_duration_ms: config.round_duration_ms,
@@ -227,13 +236,25 @@ where
         signing_key.clone(),
     ));
 
+    // Set up block broadcaster to gossip proposed blocks
+    let broadcast_tx = network_cmd_tx.clone();
+    engine.set_block_broadcaster(Arc::new(move |block: &StatementBlock| {
+        let _ = broadcast_tx.send(NetworkCommand::BroadcastBlock(block.clone()));
+    }));
+
+    // Set up vote broadcaster to gossip votes
+    let vote_broadcast_tx = network_cmd_tx.clone();
+    engine.set_vote_broadcaster(Arc::new(move |vote: &Vote| {
+        let _ = vote_broadcast_tx.send(NetworkCommand::BroadcastVote(vote.clone()));
+    }));
+
     // ------------------------------------------------------------------
     // 7. Shutdown plumbing + task spawning
     // ------------------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (exec_tx, exec_rx) = mpsc::unbounded_channel::<kvnc_consensus::CommittedSubDag>();
     engine.set_commit_sender(exec_tx.clone());
-    for subdag in recover_committed_subdags(&dag_store)? {
+    for subdag in recover_committed_subdags(&dag_store, config.use_mysticghost)? {
         exec_tx
             .send(subdag)
             .context("queueing a previously committed sub-DAG for replay")?;
@@ -372,6 +393,11 @@ async fn run_network(
                         warn!(error = %e, "failed to broadcast transaction");
                     }
                 }
+                Some(NetworkCommand::BroadcastVote(vote)) => {
+                    if let Err(e) = service.broadcast_vote(&vote) {
+                        warn!(error = %e, "failed to broadcast vote");
+                    }
+                }
                 Some(NetworkCommand::Shutdown) | None => {
                     info!("network task stopping");
                     break;
@@ -446,6 +472,12 @@ fn handle_network_event(
             }
             Err(e) => warn!(error = %e, "rejected received transaction"),
         },
+        NetworkEvent::VoteReceived { peer, vote } => {
+            debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "processing received vote");
+            if let Err(e) = engine.process_vote(vote.leader_round, vote.voter, vote.leader_hash) {
+                warn!(%peer, %e, "failed to process received vote");
+            }
+        }
         NetworkEvent::PeerConnected(peer) => info!(%peer, "peer connected"),
         NetworkEvent::PeerDisconnected(peer) => info!(%peer, "peer disconnected"),
         NetworkEvent::PeerDiscovered(peer, addr) => debug!(%peer, %addr, "peer discovered"),
@@ -454,6 +486,7 @@ fn handle_network_event(
             from_round,
             to_round,
         } => debug!(%peer, from_round, to_round, "sync request received"),
+        NetworkEvent::BlockSyncResponse { .. } => {}
     }
 }
 
@@ -613,6 +646,28 @@ impl DagStoreTrait for NodeDagStore {
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         self.inner.mark_round_decided(round, leader_hash)
     }
+
+    fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        self.inner.mergeset(leader)
+    }
+
+    fn get_blocks(&self, hashes: &[Hash]) -> Result<Vec<StatementBlock>, DagStoreError> {
+        let mut blocks = Vec::new();
+        for hash in hashes {
+            if let Ok(block) = self.inner.get_block(hash) {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
+    }
+
+    fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, DagStoreError> {
+        self.inner.get_decided_leaders(round)
+    }
+
+    fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, DagStoreError> {
+        self.inner.get_decided_rounds(max_round)
+    }
 }
 
 /// Adapter implementing [`BlockManagerTrait`] over the concrete [`BlockManager`].
@@ -639,9 +694,26 @@ impl BlockManagerTrait for NodeBlockManager {
 }
 
 /// Reconstruct durable commit decisions for restart-safe execution replay.
-fn recover_committed_subdags(dag_store: &DagStore) -> Result<Vec<kvnc_consensus::CommittedSubDag>> {
+fn recover_committed_subdags(
+    dag_store: &DagStore,
+    use_mysticghost: bool,
+) -> Result<Vec<kvnc_consensus::CommittedSubDag>> {
     let rounds = dag_store.get_decided_rounds(u64::MAX)?;
     let mut subdags = Vec::new();
+    
+    // Pre-compute all decided leaders for previous tips
+    let mut all_previous_tips = Vec::new();
+    for round in &rounds {
+        let leaders = dag_store.get_decided_leaders(*round)?;
+        for leader_hash in leaders {
+            if let Ok(block) = dag_store.get_block(&leader_hash) {
+                if block.round == *round && block.digest == leader_hash {
+                    all_previous_tips.push(leader_hash);
+                }
+            }
+        }
+    }
+
     for round in rounds {
         for leader_hash in dag_store.get_decided_leaders(round)? {
             let leader = dag_store.get_block(&leader_hash)?;
@@ -652,12 +724,20 @@ fn recover_committed_subdags(dag_store: &DagStore) -> Result<Vec<kvnc_consensus:
                     leader.digest,
                 );
             }
-            let history = dag_store
-                .get_ancestors(&leader_hash, 0)?
-                .into_iter()
-                .map(|hash| dag_store.get_block(&hash))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
+
+            if use_mysticghost {
+                // MysticGhost path: use scoped GHOSTDAG colouring
+                let subdag = recover_committed_subdag_mysticghost(dag_store, &leader, round, &all_previous_tips)?;
+                subdags.push(subdag);
+            } else {
+                // Original linearizer path (bit-identical to current behaviour)
+                let history = dag_store
+                    .get_ancestors(&leader_hash, 0)?
+                    .into_iter()
+                    .map(|hash| dag_store.get_block(&hash))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
+            }
         }
     }
     subdags.sort_by_key(|subdag| {
@@ -668,6 +748,76 @@ fn recover_committed_subdags(dag_store: &DagStore) -> Result<Vec<kvnc_consensus:
         )
     });
     Ok(subdags)
+}
+
+/// MysticGhost recovery path for a single committed sub-DAG.
+fn recover_committed_subdag_mysticghost(
+    dag_store: &DagStore,
+    leader_block: &StatementBlock,
+    leader_round: Round,
+    previous_tips: &[Hash],
+) -> Result<kvnc_consensus::CommittedSubDag> {
+    use kvnc_consensus::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
+    
+    // 1. Get mergeset hashes
+    let mergeset_hashes = dag_store.mergeset(&leader_block.digest)?;
+    
+    // 2. Get mergeset blocks
+    let mut mergeset_blocks = Vec::new();
+    for hash in mergeset_hashes {
+        if let Ok(block) = dag_store.get_block(&hash) {
+            mergeset_blocks.push(block);
+        }
+    }
+    
+    // 3. Configure MysticGhost
+    let mg_config = MysticGhostConfig {
+        enabled: true,
+        k: 3,
+        max_mergeset_blocks: 2_000,
+    };
+    
+    // 4. Run MysticGhost ordering
+    match order_committed_wave(&mg_config, &mergeset_blocks, previous_tips) {
+        MysticGhostOrder::Ghost { colouring } => {
+            // Use the blue-set order from GHOSTDAG
+            let blue_ordered = colouring.blue_ordered();
+            
+            // Build blocks in blue order, filtering to only those in mergeset
+            let block_map: std::collections::HashMap<Hash, StatementBlock> = mergeset_blocks
+                .into_iter()
+                .map(|b| (b.digest, b))
+                .collect();
+            
+            let mut ordered_blocks = Vec::new();
+            for hash in blue_ordered {
+                if let Some(block) = block_map.get(&hash) {
+                    ordered_blocks.push(block.clone());
+                }
+            }
+            
+            // Ensure leader is included (should be blue)
+            if !ordered_blocks.iter().any(|b| b.digest == leader_block.digest) {
+                ordered_blocks.push(leader_block.clone());
+            }
+            
+            Ok(kvnc_consensus::CommittedSubDag {
+                blocks: ordered_blocks,
+                leader: leader_block.clone(),
+                leader_round,
+                leader_author: leader_block.author,
+            })
+        }
+        MysticGhostOrder::Fallback => {
+            // Fall back to original linearizer
+            let history = dag_store
+                .get_ancestors(&leader_block.digest, 0)?
+                .into_iter()
+                .map(|hash| dag_store.get_block(&hash))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(kvnc_consensus::Linearizer::new().linearize(leader_block.clone(), history))
+        }
+    }
 }
 
 /// Build the initial single-validator committee from the local identity.
@@ -843,7 +993,7 @@ mod tests {
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
 
-        let recovered = recover_committed_subdags(&dag).unwrap();
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].leader.digest, digest);
         assert_eq!(recovered[0].blocks.len(), 1);
@@ -870,7 +1020,7 @@ mod tests {
         let missing_digest = StatementBlock::compute_digest(0, 2, &[], &[]);
         dag.mark_round_decided(2, &missing_digest).unwrap();
 
-        assert!(recover_committed_subdags(&dag).is_err());
+        assert!(recover_committed_subdags(&dag, false).is_err());
     }
 
     #[test]
@@ -891,7 +1041,7 @@ mod tests {
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
 
-        let error = recover_committed_subdags(&dag).unwrap_err();
+        let error = recover_committed_subdags(&dag, false).unwrap_err();
         assert!(
             error.to_string().contains("round 1"),
             "unexpected recovery error: {error}"
@@ -937,7 +1087,7 @@ mod tests {
 
         let storage = Storage::new(&db_path).unwrap();
         let dag = DagStore::new(storage).unwrap();
-        let error = recover_committed_subdags(&dag).unwrap_err().to_string();
+        let error = recover_committed_subdags(&dag, false).unwrap_err().to_string();
         assert!(
             error.contains("block digest"),
             "recovery error should identify the mismatched block digest: {error}"
@@ -946,6 +1096,31 @@ mod tests {
             error.contains(&format!("expected digest {digest}")),
             "recovery error should identify the persisted decision digest: {error}"
         );
+    }
+
+    #[test]
+    fn committed_subdag_recovery_with_mysticghost_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let digest = StatementBlock::compute_digest(0, 1, &[], &[]);
+        let block = StatementBlock {
+            author: 0,
+            round: 1,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+        };
+        dag.put_block(&block).unwrap();
+        dag.mark_round_decided(1, &digest).unwrap();
+
+        // Test recovery with MysticGhost enabled (should fall back to linearizer for simple case)
+        let recovered = recover_committed_subdags(&dag, true).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].leader.digest, digest);
+        assert_eq!(recovered[0].blocks.len(), 1);
     }
 
     #[tokio::test]

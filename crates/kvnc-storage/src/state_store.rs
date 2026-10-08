@@ -84,10 +84,26 @@ impl StateStore {
     ) -> Result<Account, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        Ok(table
-            .get(key)?
+        let value = table.get(key)?;
+        Ok(value
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default())
+    }
+
+    /// Get an account, returning default if not found (write transaction variant).
+    pub fn get_account_or_default_write(
+        &self,
+        txn: &WriteTransaction,
+        address: &Address,
+    ) -> Result<Account, StateStoreError> {
+        let key = address_to_bytes(address);
+        let table = txn.open_table(crate::tables::ACCOUNTS)?;
+        let value = table.get(key)?;
+        let account = value
+            .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
+            .unwrap_or_default();
+        drop(table);
+        Ok(account)
     }
 
     /// Set an account.
@@ -110,13 +126,13 @@ impl StateStore {
         address: &Address,
         amount: u64,
     ) -> Result<u64, StateStoreError> {
-        let read_txn = txn.open_table(crate::tables::ACCOUNTS)?;
         let key = address_to_bytes(address);
-        let mut account = read_txn
-            .get(key)?
+        let table = txn.open_table(crate::tables::ACCOUNTS)?;
+        let value = table.get(key)?;
+        let mut account = value
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
-        drop(read_txn);
+        drop(table);
         account.balance = account.balance.saturating_add(amount);
         self.set_account(txn, address, &account)?;
         Ok(account.balance)
@@ -131,10 +147,11 @@ impl StateStore {
     ) -> Result<u64, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table
-            .get(key)?
+        let value = table.get(key)?;
+        let account = value
             .ok_or_else(|| StateStoreError::NotFound(format!("account {}", address)))?;
         let mut account = Account::from_bytes(&account.value())?;
+        // table is dropped here after account is extracted
         account.balance = account.balance.saturating_sub(amount);
         self.set_account(txn, address, &account)?;
         Ok(account.balance)
@@ -148,10 +165,11 @@ impl StateStore {
     ) -> Result<u64, StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table
-            .get(key)?
+        let value = table.get(key)?;
+        let mut account = value
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
+        drop(table);
         account.nonce = account.nonce.saturating_add(1);
         self.set_account(txn, address, &account)?;
         Ok(account.nonce)
@@ -166,10 +184,11 @@ impl StateStore {
     ) -> Result<(), StateStoreError> {
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table
-            .get(key)?
+        let value = table.get(key)?;
+        let mut account = value
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
+        drop(table);
         account.nonce = nonce;
         self.set_account(txn, address, &account)?;
         Ok(())
@@ -199,10 +218,11 @@ impl StateStore {
         // Update account
         let key = address_to_bytes(address);
         let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let mut account = table
-            .get(key)?
+        let value = table.get(key)?;
+        let mut account = value
             .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default();
+        drop(table);
         account.code_hash = code_hash_bytes;
         account.code = code;
         self.set_account(txn, address, &account)?;

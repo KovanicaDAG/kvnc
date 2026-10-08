@@ -121,7 +121,7 @@ fn build_scenario(s: &Scenario, mode: VoteMode) -> (UniversalCommitter, MockDag,
     let g = genesis();
     let dag = MockDag::with_blocks([g.clone()]);
     let mut last_stored_parent = block_ref(&g);
-    let committer = UniversalCommitter::new(committee.clone());
+    let committer = UniversalCommitter::new(committee.clone(), false);
 
     for (i, row) in s.rows.iter().enumerate() {
         let round = i as u64 + 1;
@@ -724,7 +724,7 @@ proptest! {
         let block = make_block(0, 1, vec![block_ref(&g)], "eq/leader");
         dag.put(block.clone());
 
-        let committer = UniversalCommitter::new(committee.clone());
+        let committer = UniversalCommitter::new(committee.clone(), false);
         committer.update_leader(leader_info(
             1,
             block.author,
@@ -780,7 +780,7 @@ proptest! {
         let dag_a = MockDag::with_blocks([g.clone()]);
         let block_x = make_block(0, 1, vec![block_ref(&g)], "eq/view-x");
         dag_a.put(block_x.clone());
-        let view_a = UniversalCommitter::new(committee.clone());
+        let view_a = UniversalCommitter::new(committee.clone(), false);
         view_a.update_leader(leader_info(
             1,
             block_x.author,
@@ -795,7 +795,7 @@ proptest! {
         let dag_b = MockDag::with_blocks([g.clone()]);
         let block_y = make_block(0, 1, vec![block_ref(&g)], "eq/view-y");
         dag_b.put(block_y.clone());
-        let view_b = UniversalCommitter::new(committee.clone());
+        let view_b = UniversalCommitter::new(committee.clone(), false);
         view_b.update_leader(leader_info(
             1,
             block_y.author,

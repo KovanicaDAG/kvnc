@@ -12,3 +12,6 @@ hex = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }

@@ -283,6 +283,44 @@ impl DagStoreTrait for MockDag {
         }
         Ok(())
     }
+
+    fn mergeset(&self, _leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        Ok(Vec::new())
+    }
+
+    fn get_blocks(
+        &self,
+        hashes: &[Hash],
+    ) -> Result<Vec<StatementBlock>, DagStoreError> {
+        let blocks = self.blocks.read();
+        Ok(hashes
+            .iter()
+            .filter_map(|h| {
+                let digest = self.resolve_digest(h);
+                blocks.get(&digest).cloned()
+            })
+            .collect())
+    }
+
+    fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, DagStoreError> {
+        Ok(self
+            .decisions
+            .lock()
+            .iter()
+            .filter(|(r, _)| *r == round)
+            .map(|(_, h)| *h)
+            .collect())
+    }
+
+    fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, DagStoreError> {
+        Ok(self
+            .decisions
+            .lock()
+            .iter()
+            .filter(|(r, _)| *r <= max_round)
+            .map(|(r, _)| *r)
+            .collect())
+    }
 }
 
 /// In-memory block manager for `kvnc_consensus::ConsensusEngine` tests.

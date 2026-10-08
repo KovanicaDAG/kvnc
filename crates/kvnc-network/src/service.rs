@@ -2,6 +2,7 @@
 
 use crate::{
     behaviour::{self, Behaviour},
+    block_sync::{BlockRequest, BlockResponse},
     error::NetworkError,
     sync::SyncRequest,
     topics, NetworkConfig, NetworkEvent,
@@ -9,9 +10,9 @@ use crate::{
 use futures::StreamExt;
 use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolError};
-use kvnc_types::{StatementBlock, Transaction};
+use kvnc_types::{StatementBlock, Transaction, Vote};
 use libp2p::{
-    gossipsub, identify, kad,
+    gossipsub, identify, kad, request_response,
     swarm::{dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
@@ -33,6 +34,9 @@ type BehaviourEvent = <Behaviour as NetworkBehaviour>::ToSwarm;
 /// and evicted from the Kademlia routing table.
 const PING_FAILURE_LIMIT: u32 = 3;
 
+/// Maximum consecutive invalid block failures before a peer is banned.
+const INVALID_BLOCK_FAILURE_LIMIT: u32 = 5;
+
 /// Keep bootstrap retries bounded and separated so stale seeds do not trigger
 /// a burst of simultaneous dials.
 const BOOTSTRAP_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -43,6 +47,8 @@ const BOOTSTRAP_DIAL_STAGGER: Duration = Duration::from_millis(250);
 pub struct NetworkService {
     /// Effective configuration.
     config: NetworkConfig,
+    /// DAG store for serving block sync requests.
+    dag_store: Arc<DagStore>,
     /// Mempool that ingests transactions received over gossip.
     mempool: Arc<Mempool>,
     /// Sender half of the event stream handed to the caller.
@@ -56,6 +62,8 @@ pub struct NetworkService {
     peer_count: Arc<AtomicUsize>,
     /// Consecutive ping failures per peer.
     ping_failures: Mutex<HashMap<PeerId, u32>>,
+    /// Invalid block failures per peer (invalid sig, unknown author, bad parents, etc.)
+    invalid_block_failures: Mutex<HashMap<PeerId, u32>>,
     /// Addresses learned for a peer (from Kademlia), used to evict banned peers
     /// from the routing table.
     peer_addresses: Mutex<HashMap<PeerId, Vec<Multiaddr>>>,
@@ -210,7 +218,7 @@ impl NetworkService {
     /// exists.
     pub fn new(
         config: NetworkConfig,
-        _dag_store: Arc<DagStore>,
+        dag_store: Arc<DagStore>,
         mempool: Arc<Mempool>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<NetworkEvent>), NetworkError> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -222,12 +230,14 @@ impl NetworkService {
         Ok((
             Self {
                 config,
+                dag_store,
                 mempool,
                 event_tx,
                 swarm: Mutex::new(swarm),
                 connected: Mutex::new(HashSet::new()),
                 peer_count: Arc::new(AtomicUsize::new(0)),
                 ping_failures: Mutex::new(HashMap::new()),
+                invalid_block_failures: Mutex::new(HashMap::new()),
                 peer_addresses: Mutex::new(HashMap::new()),
                 bootstrap: Mutex::new(bootstrap),
             },
@@ -292,6 +302,12 @@ impl NetworkService {
     pub fn broadcast_transaction(&self, tx: &Transaction) -> Result<(), NetworkError> {
         let payload = bincode::serialize(tx)?;
         self.publish(topics::TRANSACTIONS, payload)
+    }
+
+    /// Broadcast a vote to all peers.
+    pub fn broadcast_vote(&self, vote: &Vote) -> Result<(), NetworkError> {
+        let payload = bincode::serialize(vote)?;
+        self.publish(topics::VOTES, payload)
     }
 
     /// Get connected peers.
@@ -367,6 +383,34 @@ impl NetworkService {
             }
             Err(err) => Err(NetworkError::Gossipsub(err.to_string())),
         }
+    }
+
+    /// Respond to a block sync request.
+    pub fn respond_block_sync(
+        &self,
+        channel: request_response::ResponseChannel<BlockResponse>,
+        response: BlockResponse,
+    ) -> Result<(), NetworkError> {
+        let mut swarm = self.swarm();
+        swarm
+            .behaviour_mut()
+            .block_sync
+            .send_response(channel, response)
+            .map_err(|e| NetworkError::Swarm(format!("failed to send block sync response: {e}")))
+    }
+
+    /// Send a block sync request to a peer.
+    pub fn request_block_sync(
+        &self,
+        peer: PeerId,
+        request: BlockRequest,
+    ) -> Result<request_response::OutboundRequestId, NetworkError> {
+        let mut swarm = self.swarm();
+        let request_id = swarm
+            .behaviour_mut()
+            .block_sync
+            .send_request(&peer, request);
+        Ok(request_id)
     }
 
     /// Forward an event to the caller. A dropped receiver only means nobody is
@@ -446,6 +490,7 @@ impl NetworkService {
             BehaviourEvent::Kad(event) => self.handle_kad_event(event),
             BehaviourEvent::Ping(event) => self.handle_ping_event(event),
             BehaviourEvent::Identify(event) => self.handle_identify_event(event),
+            BehaviourEvent::BlockSync(event) => self.handle_request_response_event(event),
         }
     }
 
@@ -456,10 +501,7 @@ impl NetworkService {
                 topics::BLOCKS => self.on_block_message(&message.data),
                 topics::TRANSACTIONS => self.on_transaction_message(&message.data),
                 topics::SYNC => self.on_sync_message(message.source, &message.data),
-                topics::VOTES => {
-                    debug!("ignoring vote message: tallying is not wired up yet");
-                    Ok(())
-                }
+                topics::VOTES => self.on_vote_message(message.source, &message.data),
                 other => {
                     debug!(topic = other, "message on unexpected topic");
                     Ok(())
@@ -557,6 +599,84 @@ impl NetworkService {
         Ok(())
     }
 
+    /// Handle request-response events (block sync).
+    fn handle_request_response_event(
+        &self,
+        event: request_response::Event<BlockRequest, BlockResponse>,
+    ) -> Result<(), NetworkError> {
+        match event {
+            request_response::Event::Message { peer, message, connection_id: _ } => match message {
+                request_response::Message::Request {
+                    request_id: _,
+                    request,
+                    channel,
+                } => {
+                    debug!(%peer, ?request, "block sync request received");
+                    // Automatically respond using the DAG store
+                    let response = match request {
+                        BlockRequest::ByHash(hash) => {
+                            match self.dag_store.get_block(&hash) {
+                                Ok(block) => BlockResponse::Block(block),
+                                Err(_) => BlockResponse::NotFound,
+                            }
+                        }
+                        BlockRequest::ByAuthorRound { author, round } => {
+                            match self.dag_store.get_block_by_author_round(author, round) {
+                                Ok(Some(block)) => BlockResponse::Block(block),
+                                Ok(None) => BlockResponse::NotFound,
+                                Err(_) => BlockResponse::InvalidRequest,
+                            }
+                        }
+                    };
+                    let mut swarm = self.swarm();
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .block_sync
+                        .send_response(channel, response)
+                    {
+                        warn!(%peer, %e, "failed to send block sync response");
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    debug!(%peer, ?request_id, ?response, "block sync response received");
+                    self.emit(NetworkEvent::BlockSyncResponse {
+                        peer,
+                        request_id,
+                        response,
+                    });
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "block sync request failed");
+                self.emit(NetworkEvent::BlockSyncResponse {
+                    peer,
+                    request_id,
+                    response: BlockResponse::InvalidRequest,
+                });
+            }
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "incoming block sync request failed");
+            }
+            request_response::Event::ResponseSent { .. } => {
+                debug!("block sync response sent");
+            }
+        }
+        Ok(())
+    }
+
     /// Decode a block received over gossip and announce it to the caller.
     /// Validation and persistence belong to the BlockManager, not the network
     /// ingress path.
@@ -600,6 +720,24 @@ impl NetworkService {
                 Ok(())
             }
         }
+    }
+
+    /// Decode a vote received over gossip and announce it to the caller.
+    fn on_vote_message(&self, source: Option<PeerId>, payload: &[u8]) -> Result<(), NetworkError> {
+        let vote: Vote = match bincode::deserialize(payload) {
+            Ok(vote) => vote,
+            Err(err) => {
+                warn!(%err, "dropping malformed vote gossip");
+                return Ok(());
+            }
+        };
+        let Some(peer) = source else {
+            warn!("dropping vote message without an author");
+            return Ok(());
+        };
+        debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "vote received over gossip");
+        self.emit(NetworkEvent::VoteReceived { peer, vote });
+        Ok(())
     }
 
     /// Decode a sync-range request and announce it to the caller.
@@ -684,6 +822,7 @@ impl NetworkService {
     /// swarm stops redialing it.
     fn ban_peer(&self, peer: PeerId) {
         lock(&self.ping_failures).remove(&peer);
+        lock(&self.invalid_block_failures).remove(&peer);
         let known: Vec<Multiaddr> = lock(&self.peer_addresses).remove(&peer).unwrap_or_default();
 
         let mut swarm = self.swarm();
@@ -701,6 +840,28 @@ impl NetworkService {
             }
         }
         info!(%peer, "banned peer");
+    }
+
+    /// Record an invalid block failure from a peer. If the failure limit is
+    /// reached, ban the peer.
+    pub fn record_invalid_block_failure(&self, peer: PeerId, reason: &str) {
+        let failures = {
+            let mut failures = lock(&self.invalid_block_failures);
+            let counter = failures.entry(peer).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+        if failures >= INVALID_BLOCK_FAILURE_LIMIT {
+            warn!(peer = %peer, failures, reason, "peer exceeded invalid block limit; banning");
+            self.ban_peer(peer);
+        } else {
+            debug!(peer = %peer, failures, reason, "invalid block failure recorded");
+        }
+    }
+
+    /// Reset invalid block failure counter for a peer (e.g., on successful validation).
+    pub fn reset_invalid_block_failures(&self, peer: PeerId) {
+        lock(&self.invalid_block_failures).remove(&peer);
     }
 }
 

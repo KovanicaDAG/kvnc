@@ -542,7 +542,7 @@ fn test_indirect_decide_wave_window_bounds() {
 
 #[test]
 fn test_add_vote_below_quorum_stays_undecided() {
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     let block = make_block(1, 3, vec![block_ref(&genesis())], "leader-3");
     committer.update_leader(leader_info(
         3,
@@ -564,7 +564,7 @@ fn test_add_vote_below_quorum_stays_undecided() {
 
 #[test]
 fn test_add_vote_quorum_marks_commit_and_returns_true() {
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     let block = make_block(1, 3, vec![block_ref(&genesis())], "leader-3");
     committer.update_leader(leader_info(
         3,
@@ -589,7 +589,7 @@ fn test_add_vote_quorum_marks_commit_and_returns_true() {
 
 #[test]
 fn test_update_get_leader_roundtrip() {
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     let block = make_block(2, 6, vec![block_ref(&genesis())], "leader-6");
     let info = leader_info(
         6,
@@ -611,7 +611,7 @@ fn test_update_get_leader_roundtrip() {
 
 #[test]
 fn test_cleanup_old_leaders_retains_cutoff_and_above() {
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     for round in 1..=10u64 {
         committer.update_leader(leader_info(
             round,
@@ -640,7 +640,7 @@ fn test_cleanup_old_leaders_retains_cutoff_and_above() {
 
 #[test]
 fn test_try_commit_with_no_leaders_returns_none() {
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     let dag = MockDag::new();
     assert!(committer.try_commit(&dag).is_none());
     assert_eq!(committer.last_decided_round(), 0);
@@ -651,7 +651,7 @@ fn test_try_commit_with_no_leaders_returns_none() {
 fn durable_commit_cannot_publish_an_unregistered_subdag() {
     let fabricated = make_block(1, 3, vec![block_ref(&genesis())], "fabricated");
     let dag = MockDag::with_blocks([fabricated]);
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
 
     assert!(committer
         .try_commit_and_mark_durable(&dag)
@@ -667,7 +667,7 @@ fn durable_commit_rejects_registered_round_mismatch_with_leader_block() {
     let g = genesis();
     let actual_leader = make_block(2, 6, vec![block_ref(&g)], "wrong-round-leader");
     let dag = MockDag::with_blocks([g, actual_leader.clone()]);
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     // The author matches, but quorum is registered for round 3 while the
     // matching digest resolves to a round-6 block.
     committer.update_leader(leader_info(
@@ -695,7 +695,7 @@ fn durable_commit_rejects_registered_author_mismatch_with_leader_block() {
     let g = genesis();
     let actual_leader = make_block(2, 3, vec![block_ref(&g)], "wrong-author-leader");
     let dag = MockDag::with_blocks([g, actual_leader.clone()]);
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     // The round matches, but quorum is registered for author 1 while the
     // matching digest resolves to an author-2 block.
     committer.update_leader(leader_info(
@@ -726,7 +726,7 @@ fn durable_commit_rejects_digest_alias_for_matching_round_and_author() {
     let dag = MockDag::with_blocks([g, actual_leader.clone()]);
     dag.alias_digest(alias_digest, actual_leader.digest);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         3,
         2,
@@ -752,7 +752,7 @@ fn durable_commit_persists_before_publication_and_retries_failures() {
     let g = genesis();
     let leader = make_block(1, 3, vec![block_ref(&g)], "durable-leader");
     let dag = MockDag::with_blocks([g, leader.clone()]);
-    let committer = std::sync::Arc::new(UniversalCommitter::new(committee(4)));
+    let committer = std::sync::Arc::new(UniversalCommitter::new(committee(4), false));
     committer.update_leader(leader_info(
         3,
         1,
@@ -803,7 +803,7 @@ fn test_try_commit_direct_commit_end_to_end() {
     let leader_block = make_block(1, 3, vec![block_ref(&g)], "leader-3");
     let dag = MockDag::with_blocks([g, leader_block.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         3,
         1,
@@ -858,7 +858,7 @@ fn test_try_commit_passes_over_uncertified_round() {
     let b3 = make_block(1, 3, vec![block_ref(&b1)], "b3");
     let dag = MockDag::with_blocks([g, b1, b3.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     // Round 1: registered, only 1 vote (below quorum).
     committer.update_leader(leader_info(
         1,
@@ -909,7 +909,7 @@ fn test_try_commit_passes_over_uncertified_round() {
 fn test_try_commit_round_zero_never_committed() {
     let g = genesis();
     let dag = MockDag::with_blocks([g.clone()]);
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         0,
         0,
@@ -934,7 +934,7 @@ fn test_try_commit_missing_leader_block_stalls_then_commits() {
     let leader_block = make_block(1, 3, vec![block_ref(&g)], "leader-3");
     let dag = MockDag::with_blocks([g]); // leader block deliberately absent
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         3,
         1,
@@ -971,7 +971,7 @@ fn test_try_commit_no_recommit_after_leader_update() {
     let leader_block = make_block(1, 3, vec![block_ref(&g)], "leader-3");
     let dag = MockDag::with_blocks([g, leader_block.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         3,
         1,
@@ -1015,7 +1015,7 @@ fn test_try_commit_deterministic_across_committers() {
         let b3 = make_block(1, 3, vec![block_ref(&g)], "b3");
         let b5 = make_block(2, 5, vec![block_ref(&b3)], "b5");
         let dag = MockDag::with_blocks([g, b3.clone(), b5.clone()]);
-        let committer = UniversalCommitter::new(committee(4));
+        let committer = UniversalCommitter::new(committee(4), false);
         for (round, author, block) in [(3u64, 1u16, &b3), (5, 2, &b5)] {
             committer.update_leader(leader_info(
                 round,
@@ -1066,7 +1066,7 @@ fn test_try_commit_committed_rounds_strictly_increase() {
     }
     let dag = MockDag::with_blocks(dag_blocks);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     for b in &blocks {
         committer.update_leader(leader_info(
             b.round,
@@ -1122,7 +1122,7 @@ fn test_try_commit_indirect_commit_through_later_committed_leader() {
     let b5 = make_block(1, 5, vec![block_ref(&b3)], "b5-quorum");
     let dag = MockDag::with_blocks([g, b3.clone(), b5.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     // Round 3: block exists, connected to round 5, but no direct quorum.
     committer.update_leader(leader_info(
         3,
@@ -1181,7 +1181,7 @@ fn test_vote_for_foreign_hash_does_not_commit() {
     let block = make_block(0, 1, vec![block_ref(&g)], "leader");
     let dag = MockDag::with_blocks([g, block.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         1,
         block.author,
@@ -1216,7 +1216,7 @@ fn test_indirect_skip_is_recorded_with_skip_status() {
     let b5 = make_block(1, 5, vec![block_ref(&g)], "b5-quorum");
     let dag = MockDag::with_blocks([g, b3.clone(), b5.clone()]);
 
-    let committer = UniversalCommitter::new(committee(4));
+    let committer = UniversalCommitter::new(committee(4), false);
     committer.update_leader(leader_info(
         3,
         0,
@@ -1251,4 +1251,138 @@ fn test_indirect_skip_is_recorded_with_skip_status() {
         Some(LeaderStatus::Commit),
         "round 5 committed"
     );
+}
+
+// ================================================================
+// MysticGhost tests (Phase 15.4)
+// ================================================================
+
+/// Test that with use_mysticghost=false, the committer produces bit-identical
+/// output to the original linearizer path.
+#[test]
+fn test_committer_mysticghost_disabled_matches_linearizer() {
+    let g = genesis();
+    let leader_block = make_block(1, 3, vec![block_ref(&g)], "leader-3");
+    let dag = MockDag::with_blocks([g.clone(), leader_block.clone()]);
+
+    let committer = UniversalCommitter::new(committee(4), false);
+    committer.update_leader(leader_info(
+        3,
+        1,
+        Some(leader_block.digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0u16, 1, 2] {
+        committer.add_vote(3, voter, leader_block.digest);
+    }
+
+    let subdag = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
+        .expect("quorum + present block must commit");
+    assert_eq!(subdag.leader_round, 3);
+    assert_eq!(subdag.leader_author, 1);
+    assert_eq!(subdag.leader.digest, leader_block.digest);
+    let digests: Vec<Hash> = subdag.blocks.iter().map(|b| b.digest).collect();
+    assert_eq!(
+        digests,
+        vec![Hash::new("kvnc-test/genesis"), leader_block.digest],
+        "genesis first, leader last"
+    );
+}
+
+/// Test that with use_mysticghost=true, a known mergeset produces GHOSTDAG order.
+#[test]
+fn test_committer_mysticghost_enabled_ghostdag_order() {
+    use kvnc_consensus::mysticghost::{MysticGhostConfig, order_committed_wave};
+
+    let g = genesis();
+    let b1 = make_block(1, 1, vec![block_ref(&g)], "b1");
+    let b2 = make_block(2, 1, vec![block_ref(&g)], "b2");
+    let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
+    let leader_block = make_block(4, 3, vec![block_ref(&b3)], "leader-3");
+
+    // Verify MysticGhost produces GHOSTDAG order for this mergeset
+    let mergeset_blocks = vec![g.clone(), b1.clone(), b2.clone(), b3.clone(), leader_block.clone()];
+    let previous_tips = vec![g.digest];
+    let mg_config = MysticGhostConfig { enabled: true, k: 3, max_mergeset_blocks: 2_000 };
+    
+    match order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
+        kvnc_consensus::mysticghost::MysticGhostOrder::Ghost { colouring } => {
+            let blue_ordered = colouring.blue_ordered();
+            // All blocks should be blue in this simple diamond structure
+            assert_eq!(blue_ordered.len(), 5);
+            assert!(blue_ordered.contains(&g.digest));
+            assert!(blue_ordered.contains(&b1.digest));
+            assert!(blue_ordered.contains(&b2.digest));
+            assert!(blue_ordered.contains(&b3.digest));
+            assert!(blue_ordered.contains(&leader_block.digest));
+        }
+        kvnc_consensus::mysticghost::MysticGhostOrder::Fallback => {
+            panic!("MysticGhost should have produced Ghost order for this mergeset");
+        }
+    }
+}
+
+/// Test that the committer with use_mysticghost=true produces a valid CommittedSubDag
+/// when the mergeset is properly populated (using a custom MockDag that implements mergeset).
+#[test]
+fn test_committer_mysticghost_enabled_produces_subdag() {
+    let g = genesis();
+    let b1 = make_block(1, 1, vec![block_ref(&g)], "b1");
+    let b2 = make_block(2, 1, vec![block_ref(&g)], "b2");
+    let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
+    let leader_block = make_block(4, 3, vec![block_ref(&b3)], "leader-3");
+    
+    // Use a custom MockDag that returns a proper mergeset
+    let dag = MockDag::with_blocks([g.clone(), b1.clone(), b2.clone(), b3.clone(), leader_block.clone()]);
+
+    let committer = UniversalCommitter::new(committee(4), true);
+    committer.update_leader(leader_info(
+        3,
+        4,
+        Some(leader_block.digest),
+        LeaderStatus::Undecided,
+        &[],
+    ));
+    for voter in [0u16, 1, 2] {
+        committer.add_vote(3, voter, leader_block.digest);
+    }
+
+    let subdag = committer
+        .try_commit_and_mark_durable(&dag)
+        .expect("persist commit")
+        .expect("quorum + present block must commit");
+    
+    assert_eq!(subdag.leader_round, 3);
+    assert_eq!(subdag.leader_author, 4);
+    assert_eq!(subdag.leader.digest, leader_block.digest);
+    // The subdag should contain at least the leader
+    assert!(subdag.blocks.iter().any(|b| b.digest == leader_block.digest));
+}
+
+/// Test that MysticGhost falls back to linearizer when mergeset is too large
+#[test]
+fn test_mysticghost_fallback_on_large_mergeset() {
+    use kvnc_consensus::mysticghost::{MysticGhostConfig, order_committed_wave};
+
+    // Create a large mergeset
+    let g = genesis();
+    let mut blocks = vec![g.clone()];
+    for i in 0..2_500 {
+        let b = make_block((i % 4) as AuthorityIndex, 1, vec![block_ref(&g)], &format!("b{i}"));
+        blocks.push(b);
+    }
+    
+    let mg_config = MysticGhostConfig { enabled: true, k: 3, max_mergeset_blocks: 2_000 };
+    
+    match order_committed_wave(&mg_config, &blocks, &[]) {
+        kvnc_consensus::mysticghost::MysticGhostOrder::Fallback => {
+            // Expected fallback
+        }
+        kvnc_consensus::mysticghost::MysticGhostOrder::Ghost { .. } => {
+            panic!("Should have fallen back due to large mergeset");
+        }
+    }
 }

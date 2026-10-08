@@ -6,14 +6,44 @@
 
 use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, is_leader_round, linearizer::Linearizer};
-use kvnc_types::{hash::Hash, AuthorityIndex, Round, Stake};
+use kvnc_crypto::sign;
+use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, Round, Stake};
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+
+/// Trait for broadcasting blocks to the network.
+pub trait BlockBroadcaster: Send + Sync {
+    fn broadcast_block(&self, block: &StatementBlock);
+}
+
+impl<F> BlockBroadcaster for F
+where
+    F: Fn(&StatementBlock) + Send + Sync,
+{
+    fn broadcast_block(&self, block: &StatementBlock) {
+        self(block)
+    }
+}
+
+/// Trait for broadcasting votes to the network.
+pub trait VoteBroadcaster: Send + Sync {
+    fn broadcast_vote(&self, vote: &kvnc_types::Vote);
+}
+
+impl<F> VoteBroadcaster for F
+where
+    F: Fn(&kvnc_types::Vote) + Send + Sync,
+    {
+        fn broadcast_vote(&self, vote: &kvnc_types::Vote) {
+            self(vote)
+        }
+    }
 
 /// Trait for DAG store operations needed by consensus.
 pub trait DagStoreTrait: Send + Sync {
@@ -55,6 +85,14 @@ pub trait DagStoreTrait: Send + Sync {
         round: kvnc_types::Round,
         leader_hash: &Hash,
     ) -> Result<(), kvnc_dag::DagStoreError>;
+    /// Get the mergeset for a leader block (blocks reachable from leader not in previous sub-DAGs).
+    fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
+    /// Get multiple blocks by their hashes.
+    fn get_blocks(&self, hashes: &[Hash]) -> Result<Vec<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
+    /// Get decided leader hashes for a round.
+    fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
+    /// Get all decided rounds up to a maximum.
+    fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, kvnc_dag::DagStoreError>;
 }
 
 /// Trait for block manager operations needed by consensus.
@@ -131,6 +169,8 @@ where
     leader_schedule: RwLock<HashMap<Round, kvnc_types::AuthorityIndex>>,
     running: RwLock<bool>,
     commit_sender: RwLock<Option<mpsc::UnboundedSender<kvnc_types::CommittedSubDag>>>,
+    block_broadcaster: RwLock<Option<Arc<dyn BlockBroadcaster>>>,
+    vote_broadcaster: RwLock<Option<Arc<dyn VoteBroadcaster>>>,
     /// Serializes decision construction, durable marking, state publication,
     /// and execution delivery across all commit triggers.
     commit_trigger_lock: Mutex<()>,
@@ -152,7 +192,7 @@ where
         let our_authority = block_manager.read().our_authority();
         let our_stake = committee.stake_of(our_authority).unwrap_or(0);
 
-        let committer = UniversalCommitter::new(committee.clone());
+        let committer = UniversalCommitter::new(committee.clone(), config.use_mysticghost);
         let linearizer = Linearizer::new();
 
         let mut leader_schedule = HashMap::new();
@@ -181,8 +221,20 @@ where
             leader_schedule: RwLock::new(leader_schedule),
             running: RwLock::new(false),
             commit_sender: RwLock::new(None),
+            block_broadcaster: RwLock::new(None),
+            vote_broadcaster: RwLock::new(None),
             commit_trigger_lock: Mutex::new(()),
         }
+    }
+
+    /// Set the block broadcaster for gossiping proposed blocks.
+    pub fn set_block_broadcaster(&self, broadcaster: Arc<dyn BlockBroadcaster>) {
+        *self.block_broadcaster.write() = Some(broadcaster);
+    }
+
+    /// Set the vote broadcaster for gossiping votes.
+    pub fn set_vote_broadcaster(&self, broadcaster: Arc<dyn VoteBroadcaster>) {
+        *self.vote_broadcaster.write() = Some(broadcaster);
     }
 
     /// Deliver durable committed sub-DAGs to the execution pipeline.
@@ -239,6 +291,11 @@ where
                 self.propose_block(next_round).await?;
             }
 
+            // If this is a vote round, produce a vote for the previous leader round
+            if crate::is_vote_round(next_round) {
+                self.produce_vote(next_round).await?;
+            }
+
             // Clean up old rounds
             self.cleanup_old_rounds(next_round);
         }
@@ -286,6 +343,12 @@ where
                 self.state.write().proposed = true;
 
                 info!("Proposed block {} at round {}", block.digest, round);
+
+                // Broadcast the block to the network
+                if let Some(broadcaster) = self.block_broadcaster.read().as_ref() {
+                    broadcaster.broadcast_block(&block);
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -293,6 +356,68 @@ where
                 Err(ConsensusError::BlockProposal(e.to_string()))
             }
         }
+    }
+
+    /// Produce a vote for the leader of the previous leader round.
+    /// Called during vote rounds (offset 1).
+    async fn produce_vote(&self, vote_round: Round) -> Result<(), ConsensusError> {
+        // The leader round is the previous leader round (vote_round - 1)
+        let leader_round = vote_round - 1;
+        
+        // Get the leader for that round
+        let Some(leader_author) = self.scheduled_leader_for_round(leader_round) else {
+            debug!("No leader scheduled for round {}", leader_round);
+            return Ok(());
+        };
+
+        // Get the leader block hash from the committer
+        let Some(leader_info) = self.committer.get_leader(leader_round) else {
+            debug!("No leader info for round {}", leader_round);
+            return Ok(());
+        };
+
+        let Some(leader_hash) = leader_info.block_hash else {
+            debug!("Leader block for round {} not yet known", leader_round);
+            return Ok(());
+        };
+
+        // Check if we already voted for this leader
+        if leader_info.votes.contains_key(&self.state.read().our_authority) {
+            debug!("Already voted for leader round {}", leader_round);
+            return Ok(());
+        }
+
+        // Create and sign the vote
+        let our_authority = self.state.read().our_authority;
+        let mut vote = kvnc_types::Vote {
+            leader_round,
+            leader_hash,
+            voter: our_authority,
+            signature: kvnc_types::Signature([0u8; 64]),
+        };
+        vote.signature = sign(&self.signing_key, &vote.signature_data());
+
+        // Record the vote locally
+        self.committer.add_vote(leader_round, our_authority, leader_hash);
+
+        // Broadcast the vote
+        if let Some(broadcaster) = self.vote_broadcaster.read().as_ref() {
+            broadcaster.broadcast_vote(&vote);
+            info!("Broadcast vote for leader round {} (hash: {})", leader_round, leader_hash);
+        }
+
+        // Try to commit after voting
+        self.try_commit_and_deliver()?;
+
+        Ok(())
+    }
+
+    /// Helper to create the data signed for a vote.
+    fn vote_signature_data(leader_round: Round, leader_hash: Hash) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&leader_round.to_le_bytes());
+        data.extend_from_slice(&leader_hash.0);
+        data
     }
 
     /// Process a received block from another validator.
@@ -549,6 +674,44 @@ mod tests {
                 decisions.push((round, *leader_hash));
             }
             Ok(())
+        }
+
+        fn mergeset(&self, _leader: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
+            Ok(Vec::new())
+        }
+
+        fn get_blocks(
+            &self,
+            hashes: &[Hash],
+        ) -> Result<Vec<kvnc_types::StatementBlock>, kvnc_dag::DagStoreError> {
+            let blocks = self.blocks.read();
+            Ok(hashes.iter().filter_map(|h| blocks.get(h).cloned()).collect())
+        }
+
+        fn get_decided_leaders(
+            &self,
+            round: Round,
+        ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
+            Ok(self
+                .decisions
+                .lock()
+                .iter()
+                .filter(|(r, _)| *r == round)
+                .map(|(_, h)| *h)
+                .collect())
+        }
+
+        fn get_decided_rounds(
+            &self,
+            max_round: Round,
+        ) -> Result<Vec<Round>, kvnc_dag::DagStoreError> {
+            Ok(self
+                .decisions
+                .lock()
+                .iter()
+                .filter(|(r, _)| *r <= max_round)
+                .map(|(r, _)| *r)
+                .collect())
         }
     }
 
@@ -821,5 +984,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 6]
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_block_rejected_by_network_pipeline() {
+        // This test simulates the network→engine→block_manager pipeline
+        // receiving an invalid block (bad signature) and rejecting it.
+        let (engine, dag, key) = test_engine(100);
+        let engine = Arc::new(engine);
+
+        // Create a valid block first (genesis is already in TestDag via propose_block)
+        let valid_digest = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[]);
+        let valid_block = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, valid_digest.as_ref()),
+            digest: valid_digest,
+        };
+
+        // Process valid block - should succeed
+        engine.process_block(&valid_block).unwrap();
+        assert!(dag.has_block(&valid_digest).unwrap());
+
+        // Create an invalid block (wrong signature)
+        let invalid_digest = kvnc_types::StatementBlock::compute_digest(0, 4, &[], &[]);
+        let (_, wrong_pk) = kvnc_crypto::generate_keypair();
+        let wrong_key = kvnc_types::SigningKey::from_bytes(&wrong_pk.0);
+        let invalid_block = kvnc_types::StatementBlock {
+            author: 0,
+            round: 4,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&wrong_key, invalid_digest.as_ref()),
+            digest: invalid_digest,
+        };
+
+        // Process invalid block - should fail validation
+        let result = engine.process_block(&invalid_block);
+        assert!(result.is_err(), "Invalid block should be rejected");
+
+        // Block should not be stored
+        assert!(!dag.has_block(&invalid_digest).unwrap());
+
+        // Create block with unknown author - should fail
+        let unknown_digest = kvnc_types::StatementBlock::compute_digest(99, 5, &[], &[]);
+        let unknown_block = kvnc_types::StatementBlock {
+            author: 99, // not in committee
+            round: 5,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_types::Signature([0; 64]),
+            digest: unknown_digest,
+        };
+
+        let result = engine.process_block(&unknown_block);
+        assert!(result.is_err(), "Block from unknown author should be rejected");
+        assert!(!dag.has_block(&unknown_digest).unwrap());
+
+        // Create block with bad digest - should fail
+        let mut bad_digest_block = valid_block.clone();
+        bad_digest_block.round = 6;
+        bad_digest_block.digest = kvnc_types::Hash::zero();
+
+        let result = engine.process_block(&bad_digest_block);
+        assert!(result.is_err(), "Block with mismatched digest should be rejected");
     }
 }

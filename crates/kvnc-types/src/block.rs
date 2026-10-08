@@ -18,7 +18,7 @@ pub struct BlockReference {
 }
 
 /// Full block as used in the DAG (Mysticeti-style StatementBlock).
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub struct StatementBlock {
     /// Author of this block.
     pub author: AuthorityIndex,

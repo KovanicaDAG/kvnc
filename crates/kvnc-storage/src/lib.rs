@@ -30,6 +30,7 @@ pub mod state_store;
 pub use block_store::{BlockStore, BlockStoreError};
 pub use consensus_store::{ConsensusStore, ConsensusStoreError};
 pub use state_store::{StateStore, StateStoreError};
+pub use tables::{ACCOUNTS, CONTRACT_CODE, CONTRACT_STORAGE, STAKING_STATE, STATE_ROOT};
 
 /// Main storage handle combining all stores.
 pub struct Storage {
@@ -122,7 +123,7 @@ pub enum StorageError {
 }
 
 /// Table definitions for redb.
-mod tables {
+pub mod tables {
     use super::*;
     use kvnc_types::block::StatementBlock;
     use kvnc_types::hash::Hash;
@@ -185,7 +186,7 @@ fn hash_to_bytes(hash: &Hash) -> [u8; 32] {
 }
 
 /// Serialize an Address to bytes for table keys.
-fn address_to_bytes(addr: &Address) -> [u8; 32] {
+pub fn address_to_bytes(addr: &Address) -> [u8; 32] {
     addr.0
 }
 

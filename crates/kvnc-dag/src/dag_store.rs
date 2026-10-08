@@ -51,6 +51,19 @@ impl DagStore {
         Ok(self.storage.consensus().get_dag_block(&txn, hash)?)
     }
 
+    /// Get multiple blocks by their hashes.
+    /// Returns only the blocks that are found (missing blocks are silently skipped).
+    pub fn get_blocks(&self, hashes: &[Hash]) -> Result<Vec<StatementBlock>, DagStoreError> {
+        let txn = self.storage.begin_read()?;
+        let mut blocks = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Ok(block) = self.storage.consensus().get_dag_block(&txn, hash) {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
+    }
+
     /// Check if a block exists.
     pub fn has_block(&self, hash: &Hash) -> Result<bool, DagStoreError> {
         let txn = self.storage.begin_read()?;

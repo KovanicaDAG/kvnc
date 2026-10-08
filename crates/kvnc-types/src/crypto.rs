@@ -83,3 +83,20 @@ impl From<DalekSignature> for Signature {
         Self(sig.to_bytes())
     }
 }
+
+impl Signature {
+    /// Verify this signature over the given message using the provided public key.
+    pub fn verify(&self, message: &[u8], public_key: &PublicKey) -> bool {
+        use ed25519_dalek::{Signature as DalekSignature, Verifier, VerifyingKey};
+        // Convert our signature to dalek's Signature type
+        let dalek_sig = match DalekSignature::try_from(self.0.as_slice()) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+        let dalek_pk = match VerifyingKey::from_bytes(&public_key.0) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        };
+        dalek_pk.verify(message, &dalek_sig).is_ok()
+    }
+}

@@ -60,16 +60,16 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 3: DAG Layer (kvnc-dag)
 
-### [ ] 3.1 DagStore
-- [ ] **Block ingestion**: Validate parents exist, verify signatures, check round
-- [ ] **Causal ordering**: Topological sort, ancestor/descendant queries
-- [ ] **Parent selection**: Algorithm for choosing 2f+1 parents from previous round
-- [x] **Garbage collection**: Prune blocks before last committed leader (configurable)
+### [x] 3.1 DagStore
+- [x] **Block ingestion**: Validate parents exist, verify signatures, check round — validation wired in hot path (block_manager.rs, service.rs, main.rs)
+- [x] **Causal ordering**: Topological sort, ancestor/descendant queries — `get_ancestors` BFS, `get_parents` added
+- [x] **Parent selection**: Algorithm for choosing parents from previous round — stake-filtered, committee-aware `select_parents()`
+- [x] **Garbage collection**: Prune blocks before last committed leader (configurable) — `prune_below` implemented, wired
 
-### [ ] 3.2 Block Manager
+### [x] 3.2 Block Manager
 - [x] **Propose block**: Build `StatementBlock` with transactions from mempool
-- [ ] **Validate block**: Check parents, signature, round, transactions valid
-- [ ] **Block broadcast**: Gossip new blocks to peers
+- [x] **Validate block**: Check parents, signature, round, transactions valid — signature verification, round-0 fix, tx validation wired
+- [x] **Block broadcast**: Gossip new blocks to peers — `BlockBroadcaster` trait + network wiring
 
 ---
 
@@ -132,10 +132,10 @@ This task list tracks all remaining work to build a functional KVNC blockchain n
 
 ## Phase 7: Execution & Runtime (kvnc-execution, kvnc-runtime)
 
-### [ ] 7.1 Native Transaction Execution
+### [x] 7.1 Native Transaction Execution
 - [x] **Transfer**: Debit sender, credit recipient, increment nonce (via ContractHost)
-- [ ] **Stake/Unstake**: Update `StakingState`, handle unbonding queue
-- [ ] **Deploy**: Store WASM code, assign contract address
+- [x] **Stake/Unstake**: Update `StakingState`, handle unbonding queue
+- [x] **Deploy**: Store WASM code, assign contract address
 - [x] **Call**: Execute WASM with gas metering, handle host calls (wasmi e2e proven)
 
 ### [x] 7.2 WASM Runtime (kvnc-runtime)
@@ -351,10 +351,10 @@ Source: `zips/mysticghost-kvnc-integration-5.zip` (studied 2026-10-07). MysticGh
 - [x] Blue-set conflict-free unit tests + selected-parent ordering tests (9 tests in crates/kvnc-consensus/tests/ghostdag_scoped.rs)
 - [x] Compare against a known GHOSTDAG reference on fixtures
 
-### [ ] 15.4 Committer integration (behind flag)
-- [ ] Hook in `build_committed_subdag` (committer.rs:376-398): flag off → bit-identical linearizer path; flag on → blue-set order
-- [ ] Same ordering on restart replay: `recover_committed_subdags` (main.rs:637-656) must use the identical path
-- [ ] Existing consensus tests pass with flag false; new tests pass with flag true
+### [x] 15.4 Committer integration (behind flag) — fix-30
+- [x] Hook in `build_committed_subdag` (committer.rs:376-398): flag off → bit-identical linearizer path; flag on → blue-set order
+- [x] Same ordering on restart replay: `recover_committed_subdags` (main.rs:637-656) must use the identical path
+- [x] Existing consensus tests pass with flag false; new tests pass with flag true (4 new tests in committer.rs)
 
 ### [ ] 15.5 Resource hardening
 - [ ] Prune non-blue blocks of committed waves; `prune_window_waves` (default 100)

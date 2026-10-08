@@ -29,7 +29,7 @@
 
 | Property | Value |
 |----------|-------|
-| **Consensus** | Mysticeti-style uncertified DAG (wave length 3) |
+| **Consensus** | Mysticeti-style uncertified DAG (wave length 3) + **MysticGhost: scoped GHOSTDAG k=3 (optional)** |
 | **Smart Contracts** | Wasmi (deterministic WASM interpreter) |
 | **Native Token** | KVNC (9 decimals) |
 | **Active Validators** | 15–21 (configurable) |
@@ -455,6 +455,37 @@ Each wave consists of 3 rounds:
 - **Target**: 15–21 active validators
 - **Stake-weighted**: Selection proportional to stake
 - **Committee rotation**: At epoch boundaries (configurable)
+
+### MysticGhost — Scoped GHOSTDAG k=3 (Optional)
+
+**MysticGhost** is an optional consensus enhancement that adds **scoped GHOSTDAG k=3 colouring** over the mergeset of a newly committed leader block. It can be enabled via the `use_mysticghost` configuration flag (default: `false`).
+
+When enabled:
+1. When a leader becomes committed (direct or indirect), its **mergeset** is computed — all blocks reachable from the leader that are not yet part of any previous `CommittedSubDag`.
+2. **GHOSTDAG k=3** colouring runs on the induced subgraph of the mergeset ∪ previous committed tips.
+3. The **blue-set** of the colouring, ordered by the selected-parent relation, becomes the canonical total order inside the new `CommittedSubDag`.
+4. Pure Mysticeti behaviour (original linearizer) is preserved when disabled — bit-identical ordering.
+
+**Resource budget** (enforced):
+- Full node RSS target: < 3 GB (21 validators, moderate load)
+- Mergeset size hard cap: 2,000 blocks (configurable via `max_mergeset_blocks`)
+- Aggressive pruning: non-blue blocks discarded after commit; waves older than `prune_window_waves=100` removed
+
+**Configuration** (`config.toml`):
+```toml
+[consensus]
+use_mysticghost = true
+ghostdag_k = 3
+prune_window_waves = 100
+max_mergeset_blocks = 2000
+```
+
+**Environment variable override**:
+```bash
+export KVNC_MYSTICGHOST=1
+```
+
+**Safety**: Pure Mysticeti remains the default. The feature flag ensures zero behaviour change when disabled. All existing consensus tests pass with `use_mysticghost = false`.
 
 ---
 

@@ -20,7 +20,8 @@ pub mod mysticghost;
 pub mod types;
 
 pub use committer::{BaseCommitter, UniversalCommitter};
-pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState};
+pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState, BlockBroadcaster, VoteBroadcaster};
+pub use kvnc_types::Vote;
 pub use linearizer::Linearizer;
 pub use types::{
     AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo,
@@ -45,4 +46,10 @@ pub fn offset_in_wave(round: Round) -> u64 {
 #[inline]
 pub fn is_leader_round(round: Round) -> bool {
     offset_in_wave(round) == 0
+}
+
+/// True if this round is a vote round.
+#[inline]
+pub fn is_vote_round(round: Round) -> bool {
+    offset_in_wave(round) == 1
 }

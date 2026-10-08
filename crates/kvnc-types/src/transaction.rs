@@ -6,7 +6,7 @@ use crate::hash::Hash;
 use serde::{Deserialize, Serialize};
 
 /// Kind of native transaction.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TransactionKind {
     /// Simple transfer of KVNC.
     Transfer {
@@ -45,7 +45,7 @@ pub enum TransactionKind {
 }
 
 /// Full signed transaction.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Transaction {
     /// Sender address.
     pub sender: Address,
@@ -65,5 +65,51 @@ impl Transaction {
     /// Return the cached transaction hash.
     pub fn hash(&self) -> Hash {
         self.hash
+    }
+
+    /// Compute the signing hash for this transaction (excluding signature).
+    pub fn signing_hash(&self) -> Hash {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.sender.0);
+        data.extend_from_slice(&self.nonce.to_le_bytes());
+        // Serialize kind
+        match &self.kind {
+            TransactionKind::Transfer { to, amount } => {
+                data.push(0);
+                data.extend_from_slice(&to.0);
+                data.extend_from_slice(&amount.to_le_bytes());
+            }
+            TransactionKind::Stake { amount } => {
+                data.push(1);
+                data.extend_from_slice(&amount.to_le_bytes());
+            }
+            TransactionKind::Unstake { amount } => {
+                data.push(2);
+                data.extend_from_slice(&amount.to_le_bytes());
+            }
+            TransactionKind::Deploy { code } => {
+                data.push(3);
+                data.extend_from_slice(&(code.len() as u64).to_le_bytes());
+                data.extend_from_slice(code);
+            }
+            TransactionKind::Call { contract, method, args, gas_limit } => {
+                data.push(4);
+                data.extend_from_slice(&contract.0);
+                data.extend_from_slice(&(method.len() as u64).to_le_bytes());
+                data.extend_from_slice(method.as_bytes());
+                data.extend_from_slice(&(args.len() as u64).to_le_bytes());
+                data.extend_from_slice(args);
+                data.extend_from_slice(&gas_limit.to_le_bytes());
+            }
+        }
+        data.extend_from_slice(&self.fee.to_le_bytes());
+        Hash::new(&data)
+    }
+
+    /// Verify the transaction signature against the sender's public key.
+    pub fn verify_signature(&self) -> bool {
+        // The sender address is the public key (32 bytes)
+        let public_key = crate::crypto::PublicKey(self.sender.0);
+        self.signature.verify(&self.signing_hash().0, &public_key)
     }
 }
