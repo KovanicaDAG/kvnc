@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use kvnc_consensus::CommitteeInfo;
+use kvnc_consensus::{CommitteeInfo, metrics::metrics_text};
 use kvnc_mempool::Mempool;
 use kvnc_staking::StakingState;
 use kvnc_storage::Storage;
@@ -247,6 +247,7 @@ impl RpcServer {
             .route("/rpc", post(rpc_handler))
             .route("/ws", get(ws_handler))
             .route("/health", get(health_check))
+            .route("/metrics", get(metrics_handler))
             .layer(Extension(self.methods))
             .layer(Extension(self.state.peer_count.clone()))
             .layer(Extension(self.state.clone()));
@@ -324,6 +325,11 @@ async fn health_check(Extension(peer_count): Extension<Arc<AtomicUsize>>) -> Jso
         status: "ok",
         peer_count: peer_count.load(Ordering::Relaxed),
     })
+}
+
+/// Prometheus /metrics endpoint (text format).
+async fn metrics_handler() -> (StatusCode, String) {
+    (StatusCode::OK, metrics_text())
 }
 
 fn build_success_response(id: Option<Value>, result: Value) -> Response {
