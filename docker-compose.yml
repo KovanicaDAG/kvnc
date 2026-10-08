@@ -1,16 +1,7 @@
-# Local KVNC devnet: four independent nodes on one user-defined network.
-#
-#   docker compose up --build
-#
-#  - each node has its own data volume, RPC port and validator seed
-#  - node1 is the long-lived boot peer; node2..node4 dial it
-#  - only node1's RPC is published (loopback)
-#
-# Every node writes genesis into its own data volume on a fresh start, so no
-# genesis file is required. This is a devnet, not an attack surface: keep the
-# ports bound to loopback and do not point peers at it.
-
-name: kvnc-devnet
+# Phase 16.6 — Real 4-Node Quorum (2f+1 = 3 with 4 nodes)
+# Each node runs as validator with its own key and data volume.
+# Keys generated offline (ops/docker/validators/generate.sh); NOT committed.
+name: kvnc-quorum-4
 
 x-node: &node
   image: kvnc-node:local
@@ -22,9 +13,10 @@ x-node: &node
     KVNC_DATA_DIR: "/var/lib/kvnc"
     KVNC_MAX_PEERS: "8"
     KVNC_ROUND_DURATION_MS: "1000"
+    KVNC_RUN_VALIDATOR: "true"
     RUST_LOG: "info"
-  # No config file is mounted: the KVNC_* variables above are the configuration.
-  command: ["--config", "config.toml"]
+  # No config file: pure env + genesis file copied to data dir at start.
+  # Each service mounts its own validator keystore + genesis_validators.toml.
 
 x-healthcheck: &healthcheck
   interval: 10s
@@ -33,10 +25,9 @@ x-healthcheck: &healthcheck
   start_period: 20s
 
 services:
-  # Boot peer / the one node with a published RPC port.
   node1:
     <<: *node
-    container_name: kvnc-node1
+    container_name: kvnc-quorum-node1
     build:
       context: .
       dockerfile: Dockerfile
@@ -44,17 +35,20 @@ services:
       <<: *node-env
       KVNC_RPC_PORT: "8545"
       KVNC_BOOTNODES: "node2:9000,node3:9000,node4:9000"
+      KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     ports:
       - "127.0.0.1:8545:8545"
     volumes:
       - node1-data:/var/lib/kvnc
+      - ./ops/docker/validators/val1.pem:/var/lib/kvnc/validator.pem:ro
+      - ./ops/docker/validators/genesis_validators.toml:/var/lib/kvnc/genesis_validators.toml:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8545/health"]
 
   node2:
     <<: *node
-    container_name: kvnc-node2
+    container_name: kvnc-quorum-node2
     depends_on:
       node1:
         condition: service_healthy
@@ -62,15 +56,18 @@ services:
       <<: *node-env
       KVNC_RPC_PORT: "8546"
       KVNC_BOOTNODES: "node1:9000,node3:9000,node4:9000"
+      KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     volumes:
       - node2-data:/var/lib/kvnc
+      - ./ops/docker/validators/val2.pem:/var/lib/kvnc/validator.pem:ro
+      - ./ops/docker/validators/genesis_validators.toml:/var/lib/kvnc/genesis_validators.toml:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8546/health"]
 
   node3:
     <<: *node
-    container_name: kvnc-node3
+    container_name: kvnc-quorum-node3
     depends_on:
       node1:
         condition: service_healthy
@@ -78,15 +75,18 @@ services:
       <<: *node-env
       KVNC_RPC_PORT: "8547"
       KVNC_BOOTNODES: "node1:9000,node2:9000,node4:9000"
+      KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     volumes:
       - node3-data:/var/lib/kvnc
+      - ./ops/docker/validators/val3.pem:/var/lib/kvnc/validator.pem:ro
+      - ./ops/docker/validators/genesis_validators.toml:/var/lib/kvnc/genesis_validators.toml:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8547/health"]
 
   node4:
     <<: *node
-    container_name: kvnc-node4
+    container_name: kvnc-quorum-node4
     depends_on:
       node1:
         condition: service_healthy
@@ -94,8 +94,11 @@ services:
       <<: *node-env
       KVNC_RPC_PORT: "8548"
       KVNC_BOOTNODES: "node1:9000,node2:9000,node3:9000"
+      KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     volumes:
       - node4-data:/var/lib/kvnc
+      - ./ops/docker/validators/val4.pem:/var/lib/kvnc/validator.pem:ro
+      - ./ops/docker/validators/genesis_validators.toml:/var/lib/kvnc/genesis_validators.toml:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8548/health"]

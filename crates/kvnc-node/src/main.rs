@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::Deserialize;
 use multiaddr::Multiaddr;
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, watch};
@@ -372,6 +373,26 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     let treasury = parse_address_hex(config.treasury_address.as_deref())?;
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
+
+    // Load 4-node validator set from genesis file if present (Phase 16.6).
+    let genesis_validators_path = config.data_dir.join("genesis_validators.toml");
+    if genesis_validators_path.exists() {
+        let text = std::fs::read_to_string(&genesis_validators_path)
+            .with_context(|| format!("reading genesis validators {}", genesis_validators_path.display()))?;
+        let validators: Vec<GenesisValidatorEntry> = toml::from_str(&text)
+            .with_context(|| format!("parsing genesis validators {}", genesis_validators_path.display()))?;
+        let count = validators.len();
+        for v in validators {
+            let address = parse_address_hex(Some(&v.address))?;
+            let pk = if let Some(p) = v.public_key.as_ref() {
+                Some(parse_public_key_hex(p)?)
+            } else {
+                None
+            };
+            staking.join_validator(address, v.stake, 0, Some(address), pk)?;
+        }
+        info!(count = count, "loaded genesis validator set");
+    }
 
     // TODO: apply the founder premine and the genesis validator set once the
     // genesis ceremony format is finalised. For now the treasury address is the
@@ -912,6 +933,25 @@ fn build_network_config(config: &NodeConfig) -> Result<NetworkConfig> {
         max_peers: config.max_peers,
         ping_interval: Duration::from_secs(10),
     })
+}
+
+/// Genesis validator entry for Phase 16.6 4-node quorum.
+#[derive(Debug, Deserialize)]
+struct GenesisValidatorEntry {
+    address: String,
+    stake: u64,
+    public_key: Option<String>,
+}
+
+/// Parse a 32-byte hex public key (PublicKey is [u8; 32]).
+fn parse_public_key_hex(value: &str) -> Result<PublicKey> {
+    let bytes = hex::decode(value.trim()).with_context(|| format!("invalid public key hex `{}`", value))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("public key must be 32 bytes, got {}", bytes.len());
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&bytes);
+    Ok(PublicKey(pk))
 }
 
 /// Convert a `host:port` string or a full multiaddr into a [`Multiaddr`].

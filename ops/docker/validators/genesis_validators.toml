@@ -1,0 +1,22 @@
+# Phase 16.6 — 4-node validator set for genesis
+# Stakes = MIN_VALIDATOR_STAKE = 50_000 KVNC (5_000_000_000_000 atoms)
+# Replace addresses/public_keys with real values from keystore imports.
+[[validator]]
+address = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+stake = 5000000000000
+public_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[validator]]
+address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+stake = 5000000000000
+public_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[validator]]
+address = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+stake = 5000000000000
+public_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[[validator]]
+address = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+stake = 5000000000000
+public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
