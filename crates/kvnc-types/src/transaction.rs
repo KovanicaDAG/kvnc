@@ -103,7 +103,7 @@ impl Transaction {
             }
         }
         data.extend_from_slice(&self.fee.to_le_bytes());
-        Hash::new(&data)
+        Hash::new_keyed(Hash::DOMAIN_TX, &data)
     }
 
     /// Verify the transaction signature against the sender's public key.

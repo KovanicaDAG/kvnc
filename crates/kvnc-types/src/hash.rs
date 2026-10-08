@@ -16,6 +16,25 @@ impl Hash {
         Self(*hasher.finalize().as_bytes())
     }
 
+    /// Compute BLAKE3 hash with a domain key (domain separation).
+    pub fn new_keyed(domain: &[u8], data: impl AsRef<[u8]>) -> Self {
+        let mut key = [0u8; 32];
+        let len = domain.len().min(32);
+        key[..len].copy_from_slice(&domain[..len]);
+        let mut hasher = Hasher::new_keyed(&key);
+        hasher.update(data.as_ref());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Domain tag for block digests.
+    pub const DOMAIN_BLOCK: &'static [u8] = b"KVNC-BLOCK-v1";
+    /// Domain tag for transactions.
+    pub const DOMAIN_TX: &'static [u8] = b"KVNC-TX-v1";
+    /// Domain tag for digest/merkle pairing.
+    pub const DOMAIN_DIGEST: &'static [u8] = b"KVNC-DIGEST-v1";
+    /// Domain tag for merkle tree pairing.
+    pub const DOMAIN_MERKLE: &'static [u8] = b"KVNC-MERKLE-v1";
+
     /// Zero hash (useful for genesis).
     pub fn zero() -> Self {
         Self([0u8; 32])
