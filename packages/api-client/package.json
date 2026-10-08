@@ -1,0 +1,14 @@
+{
+  "name": "@kvnc/api-client",
+  "version": "0.0.31",
+  "description": "Minimal typed fetch wrapper for kvnc-rpc",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}
