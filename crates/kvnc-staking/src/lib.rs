@@ -81,6 +81,9 @@ pub const MAX_ACTIVE_VALIDATORS: usize = 21;
 /// (Skeleton name: `UNBONDING_PERIOD` — same value: 100_000 rounds.)
 pub const UNBONDING_ROUNDS: u64 = 100_000;
 
+/// Epoch rotation length (same as subsidy era for simplicity, linked to commitment height).
+pub const EPOCH_ROUNDS: u64 = SUBSIDY_ERA_BLOCKS; // 2_050_000
+
 // ============================================================
 // Emission schedule (mining rewards)
 // ============================================================
