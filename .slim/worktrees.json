@@ -1,22 +1,22 @@
 {
   "version": "1.0.0",
-  "updatedAt": "2026-10-07T00:00:00Z",
+  "updatedAt": "2026-10-08T21:33:00Z",
   "lanes": [
     {
-      "slug": "tasklist-completion",
-      "branch": "omos/tasklist-completion",
-      "path": ".slim/worktrees/tasklist-completion",
+      "slug": "stabilize-cleanup",
+      "branch": "omos/stabilize-cleanup",
+      "path": ".slim/worktrees/stabilize-cleanup",
       "base": "main",
-      "purpose": "Implement unchecked tasklist items in safety-gated phases",
+      "purpose": "Hygiene: ignore blocks, docs drift, dead lane cleanup. No protocol changes.",
       "owner": "orchestrator",
       "status": "active",
       "areas": [
-        "crates/kvnc-consensus",
-        "crates/kvnc-dag",
-        "crates/kvnc-node",
-        "crates/kvnc-execution"
+        ".gitignore",
+        ".slim/worktrees.json",
+        "docs/",
+        "README.md"
       ],
-      "createdAt": "2026-10-07T00:00:00Z"
+      "createdAt": "2026-10-08T21:33:00Z"
     }
   ]
 }

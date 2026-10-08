@@ -1,22 +1,24 @@
 # Phase 16.6 — 4-node validator set for genesis
-# Stakes = MIN_VALIDATOR_STAKE = 50_000 KVNC (5_000_000_000_000 atoms)
-# Replace addresses/public_keys with real values from keystore imports.
-[[validator]]
-address = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-stake = 5000000000000
-public_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+# Stakes = MIN_VALIDATOR_STAKE = 50_000 KVNC (50_000_000_000_000 atoms)
+# Generated from keystores
 
-[[validator]]
-address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-stake = 5000000000000
-public_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[[validators]]
+address = "fea327f7cc95d2f399c4269ce2deb0d901900716fa9235328027c2e3dec88919"
+stake = 50000000000000
+public_key = "fea327f7cc95d2f399c4269ce2deb0d901900716fa9235328027c2e3dec88919"
 
-[[validator]]
-address = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-stake = 5000000000000
-public_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+[[validators]]
+address = "e8efd76ed4d9cd3bdecb8d0e9acfd7f340c66b94cb3b92e23b9ed5e58759e041"
+stake = 50000000000000
+public_key = "e8efd76ed4d9cd3bdecb8d0e9acfd7f340c66b94cb3b92e23b9ed5e58759e041"
 
-[[validator]]
-address = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-stake = 5000000000000
-public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[[validators]]
+address = "fa8f8baa7d0501e99ae7a8ce241c1b101692cc0fda62aa69d238f483b3b12f0e"
+stake = 50000000000000
+public_key = "fa8f8baa7d0501e99ae7a8ce241c1b101692cc0fda62aa69d238f483b3b12f0e"
+
+[[validators]]
+address = "f2ef258a8fb684b384e0dfebea7299f1668d7db34db572855982e26ee9c83e24"
+stake = 50000000000000
+public_key = "f2ef258a8fb684b384e0dfebea7299f1668d7db34db572855982e26ee9c83e24"
+

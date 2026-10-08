@@ -1,0 +1,132 @@
+//! Prometheus metrics for MysticGhost consensus.
+
+use once_cell::sync::Lazy;
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::{Registry, Unit};
+use std::sync::Mutex;
+
+/// Global metrics registry.
+static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::default()));
+
+/// Get the global metrics registry.
+pub fn registry() -> &'static Mutex<Registry> {
+    &REGISTRY
+}
+
+/// Labels for MysticGhost metrics.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct MysticGhostLabels {
+    pub result: &'static str, // "success", "fallback", "error"
+}
+
+/// MysticGhost mergeset size (number of blocks in mergeset before colouring).
+static MYSTICGHOST_MERGESET_SIZE: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "mysticghost_mergeset_size",
+        "Number of blocks in the mergeset before GHOSTDAG colouring",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// MysticGhost colouring duration in milliseconds.
+static MYSTICGHOST_COLOURING_DURATION_MS: Lazy<Family<MysticGhostLabels, Histogram>> =
+    Lazy::new(|| {
+        let family = Family::<MysticGhostLabels, Histogram>::new_with_constructor(|| {
+            let buckets: Vec<f64> = prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, 20).collect();
+            Histogram::new(buckets)
+        });
+        let mut registry = REGISTRY.lock().unwrap();
+        registry.register(
+            "mysticghost_colouring_duration_ms",
+            "Duration of GHOSTDAG colouring in milliseconds",
+            family.clone(),
+        );
+        family
+    });
+
+/// Number of DAG blocks currently in memory/storage.
+static DAG_BLOCKS_IN_MEMORY: Lazy<Gauge> = Lazy::new(|| {
+    let gauge = Gauge::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "dag_blocks_in_memory",
+        "Current number of DAG blocks stored",
+        gauge.clone(),
+    );
+    gauge
+});
+
+/// Total number of non-blue blocks pruned.
+static MYSTICGHOST_PRUNED_BLOCKS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    let counter = Counter::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "mysticghost_pruned_blocks_total",
+        "Total number of non-blue blocks pruned after commit",
+        counter.clone(),
+    );
+    counter
+});
+
+/// Total number of waves pruned.
+static MYSTICGHOST_PRUNED_WAVES_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    let counter = Counter::default();
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.register(
+        "mysticghost_pruned_waves_total",
+        "Total number of waves pruned (all blocks in old waves)",
+        counter.clone(),
+    );
+    counter
+});
+
+/// Record mergeset size.
+pub fn record_mergeset_size(size: usize) {
+    MYSTICGHOST_MERGESET_SIZE.set(size as i64);
+}
+
+/// Record colouring duration.
+pub fn record_colouring_duration_ms(duration_ms: f64, result: &'static str) {
+    let labels = MysticGhostLabels { result };
+    MYSTICGHOST_COLOURING_DURATION_MS
+        .get_or_create(&labels)
+        .observe(duration_ms);
+}
+
+/// Record pruned blocks count.
+pub fn record_pruned_blocks(count: u64) {
+    MYSTICGHOST_PRUNED_BLOCKS_TOTAL.inc_by(count);
+}
+
+/// Record pruned waves count.
+pub fn record_pruned_waves(count: u64) {
+    MYSTICGHOST_PRUNED_WAVES_TOTAL.inc_by(count);
+}
+
+/// Update DAG blocks in memory gauge.
+pub fn update_dag_blocks_in_memory(count: i64) {
+    DAG_BLOCKS_IN_MEMORY.set(count);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metrics_registration() {
+        // Just verify metrics can be registered and used
+        record_mergeset_size(100);
+        record_colouring_duration_ms(10.5, "success");
+        record_colouring_duration_ms(5.2, "fallback");
+        record_pruned_blocks(50);
+        record_pruned_waves(2);
+        update_dag_blocks_in_memory(1000);
+    }
+}

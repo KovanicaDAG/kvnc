@@ -57,6 +57,8 @@ services:
       KVNC_RPC_PORT: "8546"
       KVNC_BOOTNODES: "node1:9000,node3:9000,node4:9000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
+    ports:
+      - "127.0.0.1:8546:8546"
     volumes:
       - node2-data:/var/lib/kvnc
       - ./ops/docker/validators/val2.pem:/var/lib/kvnc/validator.pem:ro
@@ -76,6 +78,8 @@ services:
       KVNC_RPC_PORT: "8547"
       KVNC_BOOTNODES: "node1:9000,node2:9000,node4:9000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
+    ports:
+      - "127.0.0.1:8547:8547"
     volumes:
       - node3-data:/var/lib/kvnc
       - ./ops/docker/validators/val3.pem:/var/lib/kvnc/validator.pem:ro
@@ -95,6 +99,8 @@ services:
       KVNC_RPC_PORT: "8548"
       KVNC_BOOTNODES: "node1:9000,node2:9000,node3:9000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
+    ports:
+      - "127.0.0.1:8548:8548"
     volumes:
       - node4-data:/var/lib/kvnc
       - ./ops/docker/validators/val4.pem:/var/lib/kvnc/validator.pem:ro

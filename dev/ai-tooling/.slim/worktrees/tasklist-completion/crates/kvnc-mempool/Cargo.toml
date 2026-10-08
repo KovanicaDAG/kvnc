@@ -1,0 +1,15 @@
+[package]
+name = "kvnc-mempool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+kvnc-crypto = { path = "../kvnc-crypto" }
+kvnc-storage = { path = "../kvnc-storage" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+bincode = { workspace = true }

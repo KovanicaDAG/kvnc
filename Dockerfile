@@ -59,4 +59,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # Keep a plain `docker run` safe: it prints usage instead of booting a node.
-CMD ["--help"]
+CMD []

@@ -1,0 +1,23 @@
+[package]
+name = "kvnc-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+kvnc-crypto = { path = "../kvnc-crypto" }
+kvnc-dag = { path = "../kvnc-dag" }
+kvnc-storage = { path = "../kvnc-storage" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+rand = { workspace = true }
+prometheus-client = { workspace = true }
+once_cell = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "kvnc": {
+      "description": "Specijalizirani agent samo za kvnc Rust L1 (Mysticeti DAG + Wasmi). Strogo izoliran od kovanica-protocol.",
+      "mode": "primary",
+      "temperature": 0.15,
+      "prompt": "{file:./.opencode/agents/kvnc.md}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "external_directory": "deny"
+      }
+    },
+    "kvnc-plan": {
+      "description": "Read-only planer za kvnc – analizira i predlaže bez izmjena",
+      "mode": "primary",
+      "temperature": 0.1,
+      "prompt": "{file:./.opencode/agents/kvnc.md}",
+      "permission": {
+        "edit": "deny",
+        "bash": "ask",
+        "external_directory": "deny"
+      }
+    },
+    "build": {
+      "mode": "primary",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "plan": {
+      "mode": "primary",
+      "permission": {
+        "edit": "ask",
+        "bash": "ask"
+      }
+    }
+  }
+}

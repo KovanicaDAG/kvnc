@@ -51,6 +51,7 @@ use kvnc_types::{
     Address, AuthorityIndex, Hash, PublicKey, Round, Signature, SigningKey, Transaction,
 };
 
+
 /// Command line arguments.
 #[derive(Parser, Debug)]
 #[command(name = "kvnc-node")]
@@ -369,6 +370,18 @@ where
             .map(|authority| (authority.index, authority.stake))
             .collect(),
     );
+
+    // Populate the global validator key registry for batch signature verification
+    // The registry is indexed by authority index, so we need to ensure keys are in index order
+    let mut validator_keys = vec![None; committee.size() as usize];
+    for authority in committee.authorities() {
+        validator_keys[authority.index as usize] = Some(authority.public_key);
+    }
+    let public_keys: Vec<PublicKey> = validator_keys
+        .into_iter()
+        .map(|opt| opt.expect("validator key missing for authority index"))
+        .collect();
+    kvnc_crypto::set_validator_keys_from_public(public_keys);
     let engine = Arc::new(ConsensusEngine::new(
         ConsensusConfig {
             round_duration_ms: config.round_duration_ms,
@@ -550,12 +563,13 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
                 genesis_validators_path.display()
             )
         })?;
-        let validators: Vec<GenesisValidatorEntry> = toml::from_str(&text).with_context(|| {
+        let wrapper: GenesisValidators = toml::from_str(&text).with_context(|| {
             format!(
                 "parsing genesis validators {}",
                 genesis_validators_path.display()
             )
         })?;
+        let validators = wrapper.validators;
         let count = validators.len();
         for v in validators {
             let address = parse_address_hex(Some(&v.address))?;
@@ -1137,6 +1151,12 @@ struct GenesisValidatorEntry {
     address: String,
     stake: u64,
     public_key: Option<String>,
+}
+
+/// Wrapper for TOML deserialization ([[validators]] array-of-tables).
+#[derive(Debug, Deserialize)]
+struct GenesisValidators {
+    validators: Vec<GenesisValidatorEntry>,
 }
 
 /// Parse a 32-byte hex public key (PublicKey is [u8; 32]).

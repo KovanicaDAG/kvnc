@@ -1,52 +1,113 @@
-# kvnc ↔ OpenCode Integration Pack
+# KVNC
 
-Pripremljeni paket da **OpenCode** i **Grok** rade zajedno na **kvnc**-u bez miješanja poslova.
+> A DAG-based Layer 1 blockchain written in Rust, with staking, smart contracts and a fixed, era-based emission schedule.
 
-## Sadržaj
+**Status: pre-alpha. Not audited. Not for production use. Interfaces and consensus parameters may change without notice.**
 
+<!-- TODO: add logo from brand-assets/ -->
+<!-- TODO: badges (CI, license) once CI is green -->
+
+## Overview
+
+KVNC (Kovanica) is a Rust workspace implementing a DAG ledger node. [TODO: 2-3 sentences: what problem it solves, how it differs from other chains, what the consensus approach is.]
+
+## Features
+
+- **DAG ledger**: [TODO: one line on ordering/finality]
+- **Proof-of-stake validators**: staking with batch signature verification and an unbonding queue
+- **Contract execution**: `kvnc-execution` with persistent contract storage
+- **Verifiable state**: sorted key-value Merkle state root, with snapshot support
+- **P2P networking**: `kvnc-network`
+- **Typed API client**: `packages/api-client`
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `crates/` | Core Rust crates (staking, storage, execution, network, ...) |
+| `node/` | Node binary and integration tests |
+| `packages/api-client/` | Client library for the node API |
+| `docs/` | Documentation |
+| `ops/` | Deployment and operations |
+| `brand-assets/` | Logos and brand material |
+| `config.example.toml` | Example node configuration |
+
+## Quick start
+
+### Requirements
+
+- Rust (stable) and Cargo
+- Docker and Docker Compose (optional)
+
+### Build and test
+
+```bash
+git clone https://github.com/KovanicaDAG/kvnc.git
+cd kvnc
+cargo build --workspace
+cargo test --workspace
 ```
-kvnc-opencode-setup/
-├── AGENTS.md                          ← stavi u root kvnc repo-a
-├── opencode.json                      ← project config
-├── .opencode/agents/kvnc.md           ← specijalni agent
-├── prompts/kvnc-system.txt            ← alternativni prompt
-├── docs/SETUP-OPENCODE-KVNC.md        ← detaljne upute
-└── README.md                          ← ovaj file
+
+### Run a node
+
+```bash
+cp config.example.toml config.toml
+# edit config.toml, then:
+cargo run -p kvnc-node -- --config config.toml
 ```
 
-## Brza instalacija
+Or with Docker:
 
-1. Kopiraj cijeli sadržaj u **root** svog lokalnog kvnc klona.
-2. Pokreni `opencode` unutar tog root-a.
-3. Prebaci se na agenta **kvnc** (Tab ili `@kvnc`).
+```bash
+docker compose up --build
+```
 
-Detaljne upute: `docs/SETUP-OPENCODE-KVNC.md`
+<!-- TODO: verify the exact binary name and CLI flags -->
 
-## Podjela uloga
+## Tokenomics
 
-| Tko          | Uloga                                      |
-|--------------|--------------------------------------------|
-| **Grok**     | Arhitekt, planer, reviewer, tokenomics, dizajn |
-| **OpenCode (kvnc agent)** | Lokalna implementacija, file edit, testovi, git |
+| Parameter | Value |
+| --- | --- |
+| Maximum supply | 90,200,000 KVNC |
+| Founder premine | 200,000 KVNC |
+| Treasury | 8,000,000 KVNC |
+| Initial block reward | 10 KVNC |
+| Era length | 2,050,000 blocks |
+| Reward decay | x 3/4 per era |
+| Emitted through rewards | ~82,000,000 KVNC |
 
-## Status pretplate
+Emission per era is `era length x current reward`. Because the reward shrinks by a factor of 3/4 each era, total emission converges to 82M, and together with premine and treasury this gives the 90.2M cap.
 
-- Grok pretplata: još nije aktivna (prema tvojoj izjavi)
-- OpenCode agent: potpuno spreman za korištenje odmah
+## Roadmap
 
-Kad aktiviraš Grok pretplatu, workflow postaje:
-**Grok plan → OpenCode implementacija → Grok review**.
+See [`TASKLIST.md`](TASKLIST.md) for detailed progress.
 
----
+- [x] Staking with batch verification
+- [x] State root and snapshots
+- [x] Genesis initialization (premine and validator set)
+- [ ] Multi-node integration test passing
+- [ ] Public testnet
+- [ ] Security audit
+- [ ] Mainnet
 
-*Generirano za kvnc projekt – ne miješati s kovanica-protocol.*
+## Development
 
----
-## Aktualni status (2026-10-08)
-- `use_mysticghost` = `true` (default) — eksperimentalni flag.
-- `init_genesis` proširen: `founder_premine.hex` + `validators.json` load.
-- `kvnc-staking` batch verify (`verify_batch`) i `Address` sort popravljeni.
-- `kvnc-storage` state root (sorted KV Merkle) + snapshot + `STAKING_STATE` / `CONTRACT_STORAGE` serijalizacija popravljena.
-- `TASKLIST.md` ažuriran za završene faze (1.1, 2.2, 4.3/4.4, 5.1/5.2, 8.2, 9.1, 14, 16).
-- Preostali `cargo test -p kvnc-node --test multi_node_integration`: blokiran preostalim `kvnc-execution` (`unbonding_queue`) i `kvnc-network` greškama (ne u mom edit opsegu).
-- Tokenomics zaključan: `90.2M`, `200k premine`, `8M treasury`, `10 KVNC`, `2.05M era`, `×¾ decay`.
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Experimental features are behind config flags and are **off by default**.
+
+## Contributing
+
+Issues and pull requests are welcome. Please open an issue before large changes. [TODO: add CONTRIBUTING.md]
+
+## Security
+
+Please do not report vulnerabilities in public issues. See the repository's security policy for how to report them privately.
+
+## License
+
+[TODO: choose a license and add a LICENSE file]

@@ -1,0 +1,19 @@
+[package]
+name = "kvnc-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+kvnc-staking = { path = "../kvnc-staking" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+redb = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.8"

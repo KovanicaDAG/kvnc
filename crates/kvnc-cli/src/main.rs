@@ -11,7 +11,7 @@ mod output;
 mod rpc;
 mod stake;
 mod tx;
-mod wallet;
+pub mod wallet;
 
 use std::{
     io::{self, Write},

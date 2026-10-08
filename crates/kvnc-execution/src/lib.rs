@@ -230,6 +230,11 @@ impl ExecutionContext {
         storage
             .state()
             .save_staking_state(&txn, &candidate_staking)?;
+        // Also increment the consensus store's committed leader height for RPC visibility
+        storage
+            .consensus()
+            .increment_committed_leader_height(&txn)
+            .map_err(StorageError::ConsensusStore)?;
 
         // 4. Persist transaction receipts
         let receipts_bytes = bincode::serialize(&receipts)

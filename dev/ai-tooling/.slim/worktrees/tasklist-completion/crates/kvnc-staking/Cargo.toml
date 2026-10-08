@@ -1,0 +1,13 @@
+[package]
+name = "kvnc-staking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvnc-types = { path = "../kvnc-types" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5"
