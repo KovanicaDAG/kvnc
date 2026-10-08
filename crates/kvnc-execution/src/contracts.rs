@@ -579,7 +579,10 @@ impl ContractRunner {
     /// out of gas, missing export, trap — drops the host uncommitted.
     ///
     /// Returns the output bytes and the emitted events.
-    pub fn execute_wasm_call(&mut self, call: WasmCall<'_>) -> Result<(Vec<u8>, Vec<ContractEvent>), ExecutionError> {
+    pub fn execute_wasm_call(
+        &mut self,
+        call: WasmCall<'_>,
+    ) -> Result<(Vec<u8>, Vec<ContractEvent>), ExecutionError> {
         let key = kvnc_common::hash(call.wasm);
         if !self.modules.contains_key(&key) {
             let module = self.runtime.compile(call.wasm)?;

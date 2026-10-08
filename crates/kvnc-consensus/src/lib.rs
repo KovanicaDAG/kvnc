@@ -21,13 +21,16 @@ pub mod mysticghost;
 pub mod types;
 
 pub use committer::{BaseCommitter, UniversalCommitter};
-pub use engine::{ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState, BlockBroadcaster, VoteBroadcaster};
+pub use engine::{
+    BlockBroadcaster, ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState,
+    VoteBroadcaster,
+};
 pub use kvnc_types::Vote;
 pub use linearizer::Linearizer;
 pub use metrics::{
-    metrics_text, record_block_height, record_commit_latency, record_mergeset_size_metric,
-    record_mempool_size, record_peer_count, record_rss_proxy, record_colouring_duration_ms,
-    record_mergeset_size, record_pruned_blocks, record_pruned_waves, registry,
+    metrics_text, record_block_height, record_colouring_duration_ms, record_commit_latency,
+    record_mempool_size, record_mergeset_size, record_mergeset_size_metric, record_peer_count,
+    record_pruned_blocks, record_pruned_waves, record_rss_proxy, registry,
     update_dag_blocks_in_memory,
 };
 pub use types::{

@@ -245,18 +245,12 @@ async fn main() -> Result<()> {
         Commands::Transfer(args) => cmd_transfer(&client, args, json).await,
         Commands::Status | Commands::Info => node::status(&client, json).await,
         Commands::Balance { address } => node::balance(&client, &address, json).await,
-        Commands::Stake(args) => {
-            stake::stake_skeleton(&client, args.amount, None, json).await
-        }
-        Commands::Unstake(args) => {
-            stake::unstake_skeleton(&client, args.amount, None, json).await
-        }
+        Commands::Stake(args) => stake::stake_skeleton(&client, args.amount, None, json).await,
+        Commands::Unstake(args) => stake::unstake_skeleton(&client, args.amount, None, json).await,
         Commands::Delegate(args) => {
             stake::delegate_skeleton(&client, &args.validator, args.amount, None, json).await
         }
-        Commands::ClaimRewards => {
-            stake::claim_rewards_skeleton(&client, None, json).await
-        }
+        Commands::ClaimRewards => stake::claim_rewards_skeleton(&client, None, json).await,
         Commands::Propose(args) => node::not_implemented(
             "propose",
             "kvnc_propose",

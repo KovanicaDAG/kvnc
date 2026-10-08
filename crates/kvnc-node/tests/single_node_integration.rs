@@ -37,6 +37,7 @@ fn engine_config(use_mysticghost: bool) -> ConsensusConfig {
         max_pending_rounds: 100,
         use_mysticghost,
         prune_window_waves: 100,
+        leader_timeout_ms: 3000,
     }
 }
 
@@ -96,7 +97,13 @@ fn execute_and_credit(subdag: &CommittedSubDag) -> (u64, Address) {
     for i in 0..4u8 {
         let payout = Address([100 + i; 32]);
         ctx.staking
-            .join_validator(Address([i + 1; 32]), MIN_VALIDATOR_STAKE, 0, Some(payout), Some(PublicKey([i + 1; 32])))
+            .join_validator(
+                Address([i + 1; 32]),
+                MIN_VALIDATOR_STAKE,
+                0,
+                Some(payout),
+                Some(PublicKey([i + 1; 32])),
+            )
             .expect("genesis validator");
         payouts.push(payout);
     }
@@ -107,8 +114,7 @@ fn execute_and_credit(subdag: &CommittedSubDag) -> (u64, Address) {
     let reward = result.reward.expect("reward credited on commit");
     assert!(reward.amount > 0, "reward amount must be positive");
     assert_eq!(
-        reward.recipient,
-        payouts[subdag.leader_author as usize],
+        reward.recipient, payouts[subdag.leader_author as usize],
         "reward must go to the leader's payout address"
     );
 

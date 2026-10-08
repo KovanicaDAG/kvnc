@@ -21,7 +21,10 @@ pub enum BlockSyncRequest {
     /// Request by block hash.
     ByHash(Hash),
     /// Request by author and round.
-    ByAuthorRound { author: AuthorityIndex, round: Round },
+    ByAuthorRound {
+        author: AuthorityIndex,
+        round: Round,
+    },
 }
 
 /// Block sync response — includes missing blocks.
@@ -67,7 +70,8 @@ impl libp2p::request_response::Codec for BlockSyncCodec {
     {
         let mut buf = Vec::new();
         io.read_to_end(&mut buf).await?;
-        bincode::deserialize(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     async fn read_response<T>(
@@ -80,7 +84,8 @@ impl libp2p::request_response::Codec for BlockSyncCodec {
     {
         let mut buf = Vec::new();
         io.read_to_end(&mut buf).await?;
-        bincode::deserialize(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        bincode::deserialize(&buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     async fn write_request<T>(
@@ -151,7 +156,10 @@ mod tests {
 
     #[test]
     fn block_sync_request_by_author_round_round_trip() {
-        let req = BlockSyncRequest::ByAuthorRound { author: 5, round: 42 };
+        let req = BlockSyncRequest::ByAuthorRound {
+            author: 5,
+            round: 42,
+        };
         let encoded = bincode::serialize(&req).expect("serializes");
         let decoded: BlockSyncRequest = bincode::deserialize(&encoded).expect("deserializes");
         assert_eq!(req, decoded);

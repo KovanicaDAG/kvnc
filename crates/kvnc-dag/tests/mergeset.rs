@@ -1,6 +1,6 @@
 //! Unit tests for mergeset extraction.
 
-use kvnc_dag::{DagStore, mergeset::compute_mergeset};
+use kvnc_dag::{mergeset::compute_mergeset, DagStore};
 use kvnc_storage::Storage;
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
@@ -27,6 +27,7 @@ fn make_block(
         statements: tag.as_bytes().to_vec(),
         signature,
         digest,
+        merkle_root: Default::default(),
     }
 }
 
@@ -108,7 +109,13 @@ fn test_mergeset_with_committed_leader() {
     dag.put_block(&r2b).unwrap();
 
     // Round 3 - first leader (committed)
-    let leader1 = make_block(0, 3, vec![block_ref(&r2a), block_ref(&r2b)], "leader1", &key);
+    let leader1 = make_block(
+        0,
+        3,
+        vec![block_ref(&r2a), block_ref(&r2b)],
+        "leader1",
+        &key,
+    );
     dag.put_block(&leader1).unwrap();
     dag.commit_leader(&leader1.digest).unwrap();
 
@@ -119,7 +126,13 @@ fn test_mergeset_with_committed_leader() {
     dag.put_block(&r4b).unwrap();
 
     // Round 6 - second leader
-    let leader2 = make_block(0, 6, vec![block_ref(&r4a), block_ref(&r4b)], "leader2", &key);
+    let leader2 = make_block(
+        0,
+        6,
+        vec![block_ref(&r4a), block_ref(&r4b)],
+        "leader2",
+        &key,
+    );
     dag.put_block(&leader2).unwrap();
 
     // Mergeset of leader2 should NOT include leader1 or its ancestors
@@ -224,7 +237,13 @@ fn test_mergeset_multiple_authors() {
     dag.put_block(&r2b).unwrap();
 
     // Round 3 - leader from author 0
-    let leader = make_block(0, 3, vec![block_ref(&r2a), block_ref(&r2b)], "leader", &key0);
+    let leader = make_block(
+        0,
+        3,
+        vec![block_ref(&r2a), block_ref(&r2b)],
+        "leader",
+        &key0,
+    );
     dag.put_block(&leader).unwrap();
 
     let mergeset = dag.mergeset(&leader.digest).unwrap();

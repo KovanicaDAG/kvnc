@@ -445,7 +445,9 @@ impl StakingState {
         for i in 0..min_validators {
             let byte = (i as u8 + 1) % 255; // avoid zero address collision
             let validator = Address([byte; 32]);
-            state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).expect("genesis validator admission");
+            state
+                .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
+                .expect("genesis validator admission");
         }
         state
     }
@@ -525,7 +527,8 @@ impl StakingState {
             // Undo validator stake changes (simplified skeleton: assume match)
             for (idx, take, full) in &updates {
                 if let Some(v_idx) = self.validators.iter().position(|v| v.address == validator) {
-                    self.validators[v_idx].stake = self.validators[v_idx].stake.saturating_add(*take);
+                    self.validators[v_idx].stake =
+                        self.validators[v_idx].stake.saturating_add(*take);
                 }
                 self.total_staked = self.total_staked.saturating_add(*take);
                 if !full {
@@ -535,14 +538,20 @@ impl StakingState {
             return Err(StakingError::NoDelegation);
         }
         // Remove fully consumed delegations (highest index first).
-        let to_remove: Vec<usize> = updates.iter().filter(|(_, _, f)| *f).map(|(i, _, _)| *i).collect();
+        let to_remove: Vec<usize> = updates
+            .iter()
+            .filter(|(_, _, f)| *f)
+            .map(|(i, _, _)| *i)
+            .collect();
         let mut sorted = to_remove;
         sorted.sort_by(|a, b| b.cmp(a));
         sorted.dedup();
         for idx in sorted {
             self.delegations.remove(idx);
         }
-        let release_height = self.committed_leader_height.saturating_add(UNBONDING_ROUNDS);
+        let release_height = self
+            .committed_leader_height
+            .saturating_add(UNBONDING_ROUNDS);
         self.unbonding_queue.push(UnbondingEntry {
             delegator,
             validator,
@@ -561,17 +570,30 @@ impl StakingState {
             .iter()
             .filter(|e| e.release_height <= current)
             .collect();
-        ready.sort_by(|a, b| a.delegator.0.cmp(&b.delegator.0).then(a.validator.0.cmp(&b.validator.0)).then(a.release_height.cmp(&b.release_height)));
+        ready.sort_by(|a, b| {
+            a.delegator
+                .0
+                .cmp(&b.delegator.0)
+                .then(a.validator.0.cmp(&b.validator.0))
+                .then(a.release_height.cmp(&b.release_height))
+        });
         ready
     }
 
     /// Withdraw from unbonding queue once `release_height` passed.
-    pub fn withdraw_unbonded(&mut self, delegator: Address, validator: Address) -> Result<u64, StakingError> {
+    pub fn withdraw_unbonded(
+        &mut self,
+        delegator: Address,
+        validator: Address,
+    ) -> Result<u64, StakingError> {
         let current = self.committed_leader_height;
         let mut withdrawn = 0u64;
         let mut to_remove = Vec::new();
         for (i, entry) in self.unbonding_queue.iter().enumerate() {
-            if entry.delegator == delegator && entry.validator == validator && entry.release_height <= current {
+            if entry.delegator == delegator
+                && entry.validator == validator
+                && entry.release_height <= current
+            {
                 withdrawn = withdrawn.saturating_add(entry.amount);
                 to_remove.push(i);
             }
@@ -595,12 +617,17 @@ impl StakingState {
         reward_amount: u64,
         commission_bps: u16,
     ) -> Vec<(Address, u64)> {
-        let v_idx = self.validators.iter().position(|v| v.address == validator_address);
+        let v_idx = self
+            .validators
+            .iter()
+            .position(|v| v.address == validator_address);
         if v_idx.is_none() {
             return Vec::new();
         }
         let mut shares: Vec<(Address, u64)> = Vec::new();
-        let validator_cut = reward_amount.saturating_mul(commission_bps as u64).saturating_div(10_000);
+        let validator_cut = reward_amount
+            .saturating_mul(commission_bps as u64)
+            .saturating_div(10_000);
         shares.push((validator_address, validator_cut));
         let remaining = reward_amount.saturating_sub(validator_cut);
         let mut delegator_shares: Vec<(Address, u64, Stake)> = self
@@ -609,15 +636,17 @@ impl StakingState {
             .filter(|d| d.validator == validator_address && d.amount > 0)
             .map(|d| (d.delegator, d.amount, d.amount))
             .collect();
-        delegator_shares.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        delegator_shares.sort_by_key(|a| a.0 .0);
         let total_delegated: Stake = delegator_shares.iter().map(|(_, _, s)| s).sum();
         if total_delegated > 0 {
             for (addr, _, stake) in delegator_shares {
-                let share = remaining.saturating_mul(stake as u64).saturating_div(total_delegated as u64);
+                let share = remaining
+                    .saturating_mul(stake)
+                    .saturating_div(total_delegated as u64);
                 shares.push((addr, share));
             }
         }
-        shares.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        shares.sort_by_key(|a| a.0 .0);
         shares
     }
 
@@ -631,20 +660,27 @@ impl StakingState {
             .position(|v| v.address == evidence.validator)
             .ok_or(StakingError::NotValidator)?;
         let original = self.validators[v_idx].stake;
-        let slash_amount = original.saturating_mul(SLASH_PCT_BPS as u64).saturating_div(10_000);
+        let slash_amount = original
+            .saturating_mul(SLASH_PCT_BPS as u64)
+            .saturating_div(10_000);
         self.validators[v_idx].stake = original.saturating_sub(slash_amount);
         let mut total_slash_delegations = 0u64;
         for d in self.delegations.iter_mut() {
             if d.validator == evidence.validator && d.amount > 0 {
-                let d_slash = d.amount.saturating_mul(SLASH_PCT_BPS as u64).saturating_div(10_000);
+                let d_slash = d
+                    .amount
+                    .saturating_mul(SLASH_PCT_BPS as u64)
+                    .saturating_div(10_000);
                 d.amount = d.amount.saturating_sub(d_slash);
                 total_slash_delegations = total_slash_delegations.saturating_add(d_slash);
             }
         }
-        self.total_staked = self.total_staked.saturating_sub(slash_amount).saturating_sub(total_slash_delegations);
+        self.total_staked = self
+            .total_staked
+            .saturating_sub(slash_amount)
+            .saturating_sub(total_slash_delegations);
         Ok(slash_amount.saturating_add(total_slash_delegations))
     }
-
 }
 
 #[cfg(test)]
@@ -945,9 +981,13 @@ mod tests {
         let mut state = StakingState::new();
         let validator = Address([1u8; 32]);
         let delegator = Address([2u8; 32]);
-        state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        state
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
         let delegate_amount = 10_000 * ONE_KVNC;
-        state.delegate(delegator, validator, delegate_amount).unwrap();
+        state
+            .delegate(delegator, validator, delegate_amount)
+            .unwrap();
         assert_eq!(state.delegations.len(), 1);
 
         state.unbond(delegator, validator, delegate_amount).unwrap();
@@ -967,15 +1007,21 @@ mod tests {
 
         // Slash reduces validator stake (fixed %) — fresh state for isolation
         let mut slash_state = StakingState::new();
-        slash_state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
-        slash_state.delegate(delegator, validator, delegate_amount).unwrap();
-        let evidence = DoubleSignEvidence { validator, height: 1 };
+        slash_state
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        slash_state
+            .delegate(delegator, validator, delegate_amount)
+            .unwrap();
+        let evidence = DoubleSignEvidence {
+            validator,
+            height: 1,
+        };
         let slashed = slash_state.slash(evidence).unwrap();
         assert!(slashed > 0);
         assert!(slash_state.total_staked < MIN_VALIDATOR_STAKE.saturating_add(delegate_amount));
     }
 
-    #[test]
     #[test]
     fn epoch_rotation_at_subsidy_era_boundary() {
         let mut state = StakingState::new();
@@ -992,12 +1038,17 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn unbonding_ready_sorted_deterministic() {
         let mut state = StakingState::new();
-        state.join_validator(Address([1u8; 32]), MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
-        state.delegate(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC).unwrap();
-        state.unbond(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC).unwrap();
+        state
+            .join_validator(Address([1u8; 32]), MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        state
+            .delegate(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC)
+            .unwrap();
+        state
+            .unbond(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC)
+            .unwrap();
 
         // Before release → none ready.
         assert!(state.unbonding_ready().is_empty());
@@ -1012,50 +1063,69 @@ mod tests {
     fn slash_is_deterministic_fixed_500bps() {
         let mut state = StakingState::new();
         let validator = Address([3u8; 32]);
-        state.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
-        let evidence = DoubleSignEvidence { validator, height: 1 };
+        state
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        let evidence = DoubleSignEvidence {
+            validator,
+            height: 1,
+        };
         let total_first = state.slash(evidence.clone()).unwrap();
         // Re-apply to fresh validator with same stake (simulated second occurrence)
         let mut state2 = StakingState::new();
-        state2.join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None).unwrap();
+        state2
+            .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
         let total_second = state2.slash(evidence.clone()).unwrap();
-        assert_eq!(total_first, total_second, "slash amount must be deterministic for same evidence");
+        assert_eq!(
+            total_first, total_second,
+            "slash amount must be deterministic for same evidence"
+        );
         assert_eq!(total_first, MIN_VALIDATOR_STAKE / 20); // 500 bps = 5%
     }
 
     #[test]
-    #[test]
     fn genesis_state_has_15_validators_and_treasury() {
         let state = StakingState::genesis(MIN_ACTIVE_VALIDATORS);
         assert_eq!(state.validators.len(), MIN_ACTIVE_VALIDATORS as usize);
-        assert!(state.validators.iter().all(|v| v.active && v.stake == MIN_VALIDATOR_STAKE));
+        assert!(state
+            .validators
+            .iter()
+            .all(|v| v.active && v.stake == MIN_VALIDATOR_STAKE));
         assert!(state.treasury.is_some());
         assert_eq!(state.committed_leader_height, 0);
-        assert_eq!(state.total_staked, MIN_VALIDATOR_STAKE * MIN_ACTIVE_VALIDATORS as u64);
+        assert_eq!(
+            state.total_staked,
+            MIN_VALIDATOR_STAKE * MIN_ACTIVE_VALIDATORS as u64
+        );
     }
 
-    #[test]
     #[test]
     fn staking_state_bincode_roundtrip() {
         let mut state = StakingState::new();
         state.init_treasury(Address([42u8; 32]));
-        
+
         for i in 0..3u8 {
             let addr = Address([i + 1; 32]);
             let payout = Address([i + 11; 32]);
-            state.join_validator(addr, MIN_VALIDATOR_STAKE, 0, Some(payout), None).unwrap();
+            state
+                .join_validator(addr, MIN_VALIDATOR_STAKE, 0, Some(payout), None)
+                .unwrap();
         }
-        
+
         let bytes = bincode::serialize(&state).expect("serialize");
         let decoded: StakingState = bincode::deserialize(&bytes).expect("deserialize");
-        
+
         assert_eq!(state.validators.len(), decoded.validators.len());
         for (a, b) in state.validators.iter().zip(decoded.validators.iter()) {
             assert_eq!(a.address, b.address);
             assert_eq!(a.stake, b.stake);
             assert_eq!(a.public_key, b.public_key);
         }
-        assert_eq!(state.committed_leader_height, decoded.committed_leader_height);
+        assert_eq!(
+            state.committed_leader_height,
+            decoded.committed_leader_height
+        );
         assert_eq!(state.total_mining_issued, decoded.total_mining_issued);
     }
 }

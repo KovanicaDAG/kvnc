@@ -3,8 +3,8 @@
 
 #![deny(unsafe_code)]
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use ed25519_dalek::{verify_batch as dalek_verify_batch, Signature as DalekSignature};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use kvnc_types::crypto::{PublicKey, Signature};
 use kvnc_types::hash::Hash;
 use rand::rngs::OsRng;
@@ -71,6 +71,10 @@ pub fn verify_block_signature(
 /// Batch verify block signatures, grouped by round (wave).
 /// Uses ed25519_dalek::verify_batch. Falls back to individual verify if batch fails.
 /// Deterministic — same input always yields same result.
+///
+/// Returns `Ok(true)` iff every signature is valid; an invalid signature is a
+/// hard error (`CryptoError::VerificationFailed`) so callers using `?`/`Err`
+/// matching reject the block.
 pub fn verify_batch(blocks: &[kvnc_types::block::StatementBlock]) -> Result<bool, CryptoError> {
     use std::collections::BTreeMap;
 
@@ -91,10 +95,7 @@ pub fn verify_batch(blocks: &[kvnc_types::block::StatementBlock]) -> Result<bool
             .collect();
         let verifying_keys: Vec<VerifyingKey> = group
             .iter()
-            .map(|b| {
-                get_validator_key(b.author)
-                    .ok_or(CryptoError::InvalidPublicKey)
-            })
+            .map(|b| get_validator_key(b.author).ok_or(CryptoError::InvalidPublicKey))
             .collect::<Result<Vec<_>, _>>()?;
         let msg_refs: Vec<&[u8]> = group.iter().map(|b| b.digest.as_ref()).collect();
         // Borrow signatures as slices for batch call; owned sigs kept for fallback.
@@ -109,7 +110,7 @@ pub fn verify_batch(blocks: &[kvnc_types::block::StatementBlock]) -> Result<bool
             let vk = get_validator_key(b.author).ok_or(CryptoError::InvalidPublicKey)?;
             let sig = DalekSignature::from_bytes(&b.signature.0);
             if vk.verify(b.digest.as_ref(), &sig).is_err() {
-                return Ok(false);
+                return Err(CryptoError::VerificationFailed);
             }
         }
     }
@@ -147,6 +148,7 @@ mod batch_tests {
                 statements: vec![],
                 signature: Signature::from(sig),
                 digest,
+                merkle_root: Default::default(),
             });
         }
         assert!(verify_batch(&blocks).unwrap());

@@ -134,7 +134,7 @@ impl BlockManager {
         let mut txs = self.get_next_transactions();
         txs.extend(transactions);
         // Deterministic order + dedup for audit-safe consensus
-        txs.sort_by(|a, b| a.hash.0.cmp(&b.hash.0));
+        txs.sort_by_key(|a| a.hash.0);
         txs.dedup_by(|a, b| a.hash == b.hash);
         if txs.len() > MAX_TXS_PER_BLOCK {
             txs.truncate(MAX_TXS_PER_BLOCK);
@@ -426,6 +426,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         manager.validate_block(&valid).expect("valid signed block");
 
@@ -461,6 +462,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: parent_digest,
+            merkle_root: Default::default(),
         };
         // Simulate the current network service's store-before-event behavior.
         store.put_block(&invalid_parent).unwrap();
@@ -480,6 +482,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, child_digest.as_ref()),
             digest: child_digest,
+            merkle_root: Default::default(),
         };
 
         assert!(manager.validate_block(&child).is_err());
@@ -502,6 +505,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         // Keep the stored key and declared contents internally consistent but
         // violate the canonical genesis content invariant.
@@ -523,6 +527,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
 
         assert!(manager.validate_block(&child).is_err());
@@ -545,6 +550,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&genesis).unwrap();
 
@@ -562,6 +568,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, valid_digest.as_ref()),
             digest: valid_digest,
+            merkle_root: Default::default(),
         };
         manager
             .validate_block(&valid_child)
@@ -584,6 +591,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, bad_digest.as_ref()),
             digest: bad_digest,
+            merkle_root: Default::default(),
         };
         store.put_block(&bad_ancestor).unwrap();
 
@@ -601,6 +609,7 @@ mod tests {
             statements: Vec::new(),
             signature: crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
 
         assert!(manager.validate_block(&child).is_err());
@@ -633,6 +642,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&genesis).unwrap();
 
@@ -655,6 +665,7 @@ mod tests {
                 StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref(),
             ),
             digest: StatementBlock::compute_digest(0, 1, &parents, &[]),
+            merkle_root: Default::default(),
         };
         let block1 = StatementBlock {
             author: 1,
@@ -667,6 +678,7 @@ mod tests {
                 StatementBlock::compute_digest(1, 1, &parents, &[]).as_ref(),
             ),
             digest: StatementBlock::compute_digest(1, 1, &parents, &[]),
+            merkle_root: Default::default(),
         };
         let block2 = StatementBlock {
             author: 2,
@@ -679,6 +691,7 @@ mod tests {
                 StatementBlock::compute_digest(2, 1, &parents, &[]).as_ref(),
             ),
             digest: StatementBlock::compute_digest(2, 1, &parents, &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&block0).unwrap();
         store.put_block(&block1).unwrap();
@@ -716,6 +729,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&genesis).unwrap();
 
@@ -741,6 +755,7 @@ mod tests {
                     StatementBlock::compute_digest(author, 1, &parents, &[]).as_ref(),
                 ),
                 digest: StatementBlock::compute_digest(author, 1, &parents, &[]),
+                merkle_root: Default::default(),
             };
             store.put_block(&block).unwrap();
         }
@@ -771,6 +786,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&genesis).unwrap();
 
@@ -793,6 +809,7 @@ mod tests {
                 StatementBlock::compute_digest(0, 1, &parents, &[]).as_ref(),
             ),
             digest: StatementBlock::compute_digest(0, 1, &parents, &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&block0).unwrap();
 
@@ -809,6 +826,7 @@ mod tests {
                 StatementBlock::compute_digest(99, 1, &parents, &[]).as_ref(),
             ),
             digest: StatementBlock::compute_digest(99, 1, &parents, &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&block99).unwrap();
 
@@ -840,6 +858,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
         };
         store.put_block(&genesis).unwrap();
 

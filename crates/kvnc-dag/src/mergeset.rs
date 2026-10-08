@@ -24,7 +24,10 @@ pub trait DagReachability {
     fn already_committed(&self) -> &HashSet<Hash>;
 
     /// Get a block by hash (for reading round info).
-    fn get_block(&self, hash: &Hash) -> Result<kvnc_types::block::StatementBlock, crate::DagStoreError>;
+    fn get_block(
+        &self,
+        hash: &Hash,
+    ) -> Result<kvnc_types::block::StatementBlock, crate::DagStoreError>;
 
     /// Get the last committed leader's round, if any.
     fn committed_leader_round(&self) -> Result<Option<u64>, crate::DagStoreError>;
@@ -34,7 +37,10 @@ pub trait DagReachability {
 ///
 /// Simple BFS / DFS implementation. For production, replace with an
 /// indexed version that uses the reachability oracle.
-pub fn compute_mergeset<D: DagReachability>(dag: &D, leader: &Hash) -> Result<Vec<Hash>, crate::DagStoreError> {
+pub fn compute_mergeset<D: DagReachability>(
+    dag: &D,
+    leader: &Hash,
+) -> Result<Vec<Hash>, crate::DagStoreError> {
     let mut result = Vec::new();
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -92,7 +98,10 @@ impl DagReachability for DagStore {
         &EMPTY
     }
 
-    fn get_block(&self, hash: &Hash) -> Result<kvnc_types::block::StatementBlock, crate::DagStoreError> {
+    fn get_block(
+        &self,
+        hash: &Hash,
+    ) -> Result<kvnc_types::block::StatementBlock, crate::DagStoreError> {
         DagStore::get_block(self, hash)
     }
 

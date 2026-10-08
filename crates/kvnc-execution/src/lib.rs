@@ -23,7 +23,9 @@
 use kvnc_consensus::CommittedSubDag;
 use kvnc_runtime::ExecutionConfig;
 use kvnc_staking::{RewardOutcome, StakingError, StakingState};
-use kvnc_storage::{Storage, StorageError, tables, address_to_bytes, state_store::Account, BincodeSerialize};
+use kvnc_storage::{
+    address_to_bytes, state_store::Account, tables, BincodeSerialize, Storage, StorageError,
+};
 use kvnc_types::{Address, Transaction, TransactionKind};
 use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
@@ -230,7 +232,8 @@ impl ExecutionContext {
             .save_staking_state(&txn, &candidate_staking)?;
 
         // 4. Persist transaction receipts
-        let receipts_bytes = bincode::serialize(&receipts).map_err(|e| ExecutionError::Other(format!("receipt serialization: {e}")))?;
+        let receipts_bytes = bincode::serialize(&receipts)
+            .map_err(|e| ExecutionError::Other(format!("receipt serialization: {e}")))?;
         txn.open_table(TX_RECEIPTS)
             .map_err(StorageError::Table)?
             .insert(committed_height, receipts_bytes)
@@ -307,7 +310,10 @@ impl ExecutionContext {
                 tx_hash: tx.hash,
                 success: false,
                 gas_used: 0,
-                error: Some(format!("Nonce mismatch: expected {}, got {}", sender_account.nonce, tx.nonce)),
+                error: Some(format!(
+                    "Nonce mismatch: expected {}, got {}",
+                    sender_account.nonce, tx.nonce
+                )),
                 events: Vec::new(),
             });
         }
@@ -347,9 +353,21 @@ impl ExecutionContext {
             TransactionKind::Deploy { code } => {
                 self.execute_deploy(txn, storage, &tx.sender, code.clone())
             }
-            TransactionKind::Call { contract, method, args, gas_limit } => {
-                self.execute_call(txn, storage, &tx.sender, *contract, method, args, *gas_limit, committed_height)
-            }
+            TransactionKind::Call {
+                contract,
+                method,
+                args,
+                gas_limit,
+            } => self.execute_call(
+                txn,
+                storage,
+                &tx.sender,
+                *contract,
+                method,
+                args,
+                *gas_limit,
+                committed_height,
+            ),
         };
 
         let (success, gas_used, error, events) = match result {
@@ -392,7 +410,9 @@ impl ExecutionContext {
                 .unwrap_or_default()
         };
         if sender_account.balance < amount {
-            return Err(ExecutionError::Validation("Insufficient balance for transfer".to_string()));
+            return Err(ExecutionError::Validation(
+                "Insufficient balance for transfer".to_string(),
+            ));
         }
         sender_account.balance = sender_account.balance.saturating_sub(amount);
         {
@@ -418,7 +438,8 @@ impl ExecutionContext {
         // Emit transfer event
         let events = vec![ContractEvent {
             topic: kvnc_common::events::TOKEN_TRANSFER.to_vec(),
-            data: bincode::serialize(&(from, &to, amount)).map_err(|e| ExecutionError::Other(e.to_string()))?,
+            data: bincode::serialize(&(from, &to, amount))
+                .map_err(|e| ExecutionError::Other(e.to_string()))?,
         }];
 
         Ok(events)
@@ -442,7 +463,9 @@ impl ExecutionContext {
                 .unwrap_or_default()
         };
         if sender_account.balance < amount {
-            return Err(ExecutionError::Validation("Insufficient balance for stake".to_string()));
+            return Err(ExecutionError::Validation(
+                "Insufficient balance for stake".to_string(),
+            ));
         }
         sender_account.balance = sender_account.balance.saturating_sub(amount);
         {
@@ -464,7 +487,8 @@ impl ExecutionContext {
         // Emit stake event
         let events = vec![ContractEvent {
             topic: b"stake".to_vec(),
-            data: bincode::serialize(&(from, amount)).map_err(|e| ExecutionError::Other(e.to_string()))?,
+            data: bincode::serialize(&(from, amount))
+                .map_err(|e| ExecutionError::Other(e.to_string()))?,
         }];
 
         Ok(events)
@@ -479,14 +503,22 @@ impl ExecutionContext {
         amount: u64,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
         // Find delegation
-        let delegation_idx = self.staking.delegations.iter().position(|d| d.delegator == *from && d.validator == *from);
+        let delegation_idx = self
+            .staking
+            .delegations
+            .iter()
+            .position(|d| d.delegator == *from && d.validator == *from);
         let Some(idx) = delegation_idx else {
-            return Err(ExecutionError::Validation("No active delegation found".to_string()));
+            return Err(ExecutionError::Validation(
+                "No active delegation found".to_string(),
+            ));
         };
 
         let delegation = &self.staking.delegations[idx];
         if delegation.amount < amount {
-            return Err(ExecutionError::Validation("Insufficient staked amount to unstake".to_string()));
+            return Err(ExecutionError::Validation(
+                "Insufficient staked amount to unstake".to_string(),
+            ));
         }
 
         // Reduce delegation amount
@@ -516,7 +548,8 @@ impl ExecutionContext {
         // Emit unstake event
         let events = vec![ContractEvent {
             topic: b"unstake".to_vec(),
-            data: bincode::serialize(&(from, amount)).map_err(|e| ExecutionError::Other(e.to_string()))?,
+            data: bincode::serialize(&(from, amount))
+                .map_err(|e| ExecutionError::Other(e.to_string()))?,
         }];
 
         Ok(events)
@@ -531,7 +564,9 @@ impl ExecutionContext {
         code: Vec<u8>,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
         if code.is_empty() {
-            return Err(ExecutionError::Validation("Empty contract code".to_string()));
+            return Err(ExecutionError::Validation(
+                "Empty contract code".to_string(),
+            ));
         }
 
         // Compute contract address: hash(sender || nonce)
@@ -556,7 +591,8 @@ impl ExecutionContext {
         // Emit deploy event
         let events = vec![ContractEvent {
             topic: b"deploy".to_vec(),
-            data: bincode::serialize(&(&contract_addr, &code_hash)).map_err(|e| ExecutionError::Other(e.to_string()))?,
+            data: bincode::serialize(&(&contract_addr, &code_hash))
+                .map_err(|e| ExecutionError::Other(e.to_string()))?,
         }];
 
         Ok(events)
@@ -576,7 +612,9 @@ impl ExecutionContext {
         block_height: u64,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
         // Check contract exists
-        let contract_account = storage.state().get_account_or_default_write(txn, &contract)?;
+        let contract_account = storage
+            .state()
+            .get_account_or_default_write(txn, &contract)?;
         if contract_account.code.is_empty() {
             return Err(ExecutionError::Validation("Contract not found".to_string()));
         }
@@ -666,7 +704,7 @@ impl Default for ExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use Account;
+
     use kvnc_types::{Signature, StatementBlock};
 
     fn sample_block(author: u16) -> StatementBlock {
@@ -683,6 +721,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0u8; 64]),
             digest,
+            merkle_root: Default::default(),
         }
     }
 
@@ -706,6 +745,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0u8; 64]),
             digest,
+            merkle_root: Default::default(),
         }
     }
 
@@ -1217,14 +1257,16 @@ mod tests {
             leader_author: 0,
         };
 
-        let result = ctx.execute_committed_subdag(&subdag, &storage).expect("execute");
+        let result = ctx
+            .execute_committed_subdag(&subdag, &storage)
+            .expect("execute");
         assert_eq!(result.txs_applied, 1);
         assert_eq!(result.receipts.len(), 1);
         assert!(result.receipts[0].success);
 
         // Check balances
-        let sender_bal = read_balance(&storage, &sender);
-        let recipient_bal = read_balance(&storage, &recipient);
+        let _sender_bal = read_balance(&storage, &sender);
+        let _recipient_bal = read_balance(&storage, &recipient);
         // 1000 - 100 (transfer) - 1000 (fee) = -100, but fee is deducted first
         // Actually: 1000 - 1000 (fee) = 0, then transfer 100 fails due to insufficient balance
         // Let me fix the fee to be smaller
@@ -1278,10 +1320,16 @@ mod tests {
             leader_author: 0,
         };
 
-        let result = ctx.execute_committed_subdag(&subdag, &storage).expect("execute");
+        let result = ctx
+            .execute_committed_subdag(&subdag, &storage)
+            .expect("execute");
         assert_eq!(result.txs_applied, 1);
         assert_eq!(result.receipts.len(), 1);
-        assert!(result.receipts[0].success, "Transfer failed: {:?}", result.receipts[0].error);
+        assert!(
+            result.receipts[0].success,
+            "Transfer failed: {:?}",
+            result.receipts[0].error
+        );
 
         // Check balances: 1000 - 100 (transfer) - 1000 (fee) -> need more balance
         // Let's use a smaller fee

@@ -94,7 +94,9 @@ pub fn colour_mergeset(
     for block in blocks {
         let mut parent_hashes = Vec::new();
         for parent_ref in &block.parents {
-            if block_hashes.contains(&parent_ref.digest) || previous_tips.contains(&parent_ref.digest) {
+            if block_hashes.contains(&parent_ref.digest)
+                || previous_tips.contains(&parent_ref.digest)
+            {
                 parent_hashes.push(parent_ref.digest);
             }
         }
@@ -227,6 +229,7 @@ mod tests {
             statements: tag.as_bytes().to_vec(),
             signature: Signature([0u8; 64]),
             digest: Hash::new(format!("kvnc-test/{tag}").as_bytes()),
+            merkle_root: Default::default(),
         }
     }
 
@@ -270,7 +273,10 @@ mod tests {
 
         // Blue ordered should be genesis, b1, b2, b3
         let ordered = result.blue_ordered();
-        assert_eq!(ordered, vec![genesis.digest, b1.digest, b2.digest, b3.digest]);
+        assert_eq!(
+            ordered,
+            vec![genesis.digest, b1.digest, b2.digest, b3.digest]
+        );
     }
 
     #[test]
@@ -317,13 +323,26 @@ mod tests {
         // Exactly 4 of the 5 conflicting blocks should be blue (plus genesis = 5 total)
         // The specific 4 depends on hash ordering, but exactly one should be red
         let conflicting_blocks = [b1.digest, b2.digest, b3.digest, b4.digest, b5.digest];
-        let blue_conflicting: Vec<_> = result.blue.iter()
+        let blue_conflicting: Vec<_> = result
+            .blue
+            .iter()
             .filter(|h| conflicting_blocks.contains(h))
             .copied()
             .collect();
-        assert_eq!(blue_conflicting.len(), 4, "Exactly 4 of 5 conflicting blocks should be blue");
-        assert!(result.blue.contains(&genesis.digest), "Genesis should be blue");
-        assert_eq!(result.blue.len(), 5, "Total blue: genesis + 4 conflicting = 5");
+        assert_eq!(
+            blue_conflicting.len(),
+            4,
+            "Exactly 4 of 5 conflicting blocks should be blue"
+        );
+        assert!(
+            result.blue.contains(&genesis.digest),
+            "Genesis should be blue"
+        );
+        assert_eq!(
+            result.blue.len(),
+            5,
+            "Total blue: genesis + 4 conflicting = 5"
+        );
     }
 
     #[test]
@@ -357,12 +376,7 @@ mod tests {
         let genesis = make_block(0, 0, vec![], "genesis");
         let b1 = make_block(1, 1, vec![block_ref(&genesis)], "b1");
         let b2 = make_block(2, 1, vec![block_ref(&genesis)], "b2");
-        let b3 = make_block(
-            3,
-            2,
-            vec![block_ref(&b1), block_ref(&b2)],
-            "b3",
-        );
+        let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
 
         let blocks = vec![genesis.clone(), b1.clone(), b2.clone(), b3.clone()];
         let result = colour_mergeset(&blocks, 3, &[]);
@@ -385,12 +399,7 @@ mod tests {
         let genesis = make_block(0, 0, vec![], "genesis");
         let b1 = make_block(1, 1, vec![block_ref(&genesis)], "b1");
         let b2 = make_block(2, 1, vec![block_ref(&genesis)], "b2");
-        let b3 = make_block(
-            3,
-            2,
-            vec![block_ref(&b1), block_ref(&b2)],
-            "b3",
-        );
+        let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
 
         let blocks = vec![genesis.clone(), b1.clone(), b2.clone(), b3.clone()];
         let result = colour_mergeset(&blocks, 3, &[]);

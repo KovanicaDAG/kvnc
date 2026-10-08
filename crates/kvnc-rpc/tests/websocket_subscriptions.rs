@@ -20,9 +20,7 @@ use kvnc_mempool::{Mempool, MempoolConfig};
 use kvnc_rpc::{EventBus, RpcServer, RpcState};
 use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
 use kvnc_storage::Storage;
-use kvnc_types::{
-    crypto::PublicKey, Address, Hash, Signature, StatementBlock,
-};
+use kvnc_types::{crypto::PublicKey, Address, Hash, Signature, StatementBlock};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -115,6 +113,7 @@ async fn websocket_receives_new_head_notification() {
         statements: Vec::new(),
         signature: Signature([0u8; 64]),
         digest: Hash([0x42; 32]),
+        merkle_root: Default::default(),
     };
     events.publish_new_head(&block);
 
@@ -156,7 +155,10 @@ async fn websocket_unsubscribe_stops_notifications() {
 
     // No frame should arrive after unsubscribing.
     let quiet = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
-    assert!(quiet.is_err(), "received unexpected frame after unsubscribe");
+    assert!(
+        quiet.is_err(),
+        "received unexpected frame after unsubscribe"
+    );
 
     // Re-subscribing resumes delivery.
     send_json(
@@ -201,6 +203,7 @@ async fn websocket_receives_committed_leader_notification() {
         statements: Vec::new(),
         signature: Signature([0u8; 64]),
         digest: Hash([0x24; 32]),
+        merkle_root: Default::default(),
     };
     let subdag = CommittedSubDag {
         blocks: vec![leader.clone()],

@@ -72,7 +72,7 @@ impl StatementBlock {
         }
         let mut current: Vec<Hash> = self.transactions.iter().map(|tx| tx.hash()).collect();
         while current.len() > 1 {
-            let mut next = Vec::with_capacity((current.len() + 1) / 2);
+            let mut next = Vec::with_capacity(current.len().div_ceil(2));
             for chunk in current.chunks(2) {
                 if chunk.len() == 2 {
                     let mut data = Vec::with_capacity(64);
@@ -95,7 +95,7 @@ impl StatementBlock {
         }
         let mut current: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
         while current.len() > 1 {
-            let mut next = Vec::with_capacity((current.len() + 1) / 2);
+            let mut next = Vec::with_capacity(current.len().div_ceil(2));
             for chunk in current.chunks(2) {
                 if chunk.len() == 2 {
                     let mut data = Vec::with_capacity(64);
@@ -125,7 +125,10 @@ mod tests {
         Transaction {
             sender: Address([0; 32]),
             nonce: 0,
-            kind: crate::transaction::TransactionKind::Transfer { to: Address([1; 32]), amount: 100 },
+            kind: crate::transaction::TransactionKind::Transfer {
+                to: Address([1; 32]),
+                amount: 100,
+            },
             fee: 0,
             signature: Signature([0; 64]),
             hash,

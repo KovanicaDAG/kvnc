@@ -116,19 +116,33 @@ impl Mempool {
         let mut by_fee_rate = self.by_fee_rate.write();
         // Phase 16.5: conflict-aware selection — collect, filter contiguous nonce per sender, sort by fee
         let mut all: Vec<Transaction> = Vec::new();
-        for (_, txs) in by_fee_rate.iter_mut() {
-            while let Some(tx) = txs.pop_front() { all.push(tx); }
+        for txs in by_fee_rate.values_mut() {
+            while let Some(tx) = txs.pop_front() {
+                all.push(tx);
+            }
         }
-        let mut by_sender: std::collections::BTreeMap<String, Vec<Transaction>> = std::collections::BTreeMap::new();
-        for tx in all { by_sender.entry(format!("{:?}", tx.sender)).or_default().push(tx); }
+        let mut by_sender: std::collections::BTreeMap<String, Vec<Transaction>> =
+            std::collections::BTreeMap::new();
+        for tx in all {
+            by_sender
+                .entry(format!("{:?}", tx.sender))
+                .or_default()
+                .push(tx);
+        }
         let mut result = Vec::new();
         for (_, mut txs) in by_sender {
             txs.sort_by_key(|tx| tx.nonce);
             let mut expected = txs.first().map(|t| t.nonce).unwrap_or(0);
-            for tx in txs { if tx.nonce == expected { result.push(tx); expected += 1; } }
+            for tx in txs {
+                if tx.nonce == expected {
+                    result.push(tx);
+                    expected += 1;
+                }
+            }
         }
         result.sort_by(|a, b| b.fee.cmp(&a.fee).then_with(|| a.sender.0.cmp(&b.sender.0)));
-        result.truncate(max_txs); result
+        result.truncate(max_txs);
+        result
     }
 
     /// Remove transactions that have been included in a committed block.
@@ -192,7 +206,7 @@ impl Mempool {
         }
 
         // 2. Load sender account from storage
-        let mut txn = self.storage.begin_read()?;
+        let txn = self.storage.begin_read()?;
         let state = self.storage.state();
         let account = state.get_account_or_default(&txn, &tx.sender)?;
 
@@ -204,7 +218,12 @@ impl Mempool {
             });
         }
 
-        // 4. Check balance sufficient for fee + immediate value
+        // 4. Reject zero-fee transactions except stake (fee-free by design).
+        if tx.fee == 0 && !matches!(tx.kind, TransactionKind::Stake { .. }) {
+            return Err(MempoolError::ZeroFee);
+        }
+
+        // 5. Check balance sufficient for fee + immediate value
         let immediate_value = match &tx.kind {
             TransactionKind::Transfer { amount, .. } => *amount,
             TransactionKind::Stake { amount } => *amount,
@@ -220,14 +239,14 @@ impl Mempool {
             });
         }
 
-        // 5. Check gas limit (already partially done, but move here for completeness)
+        // 6. Check gas limit (already partially done, but move here for completeness)
         if let TransactionKind::Call { gas_limit, .. } = &tx.kind {
             if *gas_limit > self.config.max_gas_limit {
                 return Err(MempoolError::GasLimitTooHigh);
             }
         }
 
-        // 6. Check transaction size (already done, but keep)
+        // 7. Check transaction size (already done, but keep)
         let tx_size = bincode::serialize(tx).unwrap_or_default().len();
         if tx_size > self.config.max_tx_size {
             return Err(MempoolError::TransactionTooLarge(tx_size));
@@ -360,11 +379,11 @@ pub enum MempoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvnc_crypto::{generate_keypair};
-    use kvnc_storage::Storage;
+
     use kvnc_storage::state_store::Account;
-    use kvnc_types::{Address, Signature};
+    use kvnc_storage::Storage;
     use kvnc_types::crypto::{PublicKey, SigningKey};
+    use kvnc_types::{Address, Signature};
     use std::{fs, path::PathBuf};
 
     const STRESS_TX_COUNT: usize = 10_000;
@@ -378,17 +397,17 @@ mod tests {
     ) -> Transaction {
         let kind_for_tx = kind.clone();
         let mut tx = Transaction {
-            sender: sender.clone(),
+            sender,
             nonce,
             kind: kind_for_tx,
             fee,
             signature: Signature([0; 64]),
             hash: Hash::zero(),
         };
-        
+
         let signing_hash = tx.signing_hash();
         let signature = kvnc_crypto::sign(signing_key, signing_hash.as_ref());
-        
+
         tx.signature = signature;
         tx.hash = signing_hash;
         tx
@@ -396,11 +415,14 @@ mod tests {
 
     fn stress_keypair() -> (SigningKey, PublicKey) {
         let (sk, vk) = kvnc_crypto::generate_keypair();
-        let pk = PublicKey::from(vk);
+        let pk = vk;
         (sk, pk)
     }
 
-    fn stress_transaction(index: usize, (signing_key, _public_key): (SigningKey, PublicKey)) -> Transaction {
+    fn stress_transaction(
+        index: usize,
+        (signing_key, _public_key): (SigningKey, PublicKey),
+    ) -> Transaction {
         let mut recipient = [0; 32];
         recipient[..8].copy_from_slice(&(index as u64).to_be_bytes());
 
@@ -414,15 +436,15 @@ mod tests {
 
         // Build signed transaction - nonce = 0 since all are submitted simultaneously
         let fee = 1;
-        let mut tx = build_signed_tx(sender.clone(), 0, kind.clone(), fee, &signing_key);
-        
+        let mut tx = build_signed_tx(sender, 0, kind.clone(), fee, &signing_key);
+
         // Keep the fee rate in ten deterministic buckets while ensuring every
         // transaction has a non-zero fee and the same serialized size.
         let size = bincode::serialize(&tx)
             .expect("serialize stress transaction")
             .len();
         tx.fee = size as u64 * (1 + (index % 10) as u64);
-        
+
         // Re-sign with updated fee since fee is part of the signing hash
         let signing_hash = tx.signing_hash();
         tx.signature = kvnc_crypto::sign(&signing_key, signing_hash.as_ref());
@@ -441,23 +463,28 @@ mod tests {
         let _ = fs::remove_file(&db_path);
         let storage = Arc::new(Storage::new(&db_path).expect("create test storage"));
 
-        // Initialize test account in storage with sufficient balance
-        let (signing_key, public_key) = stress_keypair();
-        let sender = Address::from_public_key(&public_key);
+        // Conflict-aware selection (Phase 16.5) only inlines a contiguous nonce
+        // sequence per sender, so a 10k stress pool must use 10k distinct
+        // senders (each at nonce 0) to exercise the full selection path.
+        let keypairs: Vec<(SigningKey, PublicKey)> =
+            (0..STRESS_TX_COUNT).map(|_| stress_keypair()).collect();
 
-        // Set up account in storage with balance = 1_000_000 and nonce = 0
-        let mut write_txn = storage.begin_write().unwrap();
+        // Set up one funded account per sender.
+        let write_txn = storage.begin_write().unwrap();
         {
             let state = storage.state();
-            let mut account = Account {
-                balance: 1_000_000,
-                nonce: 0,
-                code_hash: [0; 32],
-                code: Vec::new(),
-            };
-            state.set_account(&mut write_txn, &sender, &account).unwrap();
+            for (_, public_key) in &keypairs {
+                let sender = Address::from_public_key(public_key);
+                let account = Account {
+                    balance: 1_000_000,
+                    nonce: 0,
+                    code_hash: [0; 32],
+                    code: Vec::new(),
+                };
+                state.set_account(&write_txn, &sender, &account).unwrap();
+            }
         }
-        drop(write_txn);
+        write_txn.commit().unwrap();
 
         let config = MempoolConfig {
             // 64 MiB is deliberately much larger than the serialized 10k set.
@@ -468,7 +495,7 @@ mod tests {
         let pool = Mempool::new(config.clone(), storage.clone());
 
         let transactions: Vec<_> = (0..STRESS_TX_COUNT)
-            .map(|i| stress_transaction(i, (signing_key.clone(), public_key.clone())))
+            .map(|i| stress_transaction(i, keypairs[i].clone()))
             .collect();
         let expected_total_size: usize = transactions
             .iter()
@@ -536,37 +563,40 @@ mod tests {
 
     #[test]
     fn test_transaction_validation_edge_cases() {
-        use kvnc_crypto::{generate_keypair};
+        use kvnc_crypto::generate_keypair;
         use kvnc_types::transaction::TransactionKind;
-        
-        let db_path = std::env::temp_dir().join(format!("kvnc-mempool-validation-test-{}.redb", std::process::id()));
+
+        let db_path = std::env::temp_dir().join(format!(
+            "kvnc-mempool-validation-test-{}.redb",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&db_path);
         let storage = Arc::new(Storage::new(&db_path).expect("create test storage"));
-        
+
         // Create a test account with known balance and nonce
         let (signing_key, public_key) = generate_keypair();
         let sender = Address::from_public_key(&public_key);
-        
+
         // Set up account in storage with balance = 1000 and nonce = 5
-        let mut txn = storage.begin_write().unwrap();
+        let txn = storage.begin_write().unwrap();
         {
             let state = storage.state();
-            let mut account = Account {
+            let account = Account {
                 balance: 1000,
                 nonce: 5,
                 code_hash: [0; 32],
                 code: Vec::new(),
             };
-            state.set_account(&mut txn, &sender, &account).unwrap();
+            state.set_account(&txn, &sender, &account).unwrap();
         }
-        drop(txn);
-        
+        txn.commit().unwrap();
+
         let config = MempoolConfig::default();
         let pool = Mempool::new(config, storage.clone());
-        
+
         // Test 1: Valid transaction should pass
         let valid_tx = build_signed_tx(
-            sender.clone(),
+            sender,
             5, // matches account nonce
             TransactionKind::Transfer {
                 to: Address([2u8; 32]),
@@ -575,36 +605,80 @@ mod tests {
             10, // fee
             &signing_key,
         );
-        
-        assert!(pool.add_transaction(valid_tx.clone()).is_ok(), "Valid transaction accepted");
-        
+
+        assert!(
+            pool.add_transaction(valid_tx.clone()).is_ok(),
+            "Valid transaction accepted"
+        );
+
         // Test 2: Transaction with invalid signature should be rejected
-        let mut invalid_sig_tx = valid_tx.clone();
+        // (distinct recipient so its hash is not a duplicate of `valid_tx`)
+        let mut invalid_sig_tx = build_signed_tx(
+            sender,
+            5,
+            TransactionKind::Transfer {
+                to: Address([9u8; 32]),
+                amount: 100,
+            },
+            10,
+            &signing_key,
+        );
         invalid_sig_tx.signature = Signature([0; 64]); // Invalid signature
-        assert!(matches!(
-            pool.add_transaction(invalid_sig_tx.clone()),
-            Err(MempoolError::InvalidSignature)
-        ), "Transaction with invalid signature should be rejected");
-        
+        assert!(
+            matches!(
+                pool.add_transaction(invalid_sig_tx.clone()),
+                Err(MempoolError::InvalidSignature)
+            ),
+            "Transaction with invalid signature should be rejected"
+        );
+
         // Test 3: Transaction with wrong nonce (too low) should be rejected
-        let mut low_nonce_tx = valid_tx.clone();
-        low_nonce_tx.nonce = 4; // Less than account nonce (5)
-        assert!(matches!(
-            pool.add_transaction(low_nonce_tx.clone()),
-            Err(MempoolError::InvalidNonce { expected: 5, got: 4 })
-        ), "Transaction with nonce too low should be rejected");
-        
+        let low_nonce_tx = build_signed_tx(
+            sender,
+            4, // Less than account nonce (5)
+            TransactionKind::Transfer {
+                to: Address([2u8; 32]),
+                amount: 100,
+            },
+            10,
+            &signing_key,
+        );
+        assert!(
+            matches!(
+                pool.add_transaction(low_nonce_tx.clone()),
+                Err(MempoolError::InvalidNonce {
+                    expected: 5,
+                    got: 4
+                })
+            ),
+            "Transaction with nonce too low should be rejected"
+        );
+
         // Test 4: Transaction with wrong nonce (too high) should be rejected
-        let mut high_nonce_tx = valid_tx.clone();
-        high_nonce_tx.nonce = 6; // Greater than account nonce (5)
-        assert!(matches!(
-            pool.add_transaction(high_nonce_tx.clone()),
-            Err(MempoolError::InvalidNonce { expected: 5, got: 6 })
-        ), "Transaction with nonce too high should be rejected");
-        
+        let high_nonce_tx = build_signed_tx(
+            sender,
+            6, // Greater than account nonce (5)
+            TransactionKind::Transfer {
+                to: Address([2u8; 32]),
+                amount: 100,
+            },
+            10,
+            &signing_key,
+        );
+        assert!(
+            matches!(
+                pool.add_transaction(high_nonce_tx.clone()),
+                Err(MempoolError::InvalidNonce {
+                    expected: 5,
+                    got: 6
+                })
+            ),
+            "Transaction with nonce too high should be rejected"
+        );
+
         // Test 5: Transaction with insufficient balance should be rejected
-        let mut insufficient_balance_tx = build_signed_tx(
-            sender.clone(),
+        let insufficient_balance_tx = build_signed_tx(
+            sender,
             5, // matches account nonce
             TransactionKind::Transfer {
                 to: Address([3u8; 32]),
@@ -613,14 +687,20 @@ mod tests {
             10, // fee
             &signing_key,
         );
-        assert!(matches!(
-            pool.add_transaction(insufficient_balance_tx.clone()),
-            Err(MempoolError::InsufficientBalance { balance: 1000, required: 1010 })
-        ), "Transaction with insufficient balance should be rejected");
-        
+        assert!(
+            matches!(
+                pool.add_transaction(insufficient_balance_tx.clone()),
+                Err(MempoolError::InsufficientBalance {
+                    balance: 1000,
+                    required: 1010
+                })
+            ),
+            "Transaction with insufficient balance should be rejected"
+        );
+
         // Test 6: Transaction with zero fee (non-stake) should be rejected
-        let mut zero_fee_tx = build_signed_tx(
-            sender.clone(),
+        let zero_fee_tx = build_signed_tx(
+            sender,
             5, // matches account nonce
             TransactionKind::Transfer {
                 to: Address([4u8; 32]),
@@ -629,21 +709,27 @@ mod tests {
             0, // zero fee
             &signing_key,
         );
-        assert!(matches!(
-            pool.add_transaction(zero_fee_tx.clone()),
-            Err(MempoolError::ZeroFee)
-        ), "Transaction with zero fee (non-stake) should be rejected");
-        
+        assert!(
+            matches!(
+                pool.add_transaction(zero_fee_tx.clone()),
+                Err(MempoolError::ZeroFee)
+            ),
+            "Transaction with zero fee (non-stake) should be rejected"
+        );
+
         // Test 7: Stake transaction with zero fee should be allowed
         let stake_tx = build_signed_tx(
-            sender.clone(),
+            sender,
             5, // matches account nonce
             TransactionKind::Stake { amount: 50 },
             0, // zero fee allowed for stake
             &signing_key,
         );
-        assert!(pool.add_transaction(stake_tx).is_ok(), "Stake transaction with zero fee should be accepted");
-        
+        assert!(
+            pool.add_transaction(stake_tx).is_ok(),
+            "Stake transaction with zero fee should be accepted"
+        );
+
         // Clean up
         drop(pool);
         drop(storage);

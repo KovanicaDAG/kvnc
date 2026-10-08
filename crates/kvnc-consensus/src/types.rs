@@ -243,13 +243,12 @@ mod stake_weighted_tests {
 
     #[test]
     fn stake_weighted_deterministic() {
-        let authorities = vec![
-            info(0, 100),
-            info(1, 200),
-            info(2, 300),
-        ];
+        let authorities = vec![info(0, 100), info(1, 200), info(2, 300)];
         let committee = CommitteeInfo::try_new(0, authorities).unwrap();
-        assert_eq!(committee.stake_weighted_leader(42), committee.stake_weighted_leader(42));
+        assert_eq!(
+            committee.stake_weighted_leader(42),
+            committee.stake_weighted_leader(42)
+        );
     }
 
     #[test]

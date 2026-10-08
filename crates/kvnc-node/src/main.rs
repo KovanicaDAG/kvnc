@@ -26,10 +26,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use serde::Deserialize;
+use clap::{Parser, Subcommand};
 use multiaddr::Multiaddr;
 use parking_lot::RwLock;
+use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -42,7 +42,9 @@ use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
 use kvnc_rpc::{EventBus, RpcServer, RpcState};
-use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE, MAX_ACTIVE_VALIDATORS, FOUNDER_PREMINE, ONE_KVNC};
+use kvnc_staking::{
+    StakingState, FOUNDER_PREMINE, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC,
+};
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
@@ -69,7 +71,7 @@ enum Commands {
     Genesis(GenesisArgs),
 }
 
-#[derive(Args, Debug)]
+#[derive(clap::Args, Debug)]
 struct GenesisArgs {
     /// Path to validators JSON file (array: {address, public_key?, stake?})
     #[arg(long, value_name = "FILE", default_value = "validators.json")]
@@ -83,7 +85,6 @@ struct GenesisArgs {
     #[arg(long, value_name = "FILE", default_value = "genesis.json")]
     output: String,
 }
-
 
 /// Outbound network commands handled by the network task.
 enum NetworkCommand {
@@ -122,53 +123,25 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     // Read validators JSON
     let text = fs::read_to_string(&args.validators)
         .with_context(|| format!("reading validators {}", args.validators))?;
-    let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", args.validators))?;
+    let validators_input: Vec<GenesisValidatorInput> =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", args.validators))?;
 
     // Build treasury
     let treasury = parse_address_hex(Some(&args.treasury_address))?;
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
-    // Load full validator set from validators.json (Phase 14 ceremony) if present.
-    let validators_json_path = config.data_dir.join("validators.json");
-    if validators_json_path.exists() {
-        let text = std::fs::read_to_string(&validators_json_path)
-            .with_context(|| format!("reading {}", validators_json_path.display()))?;
-        let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", validators_json_path.display()))?;
-        for v in validators_input {
-            let address = parse_address_hex(Some(&v.address))?;
-            let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
-            let stake = v.stake.unwrap_or(kvnc_staking::MIN_VALIDATOR_STAKE);
-            staking.join_validator(address, stake, 0, Some(address), pk)?;
-        }
-        info!(count = validators_input.len(), "loaded validators.json");
-    }
-
-    // Begin write transaction early (needed for premine + staking save)
-    let txn = state_storage.begin_write()?;
-
-    // Founder premine (200_000 KVNC) — write to state store if founder file present.
-    let premine_path = config.data_dir.join("founder_premine.hex");
-    if premine_path.exists() {
-        let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
-        if !hex.is_empty() {
-            let founder = parse_address_hex(Some(&hex))?;
-            use kvnc_storage::state_store::Account;
-            let state = state_storage.state();
-            let acct = Account { balance: kvnc_staking::FOUNDER_PREMINE, nonce: 0, code_hash: [0;32], code: vec![] };
-            state.set_account(&txn, &founder, &acct)?;
-            info!(address = %founder, "founder premine applied");
-        }
-    }
-
     // Join each validator
     for v in validators_input {
         let address = parse_address_hex(Some(&v.address))?;
-        let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
+        let pk = v
+            .public_key
+            .as_ref()
+            .map(|s| parse_public_key_hex(s))
+            .transpose()?;
         let stake = v.stake.unwrap_or(MIN_VALIDATOR_STAKE);
-        staking.join_validator(address, stake, 0, Some(address), pk)
+        staking
+            .join_validator(address, stake, 0, Some(address), pk)
             .with_context(|| format!("joining validator {}", v.address))?;
     }
 
@@ -314,7 +287,11 @@ where
             .iter()
             .find(|a| a.public_key == public_key)
             .map(|a| a.index)
-            .ok_or_else(|| anyhow::anyhow!("local validator public key not found in committee; cannot run as validator"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "local validator public key not found in committee; cannot run as validator"
+                )
+            })?
     } else {
         info!("run_validator=false; not participating in consensus");
         u16::MAX // Invalid authority index
@@ -406,7 +383,11 @@ where
             inner: block_manager.clone(),
         })),
         signing_key.clone(),
-        if config.run_validator { Some(mempool.clone()) } else { None },
+        if config.run_validator {
+            Some(mempool.clone())
+        } else {
+            None
+        },
     ));
 
     // Subscribe to consensus engine's round changes
@@ -525,9 +506,13 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
             .with_context(|| format!("reading {}", validators_json_path.display()))?;
         let validators_input: Vec<GenesisValidatorInput> = serde_json::from_str(&text)
             .with_context(|| format!("parsing {}", validators_json_path.display()))?;
-        for v in validators_input {
+        for v in &validators_input {
             let address = parse_address_hex(Some(&v.address))?;
-            let pk = v.public_key.as_ref().map(|s| parse_public_key_hex(s)).transpose()?;
+            let pk = v
+                .public_key
+                .as_ref()
+                .map(|s| parse_public_key_hex(s))
+                .transpose()?;
             let stake = v.stake.unwrap_or(kvnc_staking::MIN_VALIDATOR_STAKE);
             staking.join_validator(address, stake, 0, Some(address), pk)?;
         }
@@ -545,7 +530,12 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
             let founder = parse_address_hex(Some(&hex))?;
             use kvnc_storage::state_store::Account;
             let state = state_storage.state();
-            let acct = Account { balance: kvnc_staking::FOUNDER_PREMINE, nonce: 0, code_hash: [0;32], code: vec![] };
+            let acct = Account {
+                balance: kvnc_staking::FOUNDER_PREMINE,
+                nonce: 0,
+                code_hash: [0; 32],
+                code: vec![],
+            };
             state.set_account(&txn, &founder, &acct)?;
             info!(address = %founder, "founder premine applied");
         }
@@ -554,10 +544,18 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     // Load 4-node validator set from genesis file if present (Phase 16.6).
     let genesis_validators_path = config.data_dir.join("genesis_validators.toml");
     if genesis_validators_path.exists() {
-        let text = std::fs::read_to_string(&genesis_validators_path)
-            .with_context(|| format!("reading genesis validators {}", genesis_validators_path.display()))?;
-        let validators: Vec<GenesisValidatorEntry> = toml::from_str(&text)
-            .with_context(|| format!("parsing genesis validators {}", genesis_validators_path.display()))?;
+        let text = std::fs::read_to_string(&genesis_validators_path).with_context(|| {
+            format!(
+                "reading genesis validators {}",
+                genesis_validators_path.display()
+            )
+        })?;
+        let validators: Vec<GenesisValidatorEntry> = toml::from_str(&text).with_context(|| {
+            format!(
+                "parsing genesis validators {}",
+                genesis_validators_path.display()
+            )
+        })?;
         let count = validators.len();
         for v in validators {
             let address = parse_address_hex(Some(&v.address))?;
@@ -684,20 +682,20 @@ fn handle_network_event(
     match event {
         NetworkEvent::BlockReceived(block) => {
             // Hot-path validation (audit 3.1): verify signature before engine.process_block
-            if let Err(e) = kvnc_crypto::verify_batch(&[block.clone()]) {
+            if let Err(e) = kvnc_crypto::verify_batch(std::slice::from_ref(&block)) {
                 warn!(digest = %block.digest, error = %e, "rejected invalid block signature in main hot path");
                 return;
             }
             match engine.process_block(&block) {
-            Ok(()) => {
-                debug!(digest = %block.digest, "validated received block into consensus");
-                events.publish_new_head(&block);
+                Ok(()) => {
+                    debug!(digest = %block.digest, "validated received block into consensus");
+                    events.publish_new_head(&block);
+                }
+                Err(e) => {
+                    warn!(digest = %block.digest, error = %e, "rejected received consensus block")
+                }
             }
-            Err(e) => {
-                warn!(digest = %block.digest, error = %e, "rejected received consensus block")
-            }
-            }
-        },
+        }
         NetworkEvent::TransactionReceived(tx) => match mempool.add_transaction(tx.clone()) {
             Ok(()) => {
                 events.publish_pending_transaction(&tx);
@@ -874,7 +872,11 @@ impl BlockManagerTrait for NodeBlockManager {
         self.inner.propose_block(round)
     }
 
-    fn propose_block_with_txs(&self, round: Round, transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
+    fn propose_block_with_txs(
+        &self,
+        round: Round,
+        transactions: Vec<Transaction>,
+    ) -> Result<StatementBlock, BlockManagerError> {
         self.inner.propose_block_with_txs(round, transactions)
     }
 
@@ -898,7 +900,7 @@ fn recover_committed_subdags(
 ) -> Result<Vec<kvnc_consensus::CommittedSubDag>> {
     let rounds = dag_store.get_decided_rounds(u64::MAX)?;
     let mut subdags = Vec::new();
-    
+
     // Pre-compute all decided leaders for previous tips
     let mut all_previous_tips = Vec::new();
     for round in &rounds {
@@ -925,7 +927,12 @@ fn recover_committed_subdags(
 
             if use_mysticghost {
                 // MysticGhost path: use scoped GHOSTDAG colouring
-                let subdag = recover_committed_subdag_mysticghost(dag_store, &leader, round, &all_previous_tips)?;
+                let subdag = recover_committed_subdag_mysticghost(
+                    dag_store,
+                    &leader,
+                    round,
+                    &all_previous_tips,
+                )?;
                 subdags.push(subdag);
             } else {
                 // Original linearizer path (bit-identical to current behaviour)
@@ -956,10 +963,10 @@ fn recover_committed_subdag_mysticghost(
     previous_tips: &[Hash],
 ) -> Result<kvnc_consensus::CommittedSubDag> {
     use kvnc_consensus::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
-    
+
     // 1. Get mergeset hashes
     let mergeset_hashes = dag_store.mergeset(&leader_block.digest)?;
-    
+
     // 2. Get mergeset blocks
     let mut mergeset_blocks = Vec::new();
     for hash in mergeset_hashes {
@@ -967,38 +974,39 @@ fn recover_committed_subdag_mysticghost(
             mergeset_blocks.push(block);
         }
     }
-    
+
     // 3. Configure MysticGhost
     let mg_config = MysticGhostConfig {
         enabled: true,
         k: 3,
         max_mergeset_blocks: 2_000,
     };
-    
+
     // 4. Run MysticGhost ordering
     match order_committed_wave(&mg_config, &mergeset_blocks, previous_tips) {
         MysticGhostOrder::Ghost { colouring } => {
             // Use the blue-set order from GHOSTDAG
             let blue_ordered = colouring.blue_ordered();
-            
+
             // Build blocks in blue order, filtering to only those in mergeset
-            let block_map: std::collections::HashMap<Hash, StatementBlock> = mergeset_blocks
-                .into_iter()
-                .map(|b| (b.digest, b))
-                .collect();
-            
+            let block_map: std::collections::HashMap<Hash, StatementBlock> =
+                mergeset_blocks.into_iter().map(|b| (b.digest, b)).collect();
+
             let mut ordered_blocks = Vec::new();
             for hash in blue_ordered {
                 if let Some(block) = block_map.get(&hash) {
                     ordered_blocks.push(block.clone());
                 }
             }
-            
+
             // Ensure leader is included (should be blue)
-            if !ordered_blocks.iter().any(|b| b.digest == leader_block.digest) {
+            if !ordered_blocks
+                .iter()
+                .any(|b| b.digest == leader_block.digest)
+            {
                 ordered_blocks.push(leader_block.clone());
             }
-            
+
             Ok(kvnc_consensus::CommittedSubDag {
                 blocks: ordered_blocks,
                 leader: leader_block.clone(),
@@ -1054,8 +1062,15 @@ fn build_committee(
 
     // Take up to MAX_ACTIVE_VALIDATORS top validators by stake (then by address for tie-breaking)
     // Sort by stake desc, take top 21, then sort by address for index assignment.
-    active_validators.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.address.0.cmp(&b.address.0)));
-    let top_validators = active_validators.into_iter().take(MAX_ACTIVE_VALIDATORS).collect::<Vec<_>>();
+    active_validators.sort_by(|a, b| {
+        b.stake
+            .cmp(&a.stake)
+            .then_with(|| a.address.0.cmp(&b.address.0))
+    });
+    let top_validators = active_validators
+        .into_iter()
+        .take(MAX_ACTIVE_VALIDATORS)
+        .collect::<Vec<_>>();
 
     // Re-sort by address for stable index assignment
     let mut top_validators = top_validators;
@@ -1126,7 +1141,8 @@ struct GenesisValidatorEntry {
 
 /// Parse a 32-byte hex public key (PublicKey is [u8; 32]).
 fn parse_public_key_hex(value: &str) -> Result<PublicKey> {
-    let bytes = hex::decode(value.trim()).with_context(|| format!("invalid public key hex `{}`", value))?;
+    let bytes =
+        hex::decode(value.trim()).with_context(|| format!("invalid public key hex `{}`", value))?;
     if bytes.len() != 32 {
         anyhow::bail!("public key must be 32 bytes, got {}", bytes.len());
     }
@@ -1223,7 +1239,7 @@ fn parse_address_hex(value: Option<&str>) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvnc_staking::{MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC, StakingState};
+    use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC};
     use kvnc_storage::BincodeSerialize;
     use redb::{Database, TableDefinition};
     use std::collections::HashMap;
@@ -1269,6 +1285,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest,
+            merkle_root: Default::default(),
         };
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
@@ -1293,6 +1310,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest: valid_digest,
+            merkle_root: Default::default(),
         };
         dag.put_block(&valid_block).unwrap();
         dag.mark_round_decided(1, &valid_digest).unwrap();
@@ -1317,6 +1335,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest,
+            merkle_root: Default::default(),
         };
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
@@ -1347,6 +1366,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest,
+            merkle_root: Default::default(),
         };
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
@@ -1367,7 +1387,9 @@ mod tests {
 
         let storage = Storage::new(&db_path).unwrap();
         let dag = DagStore::new(storage).unwrap();
-        let error = recover_committed_subdags(&dag, false).unwrap_err().to_string();
+        let error = recover_committed_subdags(&dag, false)
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("block digest"),
             "recovery error should identify the mismatched block digest: {error}"
@@ -1392,6 +1414,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest,
+            merkle_root: Default::default(),
         };
         dag.put_block(&block).unwrap();
         dag.mark_round_decided(1, &digest).unwrap();
@@ -1414,7 +1437,13 @@ mod tests {
         let payout = Address([0x91; 32]);
         let mut staking = StakingState::new();
         staking
-            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout), Some(public_key))
+            .join_validator(
+                validator_address,
+                MIN_VALIDATOR_STAKE,
+                0,
+                Some(payout),
+                Some(public_key),
+            )
             .unwrap();
         let txn = state_storage.begin_write().unwrap();
         state_storage
@@ -1423,8 +1452,13 @@ mod tests {
             .unwrap();
         txn.commit().unwrap();
 
-        let committee = build_committee(&state_storage, &public_key, &validator_address, "127.0.0.1:0")
-            .expect("single-validator committee is valid");
+        let committee = build_committee(
+            &state_storage,
+            &public_key,
+            &validator_address,
+            "127.0.0.1:0",
+        )
+        .expect("single-validator committee is valid");
         let block_manager = Arc::new(BlockManager::new(dag.clone()));
         block_manager.set_authority(0);
         block_manager.set_signing_key(signing_key.clone());
@@ -1459,6 +1493,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&signing_key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
         engine.process_vote(leader_round, 0, digest).unwrap();
@@ -1499,7 +1534,13 @@ mod tests {
         let payout = Address([0xa1; 32]);
         let mut staking = StakingState::new();
         staking
-            .join_validator(validator_address, MIN_VALIDATOR_STAKE, 0, Some(payout), Some(PublicKey([0x22; 32])))
+            .join_validator(
+                validator_address,
+                MIN_VALIDATOR_STAKE,
+                0,
+                Some(payout),
+                Some(PublicKey([0x22; 32])),
+            )
             .unwrap();
         let txn = state_storage.begin_write().unwrap();
         state_storage
@@ -1518,6 +1559,7 @@ mod tests {
                 statements: Vec::new(),
                 signature: Signature([0; 64]),
                 digest,
+                merkle_root: Default::default(),
             };
             kvnc_consensus::CommittedSubDag {
                 blocks: vec![leader.clone()],
@@ -1627,7 +1669,7 @@ mod tests {
         // Create staking state with 4 validators with different stakes
         let mut staking = StakingState::new();
         staking.init_treasury(Address([0xaa; 32]));
-        
+
         // Validator stakes: 100K, 80K, 120K, 60K KVNC (all above MIN_VALIDATOR_STAKE = 50K)
         staking
             .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
@@ -1664,14 +1706,14 @@ mod tests {
         // Verify validators are sorted by address (deterministic ordering)
         // Since we sort by address for index assignment, the order should be by address
         let authorities = committee.authorities();
-        
+
         // Collect addresses in index order
         let committee_addresses: Vec<Address> = authorities.iter().map(|a| a.address).collect();
-        
+
         // Sort the expected addresses to match committee ordering
         let mut expected_addresses = vec![addr1, addr2, addr3, addr4];
-        expected_addresses.sort_by(|a, b| a.0.cmp(&b.0));
-        
+        expected_addresses.sort_by_key(|a| a.0);
+
         assert_eq!(
             committee_addresses, expected_addresses,
             "committee validators should be sorted by address for deterministic index assignment"
@@ -1679,7 +1721,10 @@ mod tests {
 
         // Verify indices are 0..3
         for (idx, authority) in authorities.iter().enumerate() {
-            assert_eq!(authority.index, idx as u16, "authority index should match sorted position");
+            assert_eq!(
+                authority.index, idx as u16,
+                "authority index should match sorted position"
+            );
         }
 
         // Verify stakes match
@@ -1690,10 +1735,14 @@ mod tests {
             (addr4, 60_000 * ONE_KVNC),
         ];
         for (addr, expected_stake) in addr_to_stake {
-            let auth = committee.get_by_index(
-                expected_addresses.iter().position(|a| *a == addr).unwrap() as u16
-            ).expect("authority should exist");
-            assert_eq!(auth.stake, expected_stake, "stake should match for address {}", addr);
+            let auth = committee
+                .get_by_index(expected_addresses.iter().position(|a| *a == addr).unwrap() as u16)
+                .expect("authority should exist");
+            assert_eq!(
+                auth.stake, expected_stake,
+                "stake should match for address {}",
+                addr
+            );
         }
 
         // Verify leader round-robin selection
@@ -1723,12 +1772,21 @@ mod tests {
 
         let mut staking = StakingState::new();
         staking.init_treasury(Address([0xbb; 32]));
-        
+
         // Active, sufficient stake
-        staking.join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1)).unwrap();
+        staking
+            .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
+            .unwrap();
         // Inactive - should be skipped
-        staking.join_validator(addr2, 100_000 * ONE_KVNC, 0, Some(addr2), Some(pk2)).unwrap();
-        staking.validators.iter_mut().find(|v| v.address == addr2).unwrap().active = false;
+        staking
+            .join_validator(addr2, 100_000 * ONE_KVNC, 0, Some(addr2), Some(pk2))
+            .unwrap();
+        staking
+            .validators
+            .iter_mut()
+            .find(|v| v.address == addr2)
+            .unwrap()
+            .active = false;
         // Below MIN_VALIDATOR_STAKE - manually add (bypassing join_validator check)
         staking.validators.push(kvnc_staking::ValidatorInfo {
             address: addr3,
@@ -1741,13 +1799,20 @@ mod tests {
         staking.total_staked += 10_000 * ONE_KVNC;
 
         let txn = state_storage.begin_write().unwrap();
-        state_storage.state().save_staking_state(&txn, &staking).unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
         txn.commit().unwrap();
 
         let committee = build_committee(&state_storage, &pk1, &addr1, "127.0.0.1:0")
             .expect("committee should be built with only active, sufficient-stake validators");
 
-        assert_eq!(committee.size(), 1, "only 1 validator should be active and have sufficient stake");
+        assert_eq!(
+            committee.size(),
+            1,
+            "only 1 validator should be active and have sufficient stake"
+        );
         assert_eq!(committee.authorities()[0].address, addr1);
     }
 
@@ -1777,16 +1842,23 @@ mod tests {
         }
 
         let txn = state_storage.begin_write().unwrap();
-        state_storage.state().save_staking_state(&txn, &staking).unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
         txn.commit().unwrap();
 
         // Use first validator as local
         let (local_addr, local_pk) = validators[0];
-        
+
         let committee = build_committee(&state_storage, &local_pk, &local_addr, "127.0.0.1:0")
             .expect("committee should be built");
 
         // Should only have MAX_ACTIVE_VALIDATORS (21)
-        assert_eq!(committee.size(), MAX_ACTIVE_VALIDATORS, "committee should be limited to MAX_ACTIVE_VALIDATORS");
+        assert_eq!(
+            committee.size(),
+            MAX_ACTIVE_VALIDATORS,
+            "committee should be limited to MAX_ACTIVE_VALIDATORS"
+        );
     }
 }

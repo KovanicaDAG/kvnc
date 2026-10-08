@@ -1,7 +1,7 @@
 //! Minimal audit 6.2 test: block sync request-response + rate-limited enqueue.
 
-use kvnc_network::{block_sync::{BlockSyncRequest, BlockSyncResponse, BLOCK_SYNC_PROTOCOL}, NetworkService};
-use kvnc_types::{hash::Hash, StatementBlock};
+use kvnc_network::{BlockSyncRequest, BlockSyncResponse, BLOCK_SYNC_PROTOCOL};
+use kvnc_types::hash::Hash;
 
 #[test]
 fn audit_62_sync_protocol_is_kvanc() {
@@ -11,7 +11,10 @@ fn audit_62_sync_protocol_is_kvanc() {
 #[test]
 fn audit_62_sync_request_has_variants() {
     let by_hash = BlockSyncRequest::ByHash(Hash::new("test-hash"));
-    let by_author = BlockSyncRequest::ByAuthorRound { author: 3, round: 7 };
+    let by_author = BlockSyncRequest::ByAuthorRound {
+        author: 3,
+        round: 7,
+    };
     assert!(matches!(by_hash, BlockSyncRequest::ByHash(_)));
     assert!(matches!(by_author, BlockSyncRequest::ByAuthorRound { .. }));
 }

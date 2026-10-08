@@ -1295,7 +1295,7 @@ fn test_committer_mysticghost_disabled_matches_linearizer() {
 /// Test that with use_mysticghost=true, a known mergeset produces GHOSTDAG order.
 #[test]
 fn test_committer_mysticghost_enabled_ghostdag_order() {
-    use kvnc_consensus::mysticghost::{MysticGhostConfig, order_committed_wave};
+    use kvnc_consensus::mysticghost::{order_committed_wave, MysticGhostConfig};
 
     let g = genesis();
     let b1 = make_block(1, 1, vec![block_ref(&g)], "b1");
@@ -1304,10 +1304,20 @@ fn test_committer_mysticghost_enabled_ghostdag_order() {
     let leader_block = make_block(4, 3, vec![block_ref(&b3)], "leader-3");
 
     // Verify MysticGhost produces GHOSTDAG order for this mergeset
-    let mergeset_blocks = vec![g.clone(), b1.clone(), b2.clone(), b3.clone(), leader_block.clone()];
+    let mergeset_blocks = vec![
+        g.clone(),
+        b1.clone(),
+        b2.clone(),
+        b3.clone(),
+        leader_block.clone(),
+    ];
     let previous_tips = vec![g.digest];
-    let mg_config = MysticGhostConfig { enabled: true, k: 3, max_mergeset_blocks: 2_000 };
-    
+    let mg_config = MysticGhostConfig {
+        enabled: true,
+        k: 3,
+        max_mergeset_blocks: 2_000,
+    };
+
     match order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
         kvnc_consensus::mysticghost::MysticGhostOrder::Ghost { colouring } => {
             let blue_ordered = colouring.blue_ordered();
@@ -1334,9 +1344,15 @@ fn test_committer_mysticghost_enabled_produces_subdag() {
     let b2 = make_block(2, 1, vec![block_ref(&g)], "b2");
     let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
     let leader_block = make_block(4, 3, vec![block_ref(&b3)], "leader-3");
-    
+
     // Use a custom MockDag that returns a proper mergeset
-    let dag = MockDag::with_blocks([g.clone(), b1.clone(), b2.clone(), b3.clone(), leader_block.clone()]);
+    let dag = MockDag::with_blocks([
+        g.clone(),
+        b1.clone(),
+        b2.clone(),
+        b3.clone(),
+        leader_block.clone(),
+    ]);
 
     let committer = UniversalCommitter::new(committee(4), true, 100);
     committer.update_leader(leader_info(
@@ -1354,29 +1370,41 @@ fn test_committer_mysticghost_enabled_produces_subdag() {
         .try_commit_and_mark_durable(&dag)
         .expect("persist commit")
         .expect("quorum + present block must commit");
-    
+
     assert_eq!(subdag.leader_round, 3);
     assert_eq!(subdag.leader_author, 4);
     assert_eq!(subdag.leader.digest, leader_block.digest);
     // The subdag should contain at least the leader
-    assert!(subdag.blocks.iter().any(|b| b.digest == leader_block.digest));
+    assert!(subdag
+        .blocks
+        .iter()
+        .any(|b| b.digest == leader_block.digest));
 }
 
 /// Test that MysticGhost falls back to linearizer when mergeset is too large
 #[test]
 fn test_mysticghost_fallback_on_large_mergeset() {
-    use kvnc_consensus::mysticghost::{MysticGhostConfig, order_committed_wave};
+    use kvnc_consensus::mysticghost::{order_committed_wave, MysticGhostConfig};
 
     // Create a large mergeset
     let g = genesis();
     let mut blocks = vec![g.clone()];
     for i in 0..2_500 {
-        let b = make_block((i % 4) as AuthorityIndex, 1, vec![block_ref(&g)], &format!("b{i}"));
+        let b = make_block(
+            (i % 4) as AuthorityIndex,
+            1,
+            vec![block_ref(&g)],
+            &format!("b{i}"),
+        );
         blocks.push(b);
     }
-    
-    let mg_config = MysticGhostConfig { enabled: true, k: 3, max_mergeset_blocks: 2_000 };
-    
+
+    let mg_config = MysticGhostConfig {
+        enabled: true,
+        k: 3,
+        max_mergeset_blocks: 2_000,
+    };
+
     match order_committed_wave(&mg_config, &blocks, &[]) {
         kvnc_consensus::mysticghost::MysticGhostOrder::Fallback => {
             // Expected fallback

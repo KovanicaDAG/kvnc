@@ -20,6 +20,7 @@ fn make_block(
         statements: tag.as_bytes().to_vec(),
         signature: Signature([0u8; 64]),
         digest: Hash::new(format!("kvnc-test/{tag}").as_bytes()),
+        merkle_root: Default::default(),
     }
 }
 
@@ -63,7 +64,10 @@ fn test_simple_chain_all_blue() {
 
     // Blue ordered should be genesis, b1, b2, b3
     let ordered = result.blue_ordered();
-    assert_eq!(ordered, vec![genesis.digest, b1.digest, b2.digest, b3.digest]);
+    assert_eq!(
+        ordered,
+        vec![genesis.digest, b1.digest, b2.digest, b3.digest]
+    );
 }
 
 #[test]
@@ -110,13 +114,26 @@ fn test_five_conflicting_blocks_k3_fifth_red() {
     // Exactly 4 of the 5 conflicting blocks should be blue (plus genesis = 5 total)
     // The specific 4 depends on hash ordering, but exactly one should be red
     let conflicting_blocks = [b1.digest, b2.digest, b3.digest, b4.digest, b5.digest];
-    let blue_conflicting: Vec<_> = result.blue.iter()
+    let blue_conflicting: Vec<_> = result
+        .blue
+        .iter()
         .filter(|h| conflicting_blocks.contains(h))
         .copied()
         .collect();
-    assert_eq!(blue_conflicting.len(), 4, "Exactly 4 of 5 conflicting blocks should be blue");
-    assert!(result.blue.contains(&genesis.digest), "Genesis should be blue");
-    assert_eq!(result.blue.len(), 5, "Total blue: genesis + 4 conflicting = 5");
+    assert_eq!(
+        blue_conflicting.len(),
+        4,
+        "Exactly 4 of 5 conflicting blocks should be blue"
+    );
+    assert!(
+        result.blue.contains(&genesis.digest),
+        "Genesis should be blue"
+    );
+    assert_eq!(
+        result.blue.len(),
+        5,
+        "Total blue: genesis + 4 conflicting = 5"
+    );
 }
 
 #[test]
@@ -150,12 +167,7 @@ fn test_diamond_structure() {
     let genesis = make_block(0, 0, vec![], "genesis");
     let b1 = make_block(1, 1, vec![block_ref(&genesis)], "b1");
     let b2 = make_block(2, 1, vec![block_ref(&genesis)], "b2");
-    let b3 = make_block(
-        3,
-        2,
-        vec![block_ref(&b1), block_ref(&b2)],
-        "b3",
-    );
+    let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
 
     let blocks = vec![genesis.clone(), b1.clone(), b2.clone(), b3.clone()];
     let result = colour_mergeset(&blocks, 3, &[]);
@@ -178,12 +190,7 @@ fn test_blue_ordered_is_topological() {
     let genesis = make_block(0, 0, vec![], "genesis");
     let b1 = make_block(1, 1, vec![block_ref(&genesis)], "b1");
     let b2 = make_block(2, 1, vec![block_ref(&genesis)], "b2");
-    let b3 = make_block(
-        3,
-        2,
-        vec![block_ref(&b1), block_ref(&b2)],
-        "b3",
-    );
+    let b3 = make_block(3, 2, vec![block_ref(&b1), block_ref(&b2)], "b3");
 
     let blocks = vec![genesis.clone(), b1.clone(), b2.clone(), b3.clone()];
     let result = colour_mergeset(&blocks, 3, &[]);
@@ -320,10 +327,7 @@ fn prop_blue_set_is_conflict_free() {
     // Use a few deterministic layered DAG shapes
     let shapes = vec![
         // Single root, 3 layers
-        LayeredDag::from_bits(
-            vec![1, 2, 2],
-            &[true, false, true, true, true, false],
-        ),
+        LayeredDag::from_bits(vec![1, 2, 2], &[true, false, true, true, true, false]),
         // Two roots, 2 layers
         LayeredDag::from_bits(
             vec![2, 3],
@@ -333,8 +337,7 @@ fn prop_blue_set_is_conflict_free() {
         LayeredDag::from_bits(
             vec![3, 2, 2],
             &[
-                true, false, true, false, true, true,
-                true, true, true, false, true, true,
+                true, false, true, false, true, true, true, true, true, false, true, true,
             ],
         ),
     ];
@@ -421,16 +424,13 @@ fn prop_blue_set_is_conflict_free() {
 fn prop_blue_set_k_cluster_property() {
     // Test that the blue set can be partitioned into at most k+1 chains
     // This is the fundamental GHOSTDAG property
-    let shapes = vec![
-        LayeredDag::from_bits(
-            vec![1, 3, 3],
-            &[
-                true, true, true,
-                true, false, true, true, true, false,
-                false, true, true, true, false, true,
-            ],
-        ),
-    ];
+    let shapes = vec![LayeredDag::from_bits(
+        vec![1, 3, 3],
+        &[
+            true, true, true, true, false, true, true, true, false, false, true, true, true, false,
+            true,
+        ],
+    )];
 
     for shape in shapes {
         let (layers, leader) = build_layered(&shape);

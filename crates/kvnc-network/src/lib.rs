@@ -17,12 +17,15 @@ mod service;
 mod sync;
 pub mod topics;
 
-pub use block_sync::{BlockSyncRequest, BlockSyncResponse, BlockSyncRequestEvent, BlockSyncResponseEvent, BLOCK_SYNC_PROTOCOL};
+pub use block_sync::{
+    BlockSyncRequest, BlockSyncRequestEvent, BlockSyncResponse, BlockSyncResponseEvent,
+    BLOCK_SYNC_PROTOCOL,
+};
 pub use error::NetworkError;
 pub use service::NetworkService;
 pub use sync::SyncRequest;
 
-use kvnc_types::{block::StatementBlock, transaction::Transaction, Vote, Round};
+use kvnc_types::{block::StatementBlock, transaction::Transaction, Round, Vote};
 use libp2p::{Multiaddr, PeerId};
 use std::time::Duration;
 

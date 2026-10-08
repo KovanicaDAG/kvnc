@@ -50,6 +50,7 @@ fn engine_config() -> ConsensusConfig {
         max_pending_rounds: 100,
         use_mysticghost: false,
         prune_window_waves: 100,
+        leader_timeout_ms: 3000,
     }
 }
 
@@ -270,7 +271,13 @@ fn three_one_partition_majority_commits_and_minority_catches_up() {
     let majority_voters: [AuthorityIndex; 3] = [0, 1, 2];
 
     // Partition: votes are only visible within each side.
-    cast_votes(&mut nodes, &majority, &majority_voters, &chain, &LEADER_ROUNDS);
+    cast_votes(
+        &mut nodes,
+        &majority,
+        &majority_voters,
+        &chain,
+        &LEADER_ROUNDS,
+    );
     cast_votes(&mut nodes, &minority, &[3], &chain, &LEADER_ROUNDS);
     drain_all(&mut nodes);
 
@@ -289,7 +296,13 @@ fn three_one_partition_majority_commits_and_minority_catches_up() {
     );
 
     // Heal: the majority's withheld votes now reach the minority node.
-    cast_votes(&mut nodes, &minority, &majority_voters, &chain, &LEADER_ROUNDS);
+    cast_votes(
+        &mut nodes,
+        &minority,
+        &majority_voters,
+        &chain,
+        &LEADER_ROUNDS,
+    );
     drain_all(&mut nodes);
 
     // All four nodes now agree exactly (leader sequence and ordering).

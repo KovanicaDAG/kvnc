@@ -190,9 +190,7 @@ impl Connection {
     fn handle_request(&mut self, text: &str) -> String {
         let request: JsonRpcRequest = match serde_json::from_str(text) {
             Ok(request) => request,
-            Err(e) => {
-                return error_response(Value::Null, RpcError::ParseError(e.to_string()))
-            }
+            Err(e) => return error_response(Value::Null, RpcError::ParseError(e.to_string())),
         };
 
         if request.jsonrpc != "2.0" {
@@ -445,7 +443,10 @@ mod tests {
             SubscriptionKind::parse("pendingTransactions").unwrap(),
             SubscriptionKind::PendingTransactions
         );
-        assert_eq!(SubscriptionKind::parse("logs").unwrap(), SubscriptionKind::Logs);
+        assert_eq!(
+            SubscriptionKind::parse("logs").unwrap(),
+            SubscriptionKind::Logs
+        );
         assert!(SubscriptionKind::parse("blocks").is_err());
     }
 
@@ -505,8 +506,7 @@ mod tests {
         );
 
         let event = json!({"hash": "0xabc"});
-        let frames =
-            notifications_for(&connection, SubscriptionKind::NewHeads, Ok(event.clone()));
+        let frames = notifications_for(&connection, SubscriptionKind::NewHeads, Ok(event.clone()));
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0]["params"]["subscription"], json!("0x1"));
         assert_eq!(frames[0]["params"]["result"], event);

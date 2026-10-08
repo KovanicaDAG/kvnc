@@ -11,16 +11,13 @@ use std::sync::{
 };
 
 use axum::{
-    extract::{
-        ws::WebSocketUpgrade,
-        Extension, Json,
-    },
+    extract::{ws::WebSocketUpgrade, Extension, Json},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
-use kvnc_consensus::{CommitteeInfo, metrics::metrics_text};
+use kvnc_consensus::{metrics::metrics_text, CommitteeInfo};
 use kvnc_mempool::Mempool;
 use kvnc_staking::StakingState;
 use kvnc_storage::Storage;
@@ -272,10 +269,7 @@ impl RpcServer {
 }
 
 /// Upgrades an HTTP request to a WebSocket and drives the subscription loop.
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Extension(state): Extension<RpcState>,
-) -> Response {
+async fn ws_handler(ws: WebSocketUpgrade, Extension(state): Extension<RpcState>) -> Response {
     ws.on_upgrade(move |socket| subscriptions::serve_connection(socket, state))
 }
 

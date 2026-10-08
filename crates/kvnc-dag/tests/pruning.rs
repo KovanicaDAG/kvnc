@@ -27,6 +27,7 @@ fn make_block(
         statements: tag.as_bytes().to_vec(),
         signature,
         digest,
+        merkle_root: Default::default(),
     }
 }
 
@@ -150,10 +151,14 @@ fn test_prune_waves_before_removes_old_waves() {
     let w3_b2 = make_block(1, 10, vec![block_ref(&w3_b1)], "w3_b2", &key);
 
     let all_blocks = vec![
-        w0_b1.clone(), w0_b2.clone(),
-        w1_b1.clone(), w1_b2.clone(),
-        w2_b1.clone(), w2_b2.clone(),
-        w3_b1.clone(), w3_b2.clone(),
+        w0_b1.clone(),
+        w0_b2.clone(),
+        w1_b1.clone(),
+        w1_b2.clone(),
+        w2_b1.clone(),
+        w2_b2.clone(),
+        w3_b1.clone(),
+        w3_b2.clone(),
     ];
 
     for block in &all_blocks {
@@ -162,7 +167,11 @@ fn test_prune_waves_before_removes_old_waves() {
 
     // Verify all blocks exist
     for block in &all_blocks {
-        assert!(dag.has_block(&block.digest).unwrap(), "Block {} should exist", block.digest);
+        assert!(
+            dag.has_block(&block.digest).unwrap(),
+            "Block {} should exist",
+            block.digest
+        );
     }
 
     // Prune waves before wave 3 with prune_window_waves = 2

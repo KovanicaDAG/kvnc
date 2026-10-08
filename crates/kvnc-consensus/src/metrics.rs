@@ -1,12 +1,12 @@
 //! Prometheus metrics for MysticGhost consensus.
 
 use once_cell::sync::Lazy;
+use prometheus_client::encoding::text::{encode, encode_eof};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
-use prometheus_client::encoding::text::{encode, encode_eof};
 use prometheus_client::registry::{Registry, Unit};
 use std::sync::Mutex;
 
@@ -40,7 +40,8 @@ static MYSTICGHOST_MERGESET_SIZE: Lazy<Gauge> = Lazy::new(|| {
 static MYSTICGHOST_COLOURING_DURATION_MS: Lazy<Family<MysticGhostLabels, Histogram>> =
     Lazy::new(|| {
         let family = Family::<MysticGhostLabels, Histogram>::new_with_constructor(|| {
-            let buckets: Vec<f64> = prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, 20).collect();
+            let buckets: Vec<f64> =
+                prometheus_client::metrics::histogram::exponential_buckets(1.0, 2.0, 20).collect();
             Histogram::new(buckets)
         });
         let mut registry = REGISTRY.lock().unwrap();
@@ -115,11 +116,7 @@ pub fn record_pruned_waves(count: u64) {
 static BLOCK_HEIGHT: Lazy<Gauge> = Lazy::new(|| {
     let gauge = Gauge::default();
     let mut registry = REGISTRY.lock().unwrap();
-    registry.register(
-        "block_height",
-        "Current chain block height",
-        gauge.clone(),
-    );
+    registry.register("block_height", "Current chain block height", gauge.clone());
     gauge
 });
 
@@ -127,11 +124,7 @@ static BLOCK_HEIGHT: Lazy<Gauge> = Lazy::new(|| {
 static PEER_COUNT: Lazy<Gauge> = Lazy::new(|| {
     let gauge = Gauge::default();
     let mut registry = REGISTRY.lock().unwrap();
-    registry.register(
-        "peer_count",
-        "Number of connected P2P peers",
-        gauge.clone(),
-    );
+    registry.register("peer_count", "Number of connected P2P peers", gauge.clone());
     gauge
 });
 
@@ -217,14 +210,14 @@ pub fn record_rss_proxy(mb: i64) {
 pub fn metrics_text() -> String {
     let mut buffer = String::new();
     let reg = REGISTRY.lock().unwrap();
-    let _ = encode(&mut buffer, &*reg);
+    let _ = encode(&mut buffer, &reg);
     buffer
 }
 
 /// Encode registry content (without EOF) for streaming responses.
 pub fn metrics_text_stream(buffer: &mut String) {
     let reg = REGISTRY.lock().unwrap();
-    let _ = encode(buffer, &*reg);
+    let _ = encode(buffer, &reg);
 }
 
 /// Update DAG blocks in memory gauge.

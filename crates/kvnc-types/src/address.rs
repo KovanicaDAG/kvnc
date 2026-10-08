@@ -1,7 +1,6 @@
 //! Account address type.
 
 use crate::crypto::PublicKey;
-use crate::hash::Hash;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -10,10 +9,13 @@ use std::fmt;
 pub struct Address(pub [u8; 32]);
 
 impl Address {
-    /// Derive address from a public key (BLAKE3).
+    /// Derive address from a public key.
+    ///
+    /// KVNC uses the raw 32-byte Ed25519 public key as the account address so
+    /// that [`crate::transaction::Transaction::verify_signature`] can verify the
+    /// signature directly against `sender` (which it treats as the public key).
     pub fn from_public_key(pk: &PublicKey) -> Self {
-        let hash = Hash::new(pk.as_bytes());
-        Self(hash.0)
+        Self(pk.0)
     }
 
     /// Return the address as a hex string.

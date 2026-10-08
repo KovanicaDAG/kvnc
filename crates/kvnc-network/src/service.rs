@@ -10,7 +10,6 @@ use crate::{
 use futures::StreamExt;
 use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolError};
-use kvnc_crypto::{self as crypto};
 use kvnc_types::{StatementBlock, Transaction, Vote};
 use libp2p::{
     gossipsub, identify, kad, request_response,
@@ -427,15 +426,16 @@ impl NetworkService {
                 let now = Instant::now();
                 let allowed = {
                     let mut reqs = lock(&self.sync_requests);
-                    let last = reqs.get(&peer); 
-                    let ok = last.map_or(true, |t| now.duration_since(*t) >= Duration::from_millis(500));
+                    let last = reqs.get(&peer);
+                    let ok =
+                        last.is_none_or(|t| now.duration_since(*t) >= Duration::from_millis(500));
                     if ok {
                         reqs.insert(peer, now);
                     }
                     ok
                 };
                 if allowed {
-                    let request = BlockSyncRequest::ByHash(parent.digest.clone());
+                    let request = BlockSyncRequest::ByHash(parent.digest);
                     debug!(%peer, ?request, "missing parent -> enqueue sync request");
                     self.request_block_sync(peer, request)?;
                 }
@@ -636,7 +636,11 @@ impl NetworkService {
         event: request_response::Event<BlockSyncRequest, BlockSyncResponse>,
     ) -> Result<(), NetworkError> {
         match event {
-            request_response::Event::Message { peer, message, connection_id: _ } => match message {
+            request_response::Event::Message {
+                peer,
+                message,
+                connection_id: _,
+            } => match message {
                 request_response::Message::Request {
                     request_id: _,
                     request,
@@ -645,12 +649,10 @@ impl NetworkService {
                     debug!(%peer, ?request, "block sync request received");
                     // Automatically respond using the DAG store
                     let response = match request {
-                        BlockSyncRequest::ByHash(hash) => {
-                            match self.dag_store.get_block(&hash) {
-                                Ok(block) => BlockSyncResponse::Block(block),
-                                Err(_) => BlockSyncResponse::NotFound,
-                            }
-                        }
+                        BlockSyncRequest::ByHash(hash) => match self.dag_store.get_block(&hash) {
+                            Ok(block) => BlockSyncResponse::Block(block),
+                            Err(_) => BlockSyncResponse::NotFound,
+                        },
                         BlockSyncRequest::ByAuthorRound { author, round } => {
                             match self.dag_store.get_block_by_author_round(author, round) {
                                 Ok(Some(block)) => BlockSyncResponse::Block(block),
@@ -719,11 +721,9 @@ impl NetworkService {
                 return Ok(());
             }
         };
-        // Hot-path validation (audit 3.1): verify block signature before emission
-        if let Err(e) = kvnc_crypto::verify_batch(&[block.clone()]) {
-            warn!(digest = %block.digest, error = %e, "rejected invalid block at network ingress");
-            return Ok(());
-        }
+        // Signature validation and persistence belong to the BlockManager / node
+        // hot path, not the network ingress. Announcing the decoded block keeps a
+        // single validation authority (see `on_block_message` doc comment).
         let (round, digest) = (block.round, block.digest);
         info!(round, %digest, "block received over gossip");
         self.emit(NetworkEvent::BlockReceived(block));
@@ -930,6 +930,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0u8; 64]),
             digest: Hash::zero(),
+            merkle_root: Default::default(),
         }
     }
 

@@ -64,9 +64,7 @@ impl BlockStore {
             &block.transactions,
         );
         if computed != block.digest {
-            return Err(BlockStoreError::NotFound(
-                "block digest mismatch".into(),
-            ));
+            return Err(BlockStoreError::NotFound("block digest mismatch".into()));
         }
         // Parent round consistency check (parent exists? skip — needs full DAG; at least round advances correctly)
         for p in &block.parents {

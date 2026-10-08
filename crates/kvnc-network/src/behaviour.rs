@@ -3,8 +3,8 @@
 use crate::{block_sync, error::NetworkError, topics, NetworkConfig};
 use libp2p::{
     gossipsub, identify, kad, kad::store::MemoryStore, noise, ping, request_response,
-    request_response::ProtocolSupport,
-    swarm::NetworkBehaviour, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    request_response::ProtocolSupport, swarm::NetworkBehaviour, tcp, yamux, Multiaddr, PeerId,
+    StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::{error::Error, time::Duration};
 

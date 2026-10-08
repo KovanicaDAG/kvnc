@@ -710,25 +710,51 @@ mod tests {
 
     #[tokio::test]
     async fn estimate_fee_uses_minimum_observed_rate_and_floor() {
+        use kvnc_storage::state_store::Account;
+        use kvnc_types::crypto::{Signature, SigningKey};
+
         let (_dir, storage) = open_storage();
-        let state = test_state(storage);
-        let low_rate_tx = Transaction {
-            sender: Address([1; 32]),
-            nonce: 0,
-            kind: TransactionKind::Transfer {
-                to: Address([2; 32]),
-                amount: 1,
-            },
-            fee: 1,
-            signature: kvnc_types::crypto::Signature([0; 64]),
-            hash: Hash([3; 32]),
+        let state = test_state(storage.clone());
+
+        // Two distinct funded senders so both fee-rate samples are admissible
+        // (a valid signature is required now that addresses are public keys).
+        let (sk_a, pk_a) = kvnc_crypto::generate_keypair();
+        let (sk_b, pk_b) = kvnc_crypto::generate_keypair();
+        let sender_a = Address::from_public_key(&pk_a);
+        let sender_b = Address::from_public_key(&pk_b);
+
+        let txn = storage.begin_write().unwrap();
+        {
+            let st = storage.state();
+            let account = Account {
+                balance: 1_000_000,
+                nonce: 0,
+                code_hash: [0; 32],
+                code: Vec::new(),
+            };
+            st.set_account(&txn, &sender_a, &account).unwrap();
+            st.set_account(&txn, &sender_b, &account).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let make_signed = |sender: Address, to: Address, fee: u64, sk: &SigningKey| {
+            let mut tx = Transaction {
+                sender,
+                nonce: 0,
+                kind: TransactionKind::Transfer { to, amount: 1 },
+                fee,
+                signature: Signature([0; 64]),
+                hash: Hash::zero(),
+            };
+            let signing_hash = tx.signing_hash();
+            tx.signature = kvnc_crypto::sign(sk, signing_hash.as_ref());
+            tx.hash = signing_hash;
+            tx
         };
+
+        let low_rate_tx = make_signed(sender_a, Address([2; 32]), 1, &sk_a);
         let serialized_size = bincode::serialize(&low_rate_tx).unwrap().len() as u64;
-        let higher_rate_tx = Transaction {
-            fee: serialized_size * 4,
-            hash: Hash([4; 32]),
-            ..low_rate_tx.clone()
-        };
+        let higher_rate_tx = make_signed(sender_b, Address([3; 32]), serialized_size * 4, &sk_b);
 
         state
             .mempool

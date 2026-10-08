@@ -31,3 +31,4 @@ hex = { workspace = true }
 [dev-dependencies]
 tempfile = "3.8"
 tokio-tungstenite = "0.24"
+kvnc-crypto = { path = "../kvnc-crypto" }

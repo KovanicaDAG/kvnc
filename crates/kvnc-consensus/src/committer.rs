@@ -5,8 +5,8 @@
 //! for wave-based uncertified DAG consensus.
 
 use crate::engine::DagStoreTrait;
-use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
 use crate::metrics::{record_pruned_blocks, record_pruned_waves};
+use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
 use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, CommittedSubDag, Round};
 use parking_lot::{Mutex, RwLock};
@@ -185,7 +185,10 @@ impl UniversalCommitter {
         let key = leader_info.round;
         if let Some(existing) = leaders.get(&key) {
             if existing.author == leader_info.author {
-                match (existing.block_hash.as_ref(), leader_info.block_hash.as_ref()) {
+                match (
+                    existing.block_hash.as_ref(),
+                    leader_info.block_hash.as_ref(),
+                ) {
                     (Some(old_hash), Some(new_hash)) => {
                         if new_hash.0 < old_hash.0 {
                             leaders.insert(key, leader_info);
@@ -198,7 +201,9 @@ impl UniversalCommitter {
                     }
                     (Some(_), None) => return,
                     (None, None) => {
-                        if leader_info.status == LeaderStatus::Skip && existing.status != LeaderStatus::Skip {
+                        if leader_info.status == LeaderStatus::Skip
+                            && existing.status != LeaderStatus::Skip
+                        {
                             leaders.insert(key, leader_info);
                         }
                         return;
@@ -443,7 +448,10 @@ impl UniversalCommitter {
                 let blue_hashes: Vec<Hash> = colouring.blue.clone();
                 match dag_store.prune_non_blue(&blue_hashes, leader_wave) {
                     Ok(pruned) => {
-                        info!("Pruned {} non-blue blocks from wave {}", pruned, leader_wave);
+                        info!(
+                            "Pruned {} non-blue blocks from wave {}",
+                            pruned, leader_wave
+                        );
                         record_pruned_blocks(pruned);
                     }
                     Err(e) => {
@@ -494,7 +502,8 @@ impl UniversalCommitter {
         };
 
         // 5. Run MysticGhost ordering
-        match crate::mysticghost::order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips) {
+        match crate::mysticghost::order_committed_wave(&mg_config, &mergeset_blocks, &previous_tips)
+        {
             crate::mysticghost::MysticGhostOrder::Ghost { colouring } => Some(colouring),
             crate::mysticghost::MysticGhostOrder::Fallback => None,
         }
@@ -576,22 +585,23 @@ impl UniversalCommitter {
                 crate::metrics::record_colouring_duration_ms(colouring_duration, "success");
                 // Use the blue-set order from GHOSTDAG
                 let blue_ordered = colouring.blue_ordered();
-                
+
                 // Build blocks in blue order, filtering to only those in mergeset
-                let block_map: std::collections::HashMap<Hash, StatementBlock> = mergeset_blocks
-                    .into_iter()
-                    .map(|b| (b.digest, b))
-                    .collect();
-                
+                let block_map: std::collections::HashMap<Hash, StatementBlock> =
+                    mergeset_blocks.into_iter().map(|b| (b.digest, b)).collect();
+
                 let mut ordered_blocks = Vec::new();
                 for hash in blue_ordered {
                     if let Some(block) = block_map.get(&hash) {
                         ordered_blocks.push(block.clone());
                     }
                 }
-                
+
                 // Ensure leader is included (should be blue)
-                if !ordered_blocks.iter().any(|b| b.digest == leader_block.digest) {
+                if !ordered_blocks
+                    .iter()
+                    .any(|b| b.digest == leader_block.digest)
+                {
                     ordered_blocks.push(leader_block.clone());
                 }
 
@@ -617,7 +627,7 @@ impl UniversalCommitter {
     ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
         let decided_rounds = dag_store.get_decided_rounds(u64::MAX)?;
         let mut tips = Vec::new();
-        
+
         for round in decided_rounds {
             let leaders = dag_store.get_decided_leaders(round)?;
             for leader_hash in leaders {
@@ -629,7 +639,7 @@ impl UniversalCommitter {
                 }
             }
         }
-        
+
         Ok(tips)
     }
 }

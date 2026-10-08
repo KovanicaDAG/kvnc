@@ -12,7 +12,9 @@ use kvnc_consensus::{AuthorityInfo, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_dag::{BlockManagerError, DagStoreError};
 use kvnc_types::block::{BlockReference, StatementBlock};
 use kvnc_types::hash::Hash;
-use kvnc_types::{Address, AuthorityIndex, PublicKey, Round, Signature, SigningKey, Stake, Transaction};
+use kvnc_types::{
+    Address, AuthorityIndex, PublicKey, Round, Signature, SigningKey, Stake, Transaction,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -172,10 +174,7 @@ impl DagStoreTrait for MockDag {
             .ok_or_else(|| DagStoreError::NotFound(format!("block {hash}")))
     }
 
-    fn get_parents(
-        &self,
-        hash: &Hash,
-    ) -> Result<Vec<Hash>, DagStoreError> {
+    fn get_parents(&self, hash: &Hash) -> Result<Vec<Hash>, DagStoreError> {
         let digest = self.resolve_digest(hash);
         let blocks = self.blocks.read();
         let block = blocks
@@ -184,11 +183,7 @@ impl DagStoreTrait for MockDag {
         Ok(block.parents.iter().map(|p| p.digest).collect())
     }
 
-    fn get_ancestors(
-        &self,
-        hash: &Hash,
-        min_round: Round,
-    ) -> Result<Vec<Hash>, DagStoreError> {
+    fn get_ancestors(&self, hash: &Hash, min_round: Round) -> Result<Vec<Hash>, DagStoreError> {
         let root_digest = self.resolve_digest(hash);
         let blocks = self.blocks.read();
         let mut ancestors = Vec::new();
@@ -289,10 +284,7 @@ impl DagStoreTrait for MockDag {
         Ok(Vec::new())
     }
 
-    fn get_blocks(
-        &self,
-        hashes: &[Hash],
-    ) -> Result<Vec<StatementBlock>, DagStoreError> {
+    fn get_blocks(&self, hashes: &[Hash]) -> Result<Vec<StatementBlock>, DagStoreError> {
         let blocks = self.blocks.read();
         Ok(hashes
             .iter()
@@ -389,7 +381,11 @@ impl BlockManagerTrait for MockBlockManager {
         self.propose_block_with_txs(round, Vec::new())
     }
 
-    fn propose_block_with_txs(&self, round: Round, _transactions: Vec<Transaction>) -> Result<StatementBlock, BlockManagerError> {
+    fn propose_block_with_txs(
+        &self,
+        round: Round,
+        _transactions: Vec<Transaction>,
+    ) -> Result<StatementBlock, BlockManagerError> {
         let parents = Vec::new();
         let transactions = Vec::new();
         let digest = StatementBlock::compute_digest(self.authority, round, &parents, &transactions);

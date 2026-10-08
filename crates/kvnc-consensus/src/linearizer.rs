@@ -166,6 +166,7 @@ mod tests {
             statements: Vec::new(),
             signature: Signature([0; 64]),
             digest,
+            merkle_root: Default::default(),
         }
     }
 

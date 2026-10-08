@@ -92,7 +92,12 @@ impl Transaction {
                 data.extend_from_slice(&(code.len() as u64).to_le_bytes());
                 data.extend_from_slice(code);
             }
-            TransactionKind::Call { contract, method, args, gas_limit } => {
+            TransactionKind::Call {
+                contract,
+                method,
+                args,
+                gas_limit,
+            } => {
                 data.push(4);
                 data.extend_from_slice(&contract.0);
                 data.extend_from_slice(&(method.len() as u64).to_le_bytes());

@@ -8,7 +8,9 @@ use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, is_leader_round, linearizer::Linearizer};
 use kvnc_crypto::sign;
 use kvnc_mempool::Mempool;
-use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, Round, Stake, Transaction, MAX_TXS_PER_BLOCK};
+use kvnc_types::{
+    block::StatementBlock, hash::Hash, AuthorityIndex, Round, Stake, Transaction, MAX_TXS_PER_BLOCK,
+};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -40,11 +42,11 @@ pub trait VoteBroadcaster: Send + Sync {
 impl<F> VoteBroadcaster for F
 where
     F: Fn(&kvnc_types::Vote) + Send + Sync,
-    {
-        fn broadcast_vote(&self, vote: &kvnc_types::Vote) {
-            self(vote)
-        }
+{
+    fn broadcast_vote(&self, vote: &kvnc_types::Vote) {
+        self(vote)
     }
+}
 
 /// Trait for DAG store operations needed by consensus.
 pub trait DagStoreTrait: Send + Sync {
@@ -57,10 +59,7 @@ pub trait DagStoreTrait: Send + Sync {
         hash: &Hash,
         min_round: kvnc_types::Round,
     ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
-    fn get_parents(
-        &self,
-        hash: &Hash,
-    ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
+    fn get_parents(&self, hash: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     fn get_block_by_author_round(
         &self,
         author: kvnc_types::AuthorityIndex,
@@ -89,7 +88,10 @@ pub trait DagStoreTrait: Send + Sync {
     /// Get the mergeset for a leader block (blocks reachable from leader not in previous sub-DAGs).
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     /// Get multiple blocks by their hashes.
-    fn get_blocks(&self, hashes: &[Hash]) -> Result<Vec<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
+    fn get_blocks(
+        &self,
+        hashes: &[Hash],
+    ) -> Result<Vec<kvnc_types::block::StatementBlock>, kvnc_dag::DagStoreError>;
     /// Get decided leader hashes for a round.
     fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     /// Get all decided rounds up to a maximum.
@@ -101,7 +103,11 @@ pub trait DagStoreTrait: Send + Sync {
         committed_wave: u64,
     ) -> Result<u64, kvnc_dag::DagStoreError>;
     /// Prune all blocks from waves before the given wave minus the prune window.
-    fn prune_waves_before(&self, wave: u64, prune_window_waves: u64) -> Result<u64, kvnc_dag::DagStoreError>;
+    fn prune_waves_before(
+        &self,
+        wave: u64,
+        prune_window_waves: u64,
+    ) -> Result<u64, kvnc_dag::DagStoreError>;
 }
 
 /// Trait for block manager operations needed by consensus.
@@ -224,7 +230,11 @@ where
         let our_authority = block_manager.read().our_authority();
         let our_stake = committee.stake_of(our_authority).unwrap_or(0);
 
-        let committer = UniversalCommitter::new(committee.clone(), config.use_mysticghost, config.prune_window_waves);
+        let committer = UniversalCommitter::new(
+            committee.clone(),
+            config.use_mysticghost,
+            config.prune_window_waves,
+        );
         let linearizer = Linearizer::new();
 
         let mut leader_schedule = HashMap::new();
@@ -324,7 +334,11 @@ where
             {
                 let deadline_opt = *self.leader_deadline.read();
                 if let Some((round, instant)) = deadline_opt {
-                    if std::time::Instant::now().duration_since(instant).as_millis() >= self.config.leader_timeout_ms as u128 {
+                    if std::time::Instant::now()
+                        .duration_since(instant)
+                        .as_millis()
+                        >= self.config.leader_timeout_ms as u128
+                    {
                         if let Some(leader_author) = self.scheduled_leader_for_round(round) {
                             self.committer.register_skip(round, leader_author);
                         }
@@ -429,7 +443,11 @@ where
             Vec::new()
         };
 
-        match self.block_manager.read().propose_block_with_txs(round, transactions) {
+        match self
+            .block_manager
+            .read()
+            .propose_block_with_txs(round, transactions)
+        {
             Ok(block) => {
                 // Update committer with leader info
                 let leader_info = LeaderInfo {
@@ -445,7 +463,12 @@ where
                 *self.last_proposed_round.write() = round;
                 self.state.write().proposed = true;
 
-                info!("Proposed block {} at round {} with {} transactions", block.digest, round, block.transactions.len());
+                info!(
+                    "Proposed block {} at round {} with {} transactions",
+                    block.digest,
+                    round,
+                    block.transactions.len()
+                );
 
                 // Broadcast the block to the network
                 if let Some(broadcaster) = self.block_broadcaster.read().as_ref() {
@@ -466,7 +489,7 @@ where
     async fn produce_vote(&self, vote_round: Round) -> Result<(), ConsensusError> {
         // The leader round is the previous leader round (vote_round - 1)
         let leader_round = vote_round - 1;
-        
+
         // Get the leader for that round
         let Some(leader_author) = self.scheduled_leader_for_round(leader_round) else {
             debug!("No leader scheduled for round {}", leader_round);
@@ -485,7 +508,10 @@ where
         };
 
         // Check if we already voted for this leader
-        if leader_info.votes.contains_key(&self.state.read().our_authority) {
+        if leader_info
+            .votes
+            .contains_key(&self.state.read().our_authority)
+        {
             debug!("Already voted for leader round {}", leader_round);
             return Ok(());
         }
@@ -501,12 +527,16 @@ where
         vote.signature = sign(&self.signing_key, &vote.signature_data());
 
         // Record the vote locally
-        self.committer.add_vote(leader_round, our_authority, leader_hash);
+        self.committer
+            .add_vote(leader_round, our_authority, leader_hash);
 
         // Broadcast the vote
         if let Some(broadcaster) = self.vote_broadcaster.read().as_ref() {
             broadcaster.broadcast_vote(&vote);
-            info!("Broadcast vote for leader round {} (hash: {})", leader_round, leader_hash);
+            info!(
+                "Broadcast vote for leader round {} (hash: {})",
+                leader_round, leader_hash
+            );
         }
 
         // Try to commit after voting
@@ -531,7 +561,10 @@ where
         // Fork resolution for scheduled leader slots: first-valid digest wins.
         // Deterministic lookup by round/author (no HashMap iteration order).
         if self.scheduled_leader_for_round(block.round) == Some(block.author) {
-            if let Ok(Some(existing)) = self.dag_store.get_block_by_author_round(block.author, block.round) {
+            if let Ok(Some(existing)) = self
+                .dag_store
+                .get_block_by_author_round(block.author, block.round)
+            {
                 if existing.digest != block.digest {
                     return Err(ConsensusError::InvalidVote(format!(
                         "fork/equivocation at round {} author {}: existing={}, new={}",
@@ -543,7 +576,9 @@ where
                 {
                     let mut dl = self.leader_deadline.write();
                     if let Some((r, _)) = *dl {
-                        if r == block.round && self.scheduled_leader_for_round(r) == Some(block.author) {
+                        if r == block.round
+                            && self.scheduled_leader_for_round(r) == Some(block.author)
+                        {
                             *dl = None;
                         }
                     }
@@ -746,10 +781,7 @@ mod tests {
             Ok(found)
         }
 
-        fn get_parents(
-            &self,
-            hash: &Hash,
-        ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
+        fn get_parents(&self, hash: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
             let blocks = self.blocks.read();
             if let Some(block) = blocks.get(hash) {
                 Ok(block.parents.iter().map(|p| p.digest).collect())
@@ -834,13 +866,13 @@ mod tests {
             hashes: &[Hash],
         ) -> Result<Vec<kvnc_types::StatementBlock>, kvnc_dag::DagStoreError> {
             let blocks = self.blocks.read();
-            Ok(hashes.iter().filter_map(|h| blocks.get(h).cloned()).collect())
+            Ok(hashes
+                .iter()
+                .filter_map(|h| blocks.get(h).cloned())
+                .collect())
         }
 
-        fn get_decided_leaders(
-            &self,
-            round: Round,
-        ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
+        fn get_decided_leaders(&self, round: Round) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
             Ok(self
                 .decisions
                 .lock()
@@ -910,6 +942,7 @@ mod tests {
                 statements: Vec::new(),
                 signature: kvnc_crypto::sign(&self.key.read(), digest.as_ref()),
                 digest,
+                merkle_root: Default::default(),
             };
             self.dag.put_block(&block).expect("store proposal");
             Ok(block)
@@ -1018,6 +1051,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
         engine.process_vote(3, 0, digest).unwrap();
@@ -1042,6 +1076,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
 
@@ -1064,6 +1099,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, later_digest.as_ref()),
             digest: later_digest,
+            merkle_root: Default::default(),
         };
         engine.process_block(&later_block).unwrap();
 
@@ -1121,6 +1157,7 @@ mod tests {
                 statements: Vec::new(),
                 signature: kvnc_types::Signature([0; 64]),
                 digest,
+                merkle_root: Default::default(),
             };
             dag.put_block(&block).unwrap();
             engine.committer.update_leader(LeaderInfo {
@@ -1179,6 +1216,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, valid_digest.as_ref()),
             digest: valid_digest,
+            merkle_root: Default::default(),
         };
 
         // Process valid block - should succeed
@@ -1197,6 +1235,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&wrong_key, invalid_digest.as_ref()),
             digest: invalid_digest,
+            merkle_root: Default::default(),
         };
 
         // Process invalid block - should fail validation
@@ -1216,10 +1255,14 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_types::Signature([0; 64]),
             digest: unknown_digest,
+            merkle_root: Default::default(),
         };
 
         let result = engine.process_block(&unknown_block);
-        assert!(result.is_err(), "Block from unknown author should be rejected");
+        assert!(
+            result.is_err(),
+            "Block from unknown author should be rejected"
+        );
         assert!(!dag.has_block(&unknown_digest).unwrap());
 
         // Create block with bad digest - should fail
@@ -1228,7 +1271,10 @@ mod tests {
         bad_digest_block.digest = kvnc_types::Hash::zero();
 
         let result = engine.process_block(&bad_digest_block);
-        assert!(result.is_err(), "Block with mismatched digest should be rejected");
+        assert!(
+            result.is_err(),
+            "Block with mismatched digest should be rejected"
+        );
     }
 
     #[tokio::test]
@@ -1256,7 +1302,13 @@ mod tests {
         engine.propose_block(3).await.unwrap();
 
         // Verify only one block exists at round 3
-        let blocks_at_round3: Vec<_> = dag.blocks.read().values().filter(|b| b.round == 3).cloned().collect();
+        let blocks_at_round3: Vec<_> = dag
+            .blocks
+            .read()
+            .values()
+            .filter(|b| b.round == 3)
+            .cloned()
+            .collect();
         assert_eq!(
             blocks_at_round3.len(),
             1,
@@ -1266,13 +1318,15 @@ mod tests {
 
         // Verify the block is the same one (no equivocation)
         assert_eq!(
-            blocks_at_round3[0].digest,
-            first_proposal_digest,
+            blocks_at_round3[0].digest, first_proposal_digest,
             "Block digest should not change between proposals"
         );
 
         // Verify the block has the correct author (our authority)
-        assert_eq!(blocks_at_round3[0].author, 0, "Block author should be our authority");
+        assert_eq!(
+            blocks_at_round3[0].author, 0,
+            "Block author should be our authority"
+        );
 
         engine.stop();
     }
@@ -1281,7 +1335,10 @@ mod tests {
     fn timeout_skips_leader_after_deadline() {
         let (engine, _dag, _key) = test_engine(100);
         // Manually set a leader deadline in the past for round 3
-        *engine.leader_deadline.write() = Some((3, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        *engine.leader_deadline.write() = Some((
+            3,
+            std::time::Instant::now() - std::time::Duration::from_secs(10),
+        ));
         // Skip should mark leader as Skip without panic
         engine.skip_leader(3).unwrap();
     }
@@ -1298,23 +1355,36 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest_a.as_ref()),
             digest: digest_a,
+            merkle_root: Default::default(),
         };
         engine.process_block(&block_a).unwrap();
 
         // Second block with different digest for same round/author should fail (fork)
-        let digest_b = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[kvnc_types::block::BlockReference { author: 0, round: 2, digest: kvnc_types::Hash::zero() }]);
+        let fork_parent = kvnc_types::block::BlockReference {
+            author: 0,
+            round: 2,
+            digest: kvnc_types::Hash::zero(),
+        };
+        let digest_b = kvnc_types::StatementBlock::compute_digest(0, 3, &[fork_parent], &[]);
         let block_b = kvnc_types::StatementBlock {
             author: 0,
             round: 3,
-            parents: Vec::new(),
+            parents: vec![fork_parent],
             transactions: Vec::new(),
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest_b.as_ref()),
             digest: digest_b,
+            merkle_root: Default::default(),
         };
         let result = engine.process_block(&block_b);
-        assert!(result.is_err(), "Fork/equivocation with different digest must be rejected");
-        assert!(result.unwrap_err().to_string().contains("fork/equivocation"));
+        assert!(
+            result.is_err(),
+            "Fork/equivocation with different digest must be rejected"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("fork/equivocation"));
     }
 
     #[test]
@@ -1329,6 +1399,7 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
         // Same digest again must succeed (idempotent)
@@ -1347,10 +1418,14 @@ mod tests {
             statements: Vec::new(),
             signature: kvnc_crypto::sign(&key, digest.as_ref()),
             digest,
+            merkle_root: Default::default(),
         };
         *engine.leader_deadline.write() = Some((3, std::time::Instant::now()));
         engine.process_block(&block).unwrap();
-        assert!(engine.leader_deadline.read().is_none(), "Deadline should be cleared when block arrives");
+        assert!(
+            engine.leader_deadline.read().is_none(),
+            "Deadline should be cleared when block arrives"
+        );
     }
 
     #[test]
@@ -1362,16 +1437,15 @@ mod tests {
 
         let committee = CommitteeInfo::try_new(
             0,
-            vec![
-                crate::types::AuthorityInfo {
-                    index: 0,
-                    stake: 100,
-                    public_key: kvnc_crypto::generate_keypair().0,
-                    address: kvnc_types::Address::default(),
-                    network_address: String::new(),
-                }
-            ],
-        ).expect("valid");
+            vec![crate::types::AuthorityInfo {
+                index: 0,
+                stake: 100,
+                public_key: kvnc_crypto::generate_keypair().1,
+                address: kvnc_types::Address::default(),
+                network_address: String::new(),
+            }],
+        )
+        .expect("valid");
 
         let committer = UniversalCommitter::new(committee, false, 100);
         let round: Round = 7;
@@ -1412,7 +1486,10 @@ mod tests {
         // 4.3 Timeout: register_skip must persist Skip in decided map.
         committer.register_skip(7, 0);
         let decided = committer.get_all_decided_leaders();
-        assert!(decided.contains_key(&7), "skip must be persisted in decided map");
+        assert!(
+            decided.contains_key(&7),
+            "skip must be persisted in decided map"
+        );
         assert_eq!(
             decided.get(&7).unwrap().status,
             LeaderStatus::Skip,

@@ -3,13 +3,13 @@
 #![allow(missing_docs)]
 //! Provides high-level operations on the DAG structure using the storage layer.
 
-use kvnc_storage::{BincodeSerialize, ConsensusStoreError, Storage, hash_to_bytes, tables};
+use kvnc_storage::{hash_to_bytes, tables, BincodeSerialize, ConsensusStoreError, Storage};
 use kvnc_types::{
     block::{BlockReference, StatementBlock},
     hash::Hash,
     AuthorityIndex, Round,
 };
-use redb::{CommitError, ReadableTable, ReadTransaction, TableError, WriteTransaction};
+use redb::{CommitError, ReadTransaction, ReadableTable, TableError, WriteTransaction};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -341,12 +341,15 @@ impl DagStore {
         };
 
         // Prune all blocks below or equal to this round
-        let pruned = self.storage.consensus().prune_dag_below(&txn, max_round_to_prune)?;
+        let pruned = self
+            .storage
+            .consensus()
+            .prune_dag_below(&txn, max_round_to_prune)?;
 
         // The committed_leader_height counter is not changed here because
         // it represents the total number of committed leaders ever, not just recent ones.
         // The decided_rounds index is what recovery uses, and it's not touched by pruning.
-        
+
         txn.commit()?;
         Ok(pruned)
     }
