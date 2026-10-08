@@ -9,6 +9,7 @@ mod contracts;
 mod node;
 mod output;
 mod rpc;
+mod stake;
 mod tx;
 mod wallet;
 
@@ -244,26 +245,17 @@ async fn main() -> Result<()> {
         Commands::Transfer(args) => cmd_transfer(&client, args, json).await,
         Commands::Status | Commands::Info => node::status(&client, json).await,
         Commands::Balance { address } => node::balance(&client, &address, json).await,
-        Commands::Stake(args) => node::not_implemented(
-            "stake",
-            "kvnc_stake",
-            json!({ "amount": args.amount }),
-            json,
-        ),
-        Commands::Unstake(args) => node::not_implemented(
-            "unstake",
-            "kvnc_unstake",
-            json!({ "amount": args.amount }),
-            json,
-        ),
-        Commands::Delegate(args) => node::not_implemented(
-            "delegate",
-            "kvnc_delegate",
-            json!({ "validator": args.validator, "amount": args.amount }),
-            json,
-        ),
+        Commands::Stake(args) => {
+            stake::stake_skeleton(&client, args.amount, None, json).await
+        }
+        Commands::Unstake(args) => {
+            stake::unstake_skeleton(&client, args.amount, None, json).await
+        }
+        Commands::Delegate(args) => {
+            stake::delegate_skeleton(&client, &args.validator, args.amount, None, json).await
+        }
         Commands::ClaimRewards => {
-            node::not_implemented("claim-rewards", "kvnc_claimRewards", json!({}), json)
+            stake::claim_rewards_skeleton(&client, None, json).await
         }
         Commands::Propose(args) => node::not_implemented(
             "propose",
