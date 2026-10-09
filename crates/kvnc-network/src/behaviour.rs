@@ -47,11 +47,14 @@ pub(crate) fn message_id(data: &[u8]) -> gossipsub::MessageId {
 /// Gossipsub configuration: signed messages, strict validation and
 /// deterministic message ids.
 ///
-/// `validate_messages` is deliberately left off - received payloads are
-/// handled directly from [`gossipsub::Event::Message`] instead.
-fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
+/// `validate_messages` is on: gossipsub holds every received message until
+/// the service reports a [`gossipsub::MessageAcceptance`] for it, so nothing
+/// is forwarded to the mesh before it passed the edge checks in
+/// [`crate::validation`].
+pub(crate) fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
     gossipsub::ConfigBuilder::default()
         .validation_mode(gossipsub::ValidationMode::Strict)
+        .validate_messages()
         .message_id_fn(|message| message_id(&message.data))
         .max_transmit_size(MAX_TRANSMIT_SIZE)
         .build()
@@ -201,6 +204,12 @@ mod tests {
     fn split_peer_suffix_accepts_dial_only_addresses() {
         let addr: Multiaddr = "/ip4/127.0.0.1/tcp/9000".parse().expect("valid multiaddr");
         assert!(split_peer_suffix(&addr).expect("parses").is_none());
+    }
+
+    #[test]
+    fn gossip_forwarding_waits_for_validation() {
+        let config = gossipsub_config().expect("config builds");
+        assert!(config.validate_messages());
     }
 
     #[test]

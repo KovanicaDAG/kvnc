@@ -17,6 +17,7 @@ mod service;
 mod state_sync;
 mod sync;
 pub mod topics;
+pub mod validation;
 
 pub use block_sync::{
     BlockSyncRequest, BlockSyncRequestEvent, BlockSyncResponse, BlockSyncResponseEvent,
@@ -26,6 +27,7 @@ pub use error::NetworkError;
 pub use service::NetworkService;
 pub use state_sync::{StateSyncCodec, StateSyncRequest, StateSyncResponse, STATE_SYNC_PROTOCOL};
 pub use sync::SyncRequest;
+pub use validation::{AuthorityKeys, Rejection};
 
 use kvnc_types::{block::StatementBlock, transaction::Transaction, Round, Vote};
 use std::time::Duration;
@@ -37,6 +39,9 @@ pub use libp2p::{Multiaddr, PeerId};
 #[derive(Debug)]
 pub enum NetworkEvent {
     /// A new block was received.
+    ///
+    /// Only emitted after the block passed edge validation (digest, merkle
+    /// root, committee author, signature; see [`validation::verify_block`]).
     BlockReceived(StatementBlock),
     /// A new transaction was received.
     TransactionReceived(Transaction),
@@ -74,6 +79,10 @@ pub enum NetworkEvent {
         response: StateSyncResponse,
     },
     /// A consensus vote was received.
+    ///
+    /// Only emitted after the vote passed edge validation: the voter is a
+    /// committee member and the signature verifies under its committee key
+    /// (see [`validation::verify_vote`]).
     VoteReceived {
         /// Peer that sent the vote.
         peer: PeerId,
