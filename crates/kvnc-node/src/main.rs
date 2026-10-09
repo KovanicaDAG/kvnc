@@ -498,6 +498,7 @@ where
     let events = EventBus::new();
     let rate_limit_config =
         RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    let auth_config = rpc_auth_config_from_env();
     let rpc_state = RpcState {
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -507,31 +508,13 @@ where
         peer_count: peer_count_for_rpc,
         events: events.clone(),
         rate_limiter: Arc::new(RateLimiterState::new(rate_limit_config.clone())),
-        auth_config: Arc::new(
-            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-                AuthConfig {
-                    write_tokens: vec!["test".to_string()],
-                    require_auth_for_writes: false,
-                }
-            } else {
-                AuthConfig::default()
-            },
-        ),
+        auth_config: Arc::new(auth_config.clone()),
     };
     let rpc_server = RpcServer::new(
         rpc_socket,
         rpc_state,
         Some(rate_limit_config),
-        Some(
-            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-                AuthConfig {
-                    write_tokens: vec!["test".to_string()],
-                    require_auth_for_writes: false,
-                }
-            } else {
-                AuthConfig::default()
-            },
-        ),
+        Some(auth_config),
     )
     .await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
@@ -711,6 +694,38 @@ where
     // left to flush: dropping the handles closes the databases.
     info!("KVNC node stopped cleanly");
     Ok(())
+}
+
+/// RPC write authorisation from the environment.
+///
+/// * `KVNC_RPC_AUTH=disable` turns write authorisation off (tests, trusted
+///   local tooling).
+/// * `KVNC_RPC_WRITE_TOKENS=tok1,tok2` sets the accepted bearer tokens.
+///
+/// Without either, write methods (including `kvnc_sendRawTransaction`, see
+/// `docs/SECURITY.md`) are rejected: there is no token that could match.
+fn rpc_auth_config_from_env() -> AuthConfig {
+    let disabled = std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable");
+    let tokens = std::env::var("KVNC_RPC_WRITE_TOKENS").unwrap_or_default();
+    rpc_auth_config(disabled, &tokens)
+}
+
+fn rpc_auth_config(disabled: bool, tokens: &str) -> AuthConfig {
+    let write_tokens: Vec<String> = tokens
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if disabled {
+        warn!("KVNC_RPC_AUTH=disable: RPC write methods accept unauthenticated calls");
+    } else if write_tokens.is_empty() {
+        warn!("no KVNC_RPC_WRITE_TOKENS configured: RPC write methods are rejected");
+    }
+    AuthConfig {
+        write_tokens,
+        require_auth_for_writes: !disabled,
+    }
 }
 
 /// Initialise genesis state if the database is fresh.
@@ -1594,6 +1609,15 @@ fn parse_address_hex(value: Option<&str>) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_auth_config_parses_tokens_and_disable_switch() {
+        let auth = rpc_auth_config(false, " a , ,b ");
+        assert_eq!(auth.write_tokens, vec!["a".to_string(), "b".to_string()]);
+        assert!(auth.require_auth_for_writes);
+        assert!(rpc_auth_config(false, "").write_tokens.is_empty());
+        assert!(!rpc_auth_config(true, "").require_auth_for_writes);
+    }
     use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC};
     use kvnc_storage::BincodeSerialize;
     use redb::{Database, TableDefinition};
