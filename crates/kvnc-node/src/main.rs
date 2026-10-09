@@ -41,7 +41,7 @@ use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEng
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_execution::{LogPublisher, TransactionReceipt};
-use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
+use kvnc_mempool::{Mempool, MempoolConfig};
 use kvnc_network::{
     BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
     StateSyncResponse,
@@ -116,8 +116,6 @@ struct GenesisArgs {
 enum NetworkCommand {
     /// Gossip a newly produced block.
     BroadcastBlock(StatementBlock),
-    /// Gossip a newly accepted transaction.
-    BroadcastTransaction(Transaction),
     /// Gossip a consensus vote.
     BroadcastVote(Vote),
     /// Request a block sync from a specific peer.
@@ -643,6 +641,7 @@ where
         exec_rx,
         state_storage.clone(),
         events.clone(),
+        Some(mempool.clone()),
         shutdown_rx.clone(),
     ));
 
@@ -853,11 +852,6 @@ async fn run_network(
                         warn!(error = %e, "failed to broadcast block");
                     }
                 }
-                Some(NetworkCommand::BroadcastTransaction(tx)) => {
-                    if let Err(e) = service.broadcast_transaction(&tx) {
-                        warn!(error = %e, "failed to broadcast transaction");
-                    }
-                }
                 Some(NetworkCommand::BroadcastVote(vote)) => {
                     if let Err(e) = service.broadcast_vote(&vote) {
                         warn!(error = %e, "failed to broadcast vote");
@@ -954,17 +948,16 @@ fn handle_network_event(
                 }
             }
         }
-        NetworkEvent::TransactionReceived(tx) => match mempool.add_transaction(tx.clone()) {
-            Ok(()) => {
+        NetworkEvent::TransactionReceived(tx) => {
+            // The network layer already admitted this transaction into the
+            // mempool before emitting the event, and gossipsub forwards it.
+            // Re-adding it here only ever hit AlreadyExists (so the pending
+            // event was never published), and re-broadcasting duplicated
+            // gossip. Publish it if it is still pooled.
+            if mempool.contains(&tx.hash) {
                 events.publish_pending_transaction(&tx);
-                // Re-gossip locally-accepted transactions.
-                let _ = network_cmd_tx.send(NetworkCommand::BroadcastTransaction(tx));
             }
-            Err(MempoolError::AlreadyExists) => {
-                debug!(hash = %tx.hash, "transaction already in mempool");
-            }
-            Err(e) => warn!(error = %e, "rejected received transaction"),
-        },
+        }
         NetworkEvent::VoteReceived { peer, vote } => {
             debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "processing received vote");
             if let Err(e) = engine.process_vote(vote.leader_round, vote.voter, vote.leader_hash) {
@@ -1048,6 +1041,7 @@ async fn run_execution(
     mut subdags: mpsc::UnboundedReceiver<kvnc_consensus::CommittedSubDag>,
     state_storage: Arc<Storage>,
     events: EventBus,
+    mempool: Option<Arc<Mempool>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ctx = ExecutionContext::new();
@@ -1070,6 +1064,15 @@ async fn run_execution(
                             txs = result.txs_applied,
                             "executed committed sub-DAG"
                         );
+                        if let Some(mempool) = &mempool {
+                            let committed: Vec<_> = subdag
+                                .blocks
+                                .iter()
+                                .flat_map(|block| block.transactions.iter().cloned())
+                                .collect();
+                            let removed = mempool.remove_committed_transactions(&committed);
+                            debug!(removed, "pruned committed transactions from mempool");
+                        }
                         events.publish_committed_leader(&subdag);
                     }
                     Err(e) => {
@@ -1839,6 +1842,7 @@ mod tests {
             exec_rx,
             state_storage.clone(),
             EventBus::new(),
+            None,
             shutdown_rx,
         ));
 
@@ -1933,7 +1937,14 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        run_execution(exec_rx, state_storage.clone(), EventBus::new(), shutdown_rx).await;
+        run_execution(
+            exec_rx,
+            state_storage.clone(),
+            EventBus::new(),
+            None,
+            shutdown_rx,
+        )
+        .await;
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();
