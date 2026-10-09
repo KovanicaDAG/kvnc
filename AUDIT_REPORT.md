@@ -111,3 +111,10 @@
 **Critical gap:** The sustained-liveness test (`sustained_liveness_integration.rs`) **times out at height 4** — this blocks any claim of production readiness. The "TPS ≥100" and "24h soak" items are capability-only, not verified.
 
 **Recommendation:** Update TASKLIST.md to reflect true status: change `[x]` → `[~]` for partial items, `[ ]` for not-done items, and correct the consensus test count.
+---
+
+## C — External Audit / Seed / DNS Checklist Finalized (f2b05bf)
+- `docs/AUDIT-CHECKLIST.md` completed (4 sections: seed/DNS, audit scope, live /api/bootstrap, CLI/audit reference)
+- `docs/SEED-DNS-AUDIT.md` gap confirmed: live `/api/bootstrap` reports port 8000 vs docs 9000; 3 seeds not documented; external audit not started
+- `docs/B-TREASURY-PROPOSAL.md` created for Phase 25.1 treasury flow
+- Status: audit **documented, not executed** — requires external auditor assignment before mainnet; no consensus/ledger code changed (client/ledger-safe)
