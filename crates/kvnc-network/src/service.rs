@@ -4,6 +4,7 @@ use crate::{
     behaviour::{self, Behaviour},
     block_sync::{BlockSyncRequest, BlockSyncResponse},
     error::NetworkError,
+    state_sync::{StateSyncRequest, StateSyncResponse},
     sync::SyncRequest,
     topics, NetworkConfig, NetworkEvent,
 };
@@ -527,6 +528,7 @@ impl NetworkService {
             BehaviourEvent::Ping(event) => self.handle_ping_event(event),
             BehaviourEvent::Identify(event) => self.handle_identify_event(event),
             BehaviourEvent::BlockSync(event) => self.handle_request_response_event(event),
+            BehaviourEvent::StateSync(event) => self.handle_state_sync_event(event),
         }
     }
 
@@ -710,6 +712,75 @@ impl NetworkService {
             }
             request_response::Event::ResponseSent { .. } => {
                 debug!("block sync response sent");
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle request-response events (state sync / fast sync).
+    fn handle_state_sync_event(
+        &self,
+        event: request_response::Event<StateSyncRequest, StateSyncResponse>,
+    ) -> Result<(), NetworkError> {
+        match event {
+            request_response::Event::Message {
+                peer,
+                message,
+                connection_id: _,
+            } => match message {
+                request_response::Message::Request {
+                    request_id: _,
+                    request,
+                    channel,
+                } => {
+                    debug!(%peer, ?request, "state sync request received");
+                    // For now, return NotFound - full implementation requires access to state storage
+                    let response = StateSyncResponse::NotFound;
+                    let mut swarm = self.swarm();
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .state_sync
+                        .send_response(channel, response)
+                    {
+                        warn!(%peer, %e, "failed to send state sync response");
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    debug!(%peer, ?request_id, ?response, "state sync response received");
+                    // Emit event for the node to handle snapshot import
+                    self.emit(NetworkEvent::StateSyncResponse {
+                        peer,
+                        request_id,
+                        response,
+                    });
+                }
+            },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "state sync request failed");
+                self.emit(NetworkEvent::StateSyncResponse {
+                    peer,
+                    request_id,
+                    response: StateSyncResponse::InvalidRequest,
+                });
+            }
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+                connection_id: _,
+            } => {
+                warn!(%peer, ?request_id, %error, "incoming state sync request failed");
+            }
+            request_response::Event::ResponseSent { .. } => {
+                debug!("state sync response sent");
             }
         }
         Ok(())

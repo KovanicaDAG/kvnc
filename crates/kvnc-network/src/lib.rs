@@ -15,6 +15,7 @@ mod block_sync;
 mod error;
 mod service;
 mod sync;
+mod state_sync;
 pub mod topics;
 
 pub use block_sync::{
@@ -24,10 +25,15 @@ pub use block_sync::{
 pub use error::NetworkError;
 pub use service::NetworkService;
 pub use sync::SyncRequest;
+pub use state_sync::{
+    StateSyncRequest, StateSyncResponse, StateSyncCodec, STATE_SYNC_PROTOCOL,
+};
 
 use kvnc_types::{block::StatementBlock, transaction::Transaction, Round, Vote};
-use libp2p::{Multiaddr, PeerId};
 use std::time::Duration;
+
+// Re-export libp2p types for downstream crates
+pub use libp2p::{Multiaddr, PeerId};
 
 /// Network event emitted by the networking layer.
 #[derive(Debug)]
@@ -60,6 +66,15 @@ pub enum NetworkEvent {
         /// The response.
         response: BlockSyncResponse,
     },
+    /// State sync response received (request-response).
+    StateSyncResponse {
+        /// Peer that sent the response.
+        peer: PeerId,
+        /// The request ID this response corresponds to.
+        request_id: libp2p::request_response::OutboundRequestId,
+        /// The response.
+        response: StateSyncResponse,
+    },
     /// A consensus vote was received.
     VoteReceived {
         /// Peer that sent the vote.
@@ -85,16 +100,25 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         // NOTE: the `/p2p/` component must carry the seed's real libp2p peer id.
-        // The value below is a syntactically valid placeholder until the seed
-        // publishes one; a mismatching peer id only fails the dial, which the
+        // The values below are syntactically valid placeholders until the seeds
+        // publish their peer ids; a mismatching peer id only fails the dial, which the
         // event loop tolerates.
+        // Port 8000 matches the live network's advertised P2P port (per /api/bootstrap).
         Self {
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/9000"
+            listen_addrs: vec!["/ip4/0.0.0.0/tcp/8000"
                 .parse()
                 .expect("valid listen multiaddr")],
-            bootstrap_nodes: vec!["/dns4/seed.kovanica.online/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-                .parse()
-                .expect("valid bootstrap multiaddr")],
+            bootstrap_nodes: vec![
+                "/dns4/seed.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                    .parse()
+                    .expect("valid bootstrap multiaddr"),
+                "/dns4/seed2.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                    .parse()
+                    .expect("valid bootstrap multiaddr"),
+                "/dns4/seed3.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                    .parse()
+                    .expect("valid bootstrap multiaddr"),
+            ],
             max_peers: 50,
             ping_interval: Duration::from_secs(10),
         }
@@ -109,15 +133,15 @@ mod tests {
     fn default_config_parses_without_panicking() {
         let config = NetworkConfig::default();
         assert_eq!(config.listen_addrs.len(), 1);
-        assert_eq!(config.listen_addrs[0].to_string(), "/ip4/0.0.0.0/tcp/9000");
-        assert_eq!(config.bootstrap_nodes.len(), 1);
-        assert!(
-            config.bootstrap_nodes[0]
-                .to_string()
-                .contains("/dns4/seed.kovanica.online/tcp/9000/p2p/"),
-            "unexpected default bootstrap: {}",
-            config.bootstrap_nodes[0]
-        );
+        assert_eq!(config.listen_addrs[0].to_string(), "/ip4/0.0.0.0/tcp/8000");
+        assert_eq!(config.bootstrap_nodes.len(), 3);
+        for node in &config.bootstrap_nodes {
+            assert!(
+                node.to_string().contains("/dns4/seed") && node.to_string().contains("/tcp/8000/p2p/"),
+                "unexpected default bootstrap: {}",
+                node
+            );
+        }
         assert_eq!(config.max_peers, 50);
         assert_eq!(config.ping_interval, Duration::from_secs(10));
     }

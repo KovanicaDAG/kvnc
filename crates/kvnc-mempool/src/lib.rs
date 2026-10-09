@@ -218,8 +218,8 @@ impl Mempool {
             });
         }
 
-        // 4. Reject zero-fee transactions except stake (fee-free by design).
-        if tx.fee == 0 && !matches!(tx.kind, TransactionKind::Stake { .. }) {
+        // 4. Reject zero-fee transactions except stake/delegate (fee-free by design).
+        if tx.fee == 0 && !matches!(tx.kind, TransactionKind::Stake { .. } | TransactionKind::Delegate { .. }) {
             return Err(MempoolError::ZeroFee);
         }
 
@@ -228,6 +228,8 @@ impl Mempool {
             TransactionKind::Transfer { amount, .. } => *amount,
             TransactionKind::Stake { amount } => *amount,
             TransactionKind::Unstake { .. } => 0, // funds not returned until unbonding period ends
+            TransactionKind::Delegate { amount, .. } => *amount,
+            TransactionKind::ClaimRewards { .. } => 0,
             TransactionKind::Deploy { .. } => 0,
             TransactionKind::Call { .. } => 0,
         };

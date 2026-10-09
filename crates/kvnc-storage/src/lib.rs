@@ -206,12 +206,12 @@ mod tests {
     #[test]
     fn test_state_root_determinism() {
         let dir = tempdir().unwrap();
-        let storage = Storage::new(dir.path().join("test.db")).unwrap();
-        let txn = storage.begin_read().unwrap();
-        let state = StateStore;
+        let db = Database::create(dir.path().join("test.db")).unwrap();
+        let state = StateStore::new(&db).unwrap();
+        let txn = db.begin_read().unwrap();
         let root1 = state.compute_state_root(&txn).unwrap();
         drop(txn);
-        let txn2 = storage.begin_read().unwrap();
+        let txn2 = db.begin_read().unwrap();
         let root2 = state.compute_state_root(&txn2).unwrap();
         assert_eq!(root1.0, root2.0, "state root must be deterministic");
     }

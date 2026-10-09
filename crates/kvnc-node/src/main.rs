@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use multiaddr::Multiaddr;
+use kvnc_network::{Multiaddr, PeerId};
 use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
@@ -41,7 +41,7 @@ use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEng
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
-use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
+use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService, BlockSyncRequest, BlockSyncResponse, StateSyncResponse};
 use kvnc_rpc::{EventBus, RpcServer, RpcState, AuthConfig, RateLimitConfig, RateLimiterState};
 use kvnc_execution::{LogPublisher, TransactionReceipt};
 
@@ -117,6 +117,8 @@ enum NetworkCommand {
     BroadcastTransaction(Transaction),
     /// Gossip a consensus vote.
     BroadcastVote(Vote),
+    /// Request a block sync from a specific peer.
+    RequestSync(PeerId, BlockSyncRequest),
     /// Ask the network task to stop.
     Shutdown,
 }
@@ -537,6 +539,7 @@ where
         network_events,
         mempool.clone(),
         engine.clone(),
+        dag_store.clone(),
         network_cmd_tx.clone(),
         events.clone(),
         shutdown_rx.clone(),
@@ -769,6 +772,11 @@ async fn run_network(
                         warn!(error = %e, "failed to broadcast vote");
                     }
                 }
+                Some(NetworkCommand::RequestSync(peer, request)) => {
+                    if let Err(e) = service.request_block_sync(peer, request) {
+                        warn!(%peer, error = %e, "failed to request block sync");
+                    }
+                }
                 Some(NetworkCommand::Shutdown) | None => {
                     info!("network task stopping");
                     break;
@@ -802,6 +810,7 @@ async fn run_event_handler(
     mut network_events: mpsc::UnboundedReceiver<NetworkEvent>,
     mempool: Arc<Mempool>,
     engine: Arc<ConsensusEngine<NodeDagStore, NodeBlockManager>>,
+    dag_store: Arc<DagStore>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
     events: EventBus,
     mut shutdown: watch::Receiver<bool>,
@@ -813,6 +822,7 @@ async fn run_event_handler(
                     event,
                     &mempool,
                     &engine,
+                    &dag_store,
                     &network_cmd_tx,
                     &events,
                 ),
@@ -832,6 +842,7 @@ fn handle_network_event(
     event: NetworkEvent,
     mempool: &Mempool,
     engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
+    dag_store: &DagStore,
     network_cmd_tx: &mpsc::UnboundedSender<NetworkCommand>,
     events: &EventBus,
 ) {
@@ -877,7 +888,61 @@ fn handle_network_event(
             from_round,
             to_round,
         } => debug!(%peer, from_round, to_round, "sync request received"),
-        NetworkEvent::BlockSyncResponse { .. } => {}
+        NetworkEvent::BlockSyncResponse {
+            peer,
+            request_id: _,
+            response,
+        } => {
+            debug!(%peer, ?response, "block sync response received");
+            match response {
+                BlockSyncResponse::Block(block) => {
+                    // Hot-path validation before inserting into DAG
+                    if let Err(e) = kvnc_crypto::verify_batch(std::slice::from_ref(&block)) {
+                        warn!(digest = %block.digest, error = %e, "rejected invalid block signature from sync response");
+                    } else {
+                        match dag_store.put_block(&block) {
+                            Ok(()) => debug!(digest = %block.digest, "synced block inserted into DAG"),
+                            Err(e) => warn!(digest = %block.digest, error = %e, "failed to insert synced block"),
+                        }
+                    }
+                }
+                BlockSyncResponse::NotFound => {
+                    debug!(%peer, "requested block not found on peer");
+                }
+                BlockSyncResponse::InvalidRequest => {
+                    warn!(%peer, "block sync request was invalid");
+                }
+                BlockSyncResponse::MissingBlocks(hashes) => {
+                    debug!(%peer, count = hashes.len(), "peer returned missing parent hashes");
+                    // Re-request each missing block
+                    for hash in hashes {
+                        let request = BlockSyncRequest::ByHash(hash);
+                        if let Err(e) = network_cmd_tx.send(NetworkCommand::RequestSync(peer, request)) {
+                            debug!(error = %e, "failed to queue re-request for missing block");
+                        }
+                    }
+                }
+            }
+        }
+        NetworkEvent::StateSyncResponse {
+            peer,
+            request_id: _,
+            response,
+        } => {
+            debug!(%peer, ?response, "state sync response received");
+            match response {
+                StateSyncResponse::Snapshot(data) => {
+                    debug!(%peer, size = data.len(), "received state snapshot");
+                    // TODO: Import snapshot into state storage
+                }
+                StateSyncResponse::NotFound => {
+                    debug!(%peer, "requested state snapshot not found on peer");
+                }
+                StateSyncResponse::InvalidRequest => {
+                    warn!(%peer, "state sync request was invalid");
+                }
+            }
+        }
     }
 }
 

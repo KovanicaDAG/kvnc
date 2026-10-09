@@ -15,15 +15,27 @@ pub enum TransactionKind {
         /// Amount in base units.
         amount: u64,
     },
-    /// Stake tokens.
+    /// Stake tokens (self-stake for validator).
     Stake {
         /// Amount to stake in base units.
         amount: u64,
     },
-    /// Unstake tokens.
+    /// Unstake tokens (begin unbonding).
     Unstake {
         /// Amount to unstake in base units.
         amount: u64,
+    },
+    /// Delegate stake to a validator.
+    Delegate {
+        /// Validator address to delegate to.
+        validator: Address,
+        /// Amount to delegate in base units.
+        amount: u64,
+    },
+    /// Claim delegation rewards.
+    ClaimRewards {
+        /// Validator whose rewards to claim (optional, claims all if None).
+        validator: Option<Address>,
     },
     /// Deploy a WASM contract.
     Deploy {
@@ -86,6 +98,20 @@ impl Transaction {
             TransactionKind::Unstake { amount } => {
                 data.push(2);
                 data.extend_from_slice(&amount.to_le_bytes());
+            }
+            TransactionKind::Delegate { validator, amount } => {
+                data.push(5);
+                data.extend_from_slice(&validator.0);
+                data.extend_from_slice(&amount.to_le_bytes());
+            }
+            TransactionKind::ClaimRewards { validator } => {
+                data.push(6);
+                if let Some(v) = validator {
+                    data.push(1);
+                    data.extend_from_slice(&v.0);
+                } else {
+                    data.push(0);
+                }
             }
             TransactionKind::Deploy { code } => {
                 data.push(3);

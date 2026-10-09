@@ -154,6 +154,15 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
             "type": "unstake",
             "amount": quantity(*amount),
         }),
+        TransactionKind::Delegate { validator, amount } => json!({
+            "type": "delegate",
+            "validator": validator.to_string(),
+            "amount": quantity(*amount),
+        }),
+        TransactionKind::ClaimRewards { validator } => json!({
+            "type": "claim_rewards",
+            "validator": validator.map(|v| v.to_string()),
+        }),
         TransactionKind::Deploy { code } => json!({
             "type": "deploy",
             "code": to_hex(code),

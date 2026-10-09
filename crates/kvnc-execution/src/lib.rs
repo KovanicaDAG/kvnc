@@ -369,6 +369,12 @@ impl ExecutionContext {
             TransactionKind::Unstake { amount } => {
                 self.execute_unstake(txn, storage, &tx.sender, *amount)
             }
+            TransactionKind::Delegate { validator, amount } => {
+                self.execute_delegate(txn, storage, &tx.sender, *validator, *amount)
+            }
+            TransactionKind::ClaimRewards { validator } => {
+                self.execute_claim_rewards(txn, storage, &tx.sender, *validator)
+            }
             TransactionKind::Deploy { code } => {
                 self.execute_deploy(txn, storage, &tx.sender, code.clone())
             }
@@ -570,6 +576,114 @@ impl ExecutionContext {
             data: bincode::serialize(&(from, amount))
                 .map_err(|e| ExecutionError::Other(e.to_string()))?,
         }];
+
+        Ok(events)
+    }
+
+    /// Execute a delegate transaction (delegate stake to a validator).
+    fn execute_delegate(
+        &mut self,
+        txn: &mut WriteTransaction,
+        _storage: &Storage,
+        from: &Address,
+        validator: Address,
+        amount: u64,
+    ) -> Result<Vec<ContractEvent>, ExecutionError> {
+        if amount == 0 {
+            return Err(ExecutionError::Validation(
+                "Delegate amount must be positive".to_string(),
+            ));
+        }
+
+        // Check sender has sufficient balance and debit sender
+        let from_key = address_to_bytes(from);
+        let mut sender_account = {
+            let table = txn.open_table(tables::ACCOUNTS)?;
+            let value = table.get(from_key)?;
+            value
+                .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default()
+        };
+        if sender_account.balance < amount {
+            return Err(ExecutionError::Validation(
+                "Insufficient balance for delegate".to_string(),
+            ));
+        }
+        sender_account.balance = sender_account.balance.saturating_sub(amount);
+        {
+            let mut table = txn.open_table(tables::ACCOUNTS)?;
+            table.insert(from_key, sender_account.to_bytes()?)?;
+        }
+
+        // Verify validator exists and is active
+        let v_idx = self
+            .staking
+            .validators
+            .iter()
+            .position(|v| v.address == validator && v.active)
+            .ok_or(ExecutionError::Validation(
+                "Validator not found or inactive".to_string(),
+            ))?;
+
+        // Update validator stake
+        self.staking.validators[v_idx].stake =
+            self.staking.validators[v_idx].stake.saturating_add(amount);
+        self.staking.total_staked = self.staking.total_staked.saturating_add(amount);
+
+        // Add delegation record
+        self.staking.delegations.push(kvnc_staking::Delegation {
+            delegator: *from,
+            validator,
+            amount,
+        });
+
+        // Emit delegate event
+        let events = vec![ContractEvent {
+            topic: b"delegate".to_vec(),
+            data: bincode::serialize(&(from, &validator, amount))
+                .map_err(|e| ExecutionError::Other(e.to_string()))?,
+        }];
+
+        Ok(events)
+    }
+
+    /// Execute a claim-rewards transaction (claim delegation rewards).
+    fn execute_claim_rewards(
+        &mut self,
+        txn: &mut WriteTransaction,
+        _storage: &Storage,
+        from: &Address,
+        validator: Option<Address>,
+    ) -> Result<Vec<ContractEvent>, ExecutionError> {
+        // Collect rewards for the delegator
+        let mut total_claimed = 0u64;
+        let mut events = Vec::new();
+
+        if let Some(validator_addr) = validator {
+            // Claim rewards for specific validator
+            let shares = self.staking.reward_share(validator_addr, 0, 0); // We'll compute actual rewards
+            // For now, just emit event - actual reward distribution happens via staking module
+            for (addr, _share) in shares {
+                if addr == *from {
+                    events.push(ContractEvent {
+                        topic: b"claim_rewards".to_vec(),
+                        data: bincode::serialize(&(&validator_addr, total_claimed))
+                            .map_err(|e| ExecutionError::Other(e.to_string()))?,
+                    });
+                }
+            }
+        } else {
+            // Claim all rewards for all validators the delegator has delegated to
+            for d in &self.staking.delegations {
+                if d.delegator == *from {
+                    events.push(ContractEvent {
+                        topic: b"claim_rewards".to_vec(),
+                        data: bincode::serialize(&(&d.validator, total_claimed))
+                            .map_err(|e| ExecutionError::Other(e.to_string()))?,
+                    });
+                }
+            }
+        }
 
         Ok(events)
     }

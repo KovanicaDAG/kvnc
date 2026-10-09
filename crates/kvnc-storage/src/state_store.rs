@@ -42,12 +42,37 @@ pub struct Account {
     pub code: Vec<u8>,
 }
 
+/// Configuration for state pruning.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PruningConfig {
+    /// Number of recent committed leader heights to keep full state for.
+    pub keep_recent: u64,
+    /// Maximum number of state roots to keep in history.
+    pub max_state_roots: u64,
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            keep_recent: 1000,  // Keep last 1000 committed leaders
+            max_state_roots: 2000,  // Keep up to 2000 state roots
+        }
+    }
+}
+
 /// State store for accounts, contracts, and staking.
-pub struct StateStore;
+pub struct StateStore {
+    pruning: PruningConfig,
+}
 
 impl StateStore {
     /// Create a new state store, initializing tables if needed.
     pub fn new(db: &redb::Database) -> Result<Self, StorageError> {
+        Self::with_pruning(db, PruningConfig::default())
+    }
+
+    /// Create a new state store with custom pruning config.
+    pub fn with_pruning(db: &redb::Database, pruning: PruningConfig) -> Result<Self, StorageError> {
         let write_txn = db.begin_write().map_err(StorageError::Transaction)?;
         {
             let _ = write_txn.open_table(crate::tables::ACCOUNTS)?;
@@ -57,7 +82,7 @@ impl StateStore {
             let _ = write_txn.open_table(crate::tables::STATE_ROOT)?;
         }
         write_txn.commit().map_err(StorageError::Commit)?;
-        Ok(Self)
+        Ok(Self { pruning })
     }
 
     // ============================================================
@@ -564,6 +589,43 @@ impl StateStore {
             }
         }
         Ok(())
+    }
+
+    /// Prune old state roots beyond the configured retention.
+    /// Keeps the most recent `max_state_roots` entries.
+    pub fn prune_state_roots(
+        &self,
+        txn: &WriteTransaction,
+    ) -> Result<u64, StateStoreError> {
+        let mut table = txn.open_table(crate::tables::STATE_ROOT)?;
+        let mut roots: Vec<u64> = table
+            .iter()?
+            .filter_map(|e| e.ok())
+            .map(|(k, _)| k.value())
+            .collect();
+
+        if roots.len() <= self.pruning.max_state_roots as usize {
+            return Ok(0);
+        }
+
+        // Sort by height descending (newest first)
+        roots.sort_by_key(|h| std::cmp::Reverse(*h));
+
+        // Remove oldest entries beyond max_state_roots
+        let to_remove = &roots[self.pruning.max_state_roots as usize..];
+        let mut removed = 0u64;
+        for height in to_remove {
+            if table.remove(*height)?.is_some() {
+                removed += 1;
+            }
+        }
+
+        Ok(removed)
+    }
+
+    /// Get the current pruning configuration.
+    pub fn pruning_config(&self) -> &PruningConfig {
+        &self.pruning
     }
 }
 

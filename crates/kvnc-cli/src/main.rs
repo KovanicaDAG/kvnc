@@ -73,10 +73,10 @@ enum Commands {
     Stake(AmountArgs),
     /// Unstake KVNC (builds and submits a signed Unstake transaction)
     Unstake(AmountArgs),
-    /// Delegate stake to a validator (not yet supported by the node)
+    /// Delegate stake to a validator
     Delegate(DelegateArgs),
-    /// Claim staking rewards (not yet supported by the node)
-    ClaimRewards,
+    /// Claim staking rewards
+    ClaimRewards(ClaimRewardsArgs),
     /// Submit a governance proposal (not yet supported by the node)
     Propose(ProposeArgs),
     /// Vote on a governance proposal (not yet supported by the node)
@@ -225,6 +225,26 @@ struct DelegateArgs {
     /// Amount in atoms
     #[arg(long)]
     amount: u64,
+    /// Keystore file path
+    #[arg(long, short, default_value = "keystore.json")]
+    keystore: PathBuf,
+    /// Fee in atoms (the mempool rejects zero-fee transactions)
+    #[arg(long, default_value_t = 1)]
+    fee: u64,
+}
+
+/// Arguments for `kvnc claim-rewards`.
+#[derive(Args)]
+struct ClaimRewardsArgs {
+    /// Validator address (32-byte hex, optional - claims all if omitted)
+    #[arg(long)]
+    validator: Option<String>,
+    /// Keystore file path
+    #[arg(long, short, default_value = "keystore.json")]
+    keystore: PathBuf,
+    /// Fee in atoms (the mempool rejects zero-fee transactions)
+    #[arg(long, default_value_t = 1)]
+    fee: u64,
 }
 
 /// Arguments for `kvnc propose`.
@@ -265,10 +285,8 @@ async fn main() -> Result<()> {
         Commands::Balance { address } => node::balance(&client, &address, json).await,
         Commands::Stake(args) => cmd_stake(&client, args, json).await,
         Commands::Unstake(args) => cmd_unstake(&client, args, json).await,
-        Commands::Delegate(args) => {
-            stake::delegate_skeleton(&client, &args.validator, args.amount, None, json).await
-        }
-        Commands::ClaimRewards => stake::claim_rewards_skeleton(&client, None, json).await,
+        Commands::Delegate(args) => cmd_delegate(&client, args, json).await,
+        Commands::ClaimRewards(args) => cmd_claim_rewards(&client, args, json).await,
         Commands::Propose(args) => node::not_implemented(
             "propose",
             "kvnc_propose",
@@ -539,6 +557,68 @@ async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) ->
     println!("  amount: {} atoms", args.amount);
     println!("  fee:    {} atoms", args.fee);
     println!("  nonce:  {nonce}");
+    Ok(())
+}
+
+async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool) -> Result<()> {
+    let validator = args.validator.parse::<kvnc_types::Address>()?;
+    let (tx_hash, sender, nonce) = sign_and_submit_self(
+        client,
+        &args.keystore,
+        TransactionKind::Delegate { validator, amount: args.amount },
+        args.fee,
+    )
+    .await?;
+
+    if json_output {
+        return output::print_json(&json!({
+            "transactionHash": tx_hash,
+            "sender": sender.to_string(),
+            "validator": validator.to_string(),
+            "amount": args.amount,
+            "fee": args.fee,
+            "nonce": nonce,
+        }));
+    }
+
+    println!("Submitted transaction {tx_hash}");
+    println!("  from:      {}", sender);
+    println!("  validator: {}", validator);
+    println!("  amount:    {} atoms", args.amount);
+    println!("  fee:       {} atoms", args.fee);
+    println!("  nonce:     {nonce}");
+    Ok(())
+}
+
+async fn cmd_claim_rewards(client: &RpcClient, args: ClaimRewardsArgs, json_output: bool) -> Result<()> {
+    let validator = args.validator.map(|v| v.parse::<kvnc_types::Address>()).transpose()?;
+    let (tx_hash, sender, nonce) = sign_and_submit_self(
+        client,
+        &args.keystore,
+        TransactionKind::ClaimRewards { validator },
+        args.fee,
+    )
+    .await?;
+
+    if json_output {
+        return output::print_json(&json!({
+            "transactionHash": tx_hash,
+            "sender": sender.to_string(),
+            "validator": validator.map(|v| v.to_string()),
+            "fee": args.fee,
+            "nonce": nonce,
+        }));
+    }
+
+    println!("Submitted transaction {tx_hash}");
+    println!("  from:      {}", sender);
+    if let Some(v) = validator {
+        println!("  validator: {}", v);
+    } else {
+        println!("  validator: all delegated validators");
+    }
+    println!("  fee:       {} atoms", args.fee);
+    println!("  nonce:     {nonce}");
     Ok(())
 }
 

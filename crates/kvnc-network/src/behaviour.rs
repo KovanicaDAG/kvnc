@@ -1,6 +1,6 @@
 //! Swarm construction: transport, security and the composite [`Behaviour`].
 
-use crate::{block_sync, error::NetworkError, topics, NetworkConfig};
+use crate::{block_sync, error::NetworkError, state_sync, topics, NetworkConfig};
 use libp2p::{
     gossipsub, identify, kad, kad::store::MemoryStore, noise, ping, request_response,
     request_response::ProtocolSupport, swarm::NetworkBehaviour, tcp, yamux, Multiaddr, PeerId,
@@ -32,6 +32,8 @@ pub(crate) struct Behaviour {
     pub(crate) identify: identify::Behaviour,
     /// Request-response for block sync.
     pub(crate) block_sync: request_response::Behaviour<block_sync::BlockSyncCodec>,
+    /// Request-response for state sync (fast sync).
+    pub(crate) state_sync: request_response::Behaviour<state_sync::StateSyncCodec>,
 }
 
 /// Deterministic message id: BLAKE3 of the payload.
@@ -145,12 +147,22 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
                 block_sync::block_sync_protocol(),
             );
 
+            // State sync request-response protocol (fast sync)
+            let state_sync = request_response::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new(state_sync::STATE_SYNC_PROTOCOL),
+                    ProtocolSupport::Full,
+                )],
+                state_sync::state_sync_protocol(),
+            );
+
             Ok(Behaviour {
                 gossipsub,
                 kad,
                 ping,
                 identify,
                 block_sync,
+                state_sync,
             })
         })
         .map_err(|err| NetworkError::Swarm(err.to_string()))?

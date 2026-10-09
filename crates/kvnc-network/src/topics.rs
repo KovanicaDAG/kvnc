@@ -14,8 +14,11 @@ pub const VOTES: &str = "votes";
 /// Topic carrying sync-range requests.
 pub const SYNC: &str = "sync";
 
+/// Topic carrying state sync requests (fast sync).
+pub const STATE_SYNC: &str = "state_sync";
+
 /// Every topic subscribed to at startup, in subscription order.
-pub const ALL: [&str; 4] = [BLOCKS, TRANSACTIONS, VOTES, SYNC];
+pub const ALL: [&str; 5] = [BLOCKS, TRANSACTIONS, VOTES, SYNC, STATE_SYNC];
 
 /// Topic handle for a topic name (round-trips through [`gossipsub::TopicHash`]).
 ///
@@ -35,7 +38,7 @@ mod tests {
         for name in ALL {
             assert!(seen.insert(name), "duplicate topic name: {name}");
         }
-        assert_eq!(ALL.len(), 4);
+        assert_eq!(ALL.len(), 5);
     }
 
     #[test]

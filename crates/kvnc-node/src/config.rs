@@ -215,7 +215,7 @@ treasury_address = "treasury-address-placeholder"
         assert_eq!(config.listen_addr, "127.0.0.1:7000");
         assert_eq!(config.rpc_addr, "0.0.0.0");
         assert_eq!(config.rpc_port, 9999);
-        assert_eq!(config.bootnodes.len(), 2);
+        assert_eq!(config.bootnodes.len(), 3);
         assert_eq!(config.round_duration_ms, 500);
         assert_eq!(config.max_peers, 7);
         assert!(config.validator_key.is_none());

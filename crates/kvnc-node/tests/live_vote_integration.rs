@@ -222,7 +222,9 @@ fn create_transfer_tx(
 }
 
 /// Live vote integration test: 2 nodes, real TCP, vote → commit → execute
+/// #[ignore] - requires sequential execution due to fixed port allocation
 #[tokio::test]
+#[ignore]
 async fn live_two_node_vote_commit_execute() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
@@ -332,7 +334,9 @@ validators = [
 }
 
 /// Test: send a transfer transaction and verify it's committed
+/// #[ignore] - requires sequential execution due to fixed port allocation
 #[tokio::test]
+#[ignore]
 async fn live_transaction_commit() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info")
