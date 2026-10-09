@@ -42,7 +42,17 @@ use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
 use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService};
-use kvnc_rpc::{EventBus, RpcServer, RpcState};
+use kvnc_rpc::{EventBus, RpcServer, RpcState, AuthConfig, RateLimitConfig, RateLimiterState};
+use kvnc_execution::{LogPublisher, TransactionReceipt};
+
+/// Wrapper around EventBus to implement LogPublisher.
+struct EventLogPublisher(EventBus);
+
+impl LogPublisher for EventLogPublisher {
+    fn publish_logs(&self, receipts: &[TransactionReceipt]) {
+        self.0.publish_logs(receipts);
+    }
+}
 use kvnc_staking::{
     StakingState, FOUNDER_PREMINE, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC,
 };
@@ -398,13 +408,21 @@ where
     let events = EventBus::new();
     let rpc_state = RpcState {
         storage: state_storage.clone(),
+        consensus_store: dag_store.clone(),
         mempool: mempool.clone(),
         staking: Arc::new(tokio::sync::RwLock::new(staking_state)),
         committee: committee.clone(),
         peer_count: peer_count_for_rpc,
         events: events.clone(),
+        rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
+        auth_config: Arc::new(AuthConfig::default()),
     };
-    let rpc_server = RpcServer::new(rpc_socket, rpc_state).await;
+    let rpc_server = RpcServer::new(
+        rpc_socket,
+        rpc_state,
+        Some(RateLimitConfig::default()),
+        Some(AuthConfig::default()),
+    ).await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
 
     // ------------------------------------------------------------------
@@ -839,6 +857,7 @@ async fn run_execution(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ctx = ExecutionContext::new();
+    ctx.log_publisher = Some(Box::new(EventLogPublisher(events.clone())));
     match state_storage.begin_read() {
         Ok(txn) => match state_storage.state().load_staking_state(&txn) {
             Ok(state) => ctx.staking = state,

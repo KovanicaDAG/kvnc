@@ -214,11 +214,9 @@ pub(crate) fn block_to_json(block: &StatementBlock) -> Value {
 
 /// `kvnc_blockNumber` — latest committed leader height.
 pub async fn handle_block_number(_params: Value, state: RpcState) -> Result<Value, RpcError> {
-    let txn = state.storage.begin_read().map_err(internal)?;
     let height = state
-        .storage
-        .consensus()
-        .get_committed_leader_height(&txn)
+        .consensus_store
+        .get_committed_leader_height()
         .map_err(internal)?;
     Ok(quantity(height))
 }

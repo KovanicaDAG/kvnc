@@ -129,7 +129,15 @@ pub struct ExecutionContext {
     pub staking: StakingState,
     /// Contract runner for WASM execution (shared module cache).
     pub contract_runner: ContractRunner,
+    /// Event publisher for transaction logs.
+    pub log_publisher: Option<Box<dyn LogPublisher>>,
     // TODO: account balances, contract storage, etc.
+}
+
+/// Trait for publishing transaction execution logs.
+/// Implemented by the node to forward logs to WebSocket subscribers.
+pub trait LogPublisher: Send + Sync {
+    fn publish_logs(&self, receipts: &[TransactionReceipt]);
 }
 
 impl ExecutionContext {
@@ -137,6 +145,7 @@ impl ExecutionContext {
         Self {
             staking: StakingState::new(),
             contract_runner: ContractRunner::new(),
+            log_publisher: None,
         }
     }
 
@@ -252,6 +261,11 @@ impl ExecutionContext {
 
         commit(txn)?;
         self.staking = candidate_staking;
+
+        // Publish transaction logs to WebSocket subscribers
+        if let Some(publisher) = &self.log_publisher {
+            publisher.publish_logs(&receipts);
+        }
 
         info!(
             target: "kvnc-execution",

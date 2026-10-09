@@ -39,3 +39,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tempfile = "3.8"
 redb = { workspace = true }
+bincode = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core", "batch"] }
+reqwest = { workspace = true }

@@ -11,13 +11,15 @@ use std::sync::{
 };
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, Extension, Json},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, Extension, Json},
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use kvnc_consensus::{metrics::metrics_text, CommitteeInfo};
+use kvnc_dag::DagStore;
 use kvnc_mempool::Mempool;
 use kvnc_staking::StakingState;
 use kvnc_storage::Storage;
@@ -30,9 +32,11 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 mod chain_methods;
+mod rpc_middleware;
 mod rpc_methods;
 mod subscriptions;
 pub use chain_methods::*;
+pub use rpc_middleware::{AuthConfig, RateLimitConfig, RateLimiterState, combined_middleware};
 pub use rpc_methods::*;
 pub use subscriptions::{EventBus, SubscriptionKind};
 
@@ -101,6 +105,8 @@ type RpcHandler = Arc<
 #[derive(Clone)]
 pub struct RpcState {
     pub storage: Arc<Storage>,
+    /// Consensus store (dag_store's consensus store) for block height, etc.
+    pub consensus_store: Arc<kvnc_dag::DagStore>,
     pub mempool: Arc<Mempool>,
     pub staking: Arc<RwLock<StakingState>>,
     pub committee: CommitteeInfo,
@@ -108,6 +114,10 @@ pub struct RpcState {
     pub peer_count: Arc<AtomicUsize>,
     /// Fan-out bus for WebSocket subscription events.
     pub events: EventBus,
+    /// Rate limiter state
+    pub rate_limiter: Arc<RateLimiterState>,
+    /// Authentication config
+    pub auth_config: Arc<AuthConfig>,
 }
 
 #[derive(Clone)]
@@ -118,7 +128,21 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    pub async fn new(addr: SocketAddr, state: RpcState) -> Self {
+    pub async fn new(
+        addr: SocketAddr,
+        state: RpcState,
+        rate_limit_config: Option<RateLimitConfig>,
+        auth_config: Option<AuthConfig>,
+    ) -> Self {
+        let rate_limiter = Arc::new(RateLimiterState::new(rate_limit_config.unwrap_or_default()));
+        let auth_config = Arc::new(auth_config.unwrap_or_default());
+
+        let state = RpcState {
+            rate_limiter,
+            auth_config,
+            ..state
+        };
+
         let mut server = Self {
             methods: Arc::new(RwLock::new(HashMap::new())),
             addr,
@@ -240,8 +264,19 @@ impl RpcServer {
     }
 
     pub async fn start(self) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-        let app = Router::new()
+        let rpc_router = Router::new()
             .route("/rpc", post(rpc_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                self.state.rate_limiter.clone(),
+                combined_middleware,
+            ))
+            .layer(Extension(self.methods.clone()))
+            .layer(Extension(self.state.rate_limiter.clone()))
+            .layer(Extension(self.state.auth_config.clone()))
+            .layer(Extension(self.state.clone()));
+
+        let app = Router::new()
+            .nest("/", rpc_router)
             .route("/ws", get(ws_handler))
             .route("/health", get(health_check))
             .route("/metrics", get(metrics_handler))

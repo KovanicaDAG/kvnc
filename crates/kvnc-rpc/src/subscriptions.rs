@@ -12,15 +12,10 @@
 //! | `newHeads`                 | A new block is produced or accepted by the node.        |
 //! | `newCommittedLeader`       | Consensus commits a leader sub-DAG.                     |
 //! | `pendingTransactions`      | A transaction enters the mempool.                       |
-//! | `logs`                     | Reserved. Accepted but never emits (see below).         |
+//! | `logs`                     | Transaction execution logs (receipts) emitted per committed sub-DAG. |
 //!
-//! ## `logs` is a deliberate no-op
-//!
-//! KVNC has no per-block log bloom/index surface yet, so there is nothing to
-//! filter over. Subscribing to `logs` succeeds and returns a subscription id,
-//! but no notifications are ever delivered. This is intentional: it keeps the
-//! client-visible API stable until an indexed event surface exists, rather
-//! than inventing a partial implementation.
+//! Transaction execution logs (`logs`) are emitted for each committed sub-DAG
+//! and contain the transaction receipts (status, gas used, logs, etc.).
 //!
 //! # Wire protocol
 //!
@@ -58,7 +53,8 @@ use tokio::sync::broadcast;
 
 use crate::chain_methods::{block_to_json, transaction_to_json};
 use crate::{JsonRpcErrorObject, JsonRpcRequest, JsonRpcResponse, RpcError};
-use kvnc_types::{CommittedSubDag, StatementBlock, Transaction};
+use kvnc_types::{CommittedSubDag, StatementBlock, Transaction, TransactionKind};
+use kvnc_execution::TransactionReceipt;
 
 /// Capacity of each broadcast channel. Slow consumers that fall further than
 /// this behind simply drop missed notifications (a `Lagged` receive error is
@@ -113,6 +109,7 @@ pub struct EventBus {
     new_heads: broadcast::Sender<Value>,
     committed_leaders: broadcast::Sender<Value>,
     pending_transactions: broadcast::Sender<Value>,
+    logs: broadcast::Sender<Value>,
 }
 
 impl Default for EventBus {
@@ -127,10 +124,12 @@ impl EventBus {
         let (new_heads, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (committed_leaders, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (pending_transactions, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (logs, _) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             new_heads,
             committed_leaders,
             pending_transactions,
+            logs,
         }
     }
 
@@ -140,9 +139,7 @@ impl EventBus {
             SubscriptionKind::NewHeads => self.new_heads.subscribe(),
             SubscriptionKind::NewCommittedLeader => self.committed_leaders.subscribe(),
             SubscriptionKind::PendingTransactions => self.pending_transactions.subscribe(),
-            // `logs` never emits; hand back a receiver on a channel that is
-            // never published to so callers do not need a special case.
-            SubscriptionKind::Logs => self.pending_transactions.subscribe(),
+            SubscriptionKind::Logs => self.logs.subscribe(),
         }
     }
 
@@ -169,6 +166,11 @@ impl EventBus {
     /// Broadcast a mempool admission. No-op if nobody listens.
     pub fn publish_pending_transaction(&self, tx: &Transaction) {
         let _ = self.pending_transactions.send(transaction_to_json(tx));
+    }
+
+    /// Broadcast a transaction execution log. No-op if nobody listens.
+    pub fn publish_logs(&self, receipts: &[TransactionReceipt]) {
+        let _ = self.logs.send(json!(receipts));
     }
 }
 
@@ -351,6 +353,7 @@ pub async fn serve_connection(socket: axum::extract::ws::WebSocket, state: crate
     let mut pending = state
         .events
         .subscribe_receiver(SubscriptionKind::PendingTransactions);
+    let mut logs = state.events.subscribe_receiver(SubscriptionKind::Logs);
 
     let (mut sender, mut receiver) = socket.split();
 
@@ -396,6 +399,12 @@ pub async fn serve_connection(socket: axum::extract::ws::WebSocket, state: crate
             }
             event = pending.recv() => {
                 let frames = notifications_for(&connection, SubscriptionKind::PendingTransactions, event);
+                if send_frames(&mut sender, frames).await.is_err() {
+                    break;
+                }
+            }
+            event = logs.recv() => {
+                let frames = notifications_for(&connection, SubscriptionKind::Logs, event);
                 if send_frames(&mut sender, frames).await.is_err() {
                     break;
                 }

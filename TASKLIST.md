@@ -191,7 +191,7 @@
 ### 7.2 WASM Runtime
 - [x] Host functions (10 env imports)
 - [x] Gas metering
-- [~] Memory limits (config read; limiter TODO)
+- [x] Memory limits (StoreLimitsBuilder with memory_size, trap_on_grow_failure)
 - [x] Determinism + module caching
 
 ### 7.3 Execution Context
@@ -241,10 +241,10 @@
 ## Phase 10: RPC API (`kvnc-rpc`)
 
 - [x] JSON-RPC methods (chain/tx/account/staking/mempool/consensus/contracts)
-- [x] WebSocket subscriptions
+- [x] WebSocket subscriptions (newHeads, newCommittedLeader, pendingTransactions, **logs**)
 - [ ] **API client** (TypeScript) — Phase 22
-- [~] `logs` subscription accepted ali event source nije fully wired
 - [x] Adrese u odgovorima (sender/to/contract/validator/committee) u kanonskom `kvnc…dag` formatu; parser prihvata hex i kanonski
+- [x] **RPC `kvnc_blockNumber` fixed** — now reads committed leader height from dag_store consensus store (was reading from wrong store, returned 0x4 instead of actual height)
 
 **Tips**
 - Logs: publish iz `ExecutionContext` event buffera u `EventBus` pri commit. Jedan `publish_logs(receipts)`.
