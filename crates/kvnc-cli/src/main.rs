@@ -24,6 +24,7 @@ use serde_json::json;
 
 use contracts::{ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand};
 use kvnc_types::transaction::TransactionKind;
+use kvnc_types::{crypto::PublicKey, crypto::SigningKey, Address};
 use rpc::RpcClient;
 use zeroize::Zeroizing;
 
@@ -56,6 +57,8 @@ enum Commands {
     ImportKey(ImportKeyArgs),
     /// Explicitly migrate a legacy v1 keystore to authenticated v2 encryption
     Migrate(MigrateArgs),
+    /// Derive the canonical address + public key from a raw 32-byte hex seed file (offline; never prints the seed)
+    Address(AddressArgs),
     /// Sign a message offline and print the signature as hex
     Sign(SignArgs),
     /// Submit a native KVNC transfer
@@ -160,6 +163,14 @@ struct MigrateArgs {
     replace_source: bool,
 }
 
+/// Arguments for `kvnc address`.
+#[derive(Args)]
+struct AddressArgs {
+    /// File containing a 32-byte hex seed (the seed itself is never printed)
+    #[arg(long, value_name = "FILE")]
+    key_file: PathBuf,
+}
+
 /// Arguments for `kvnc sign`.
 #[derive(Args)]
 struct SignArgs {
@@ -241,6 +252,7 @@ async fn main() -> Result<()> {
         Commands::Export(args) => cmd_export(args, json),
         Commands::ImportKey(args) => cmd_import_key(args, json),
         Commands::Migrate(args) => cmd_migrate(args, json),
+        Commands::Address(args) => cmd_address(args, json),
         Commands::Sign(args) => cmd_sign(args, json),
         Commands::Transfer(args) => cmd_transfer(&client, args, json).await,
         Commands::Status | Commands::Info => node::status(&client, json).await,
@@ -509,6 +521,30 @@ fn cmd_migrate(args: MigrateArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// `kvnc address --key-file <FILE>` — offline derivation of the canonical
+/// address and public key from a raw 32-byte hex seed. Prints only public
+/// identity material; the seed is never echoed.
+fn cmd_address(args: AddressArgs, json_output: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(&args.key_file)
+        .with_context(|| format!("reading key file {}", args.key_file.display()))?;
+    let seed = wallet::seed_from_raw_hex(&raw)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let public_key = PublicKey::from(signing_key.verifying_key());
+    let address = Address::from_public_key(&public_key);
+    let public_key_hex = hex::encode(public_key.as_bytes());
+
+    if json_output {
+        return output::print_json(&json!({
+            "address": address.to_string(),
+            "publicKey": public_key_hex,
+        }));
+    }
+
+    println!("Address:    {address}");
+    println!("Public key: {public_key_hex}");
+    Ok(())
+}
+
 fn prompt_confirmed_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
     let first = Zeroizing::new(rpassword::prompt_password(prompt)?);
     let second = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")?);
@@ -601,6 +637,22 @@ mod wallet_cli_security_tests {
             format: SecretFormat::Raw,
         };
         assert!(cmd_export(args, true).is_err());
+    }
+
+    #[test]
+    fn address_command_derives_and_rejects_bad_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("validator.pem");
+        std::fs::write(&key_path, hex::encode([0x2a; 32])).unwrap();
+        assert!(cmd_address(
+            AddressArgs {
+                key_file: key_path.clone()
+            },
+            false
+        )
+        .is_ok());
+        std::fs::write(&key_path, "00").unwrap();
+        assert!(cmd_address(AddressArgs { key_file: key_path }, false).is_err());
     }
 
     #[test]

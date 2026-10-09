@@ -100,6 +100,49 @@ cargo test --workspace
 
 Experimental features are behind config flags and are **off by default**.
 
+## Adresni format (kanonski)
+
+`Address` je **raw 32-bajtni Ed25519 public key** (obavezno, jer `verify_signature`
+koristi `sender` kao public key). Ljudski čitljiv zapis je:
+
+```
+kvnc <hex(32B payload ‖ 4B BLAKE3 checksum)> dag
+```
+
+Primjeri (checksum se računa nad payloadom):
+
+```
+kvnc111111111111111111111111111111111111111111111111111111111111111191f47563dag
+kvnc09090909090909090909090909090909090909090909090909090909090909097a861baddag
+```
+
+- Prefix `kvnc`, suffix `dag`; tijelo je lowercase hex (64 hex payload + 8 hex checksum).
+- `Display` emitira kanonski zapis; `FromStr`/`decode` verificira checksum i **prihvaća i**
+  stari bare/`0x` 64-hex zapis (backward compat za genesis, keystoreove i RPC).
+- CLI (`keygen`, `import`, `sign`, `transfer`, `balance`) i RPC odgovori
+  (`sender`, `to`, `contract`, validator/committee adrese) koriste kanonski zapis.
+
+### Primjer keystore izlaza (v2)
+
+```json
+{
+  "version": 2,
+  "address": "kvnc111111111111111111111111111111111111111111111111111111111111111191f47563dag",
+  "public_key": "1111111111111111111111111111111111111111111111111111111111111111",
+  "encrypted": true,
+  "secret_key": "<96 hex chars: 48-byte XChaCha20-Poly1305 ciphertext>",
+  "cipher": "xchacha20poly1305",
+  "kdf": "argon2id",
+  "kdf_memory_kib": 65536,
+  "kdf_iterations": 3,
+  "kdf_parallelism": 4,
+  "salt": "<32 hex chars>",
+  "nonce": "<48 hex chars>"
+}
+```
+
+> Detalji keystore v2 formata i v1 migracije: [`docs/adr/0002-cli-wallet-keystore-v2.md`](docs/adr/0002-cli-wallet-keystore-v2.md).
+
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue before large changes. [TODO: add CONTRIBUTING.md]

@@ -22,7 +22,7 @@
 mod config;
 
 use std::future::Future;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -36,8 +36,8 @@ use tracing::{debug, error, info, warn};
 use config::NodeConfig;
 
 use kvnc_consensus::engine::{BlockManagerTrait, DagStoreTrait};
-use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
 use kvnc_consensus::metrics::{record_mempool_size, record_peer_count};
+use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
 use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
@@ -51,7 +51,6 @@ use kvnc_types::{
     block::{BlockReference, StatementBlock},
     Address, AuthorityIndex, Hash, PublicKey, Round, Signature, SigningKey, Transaction,
 };
-
 
 /// Command line arguments.
 #[derive(Parser, Debug)]
@@ -166,7 +165,6 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     // Generate validator keys if output directory specified
     let mut validator_keys = Vec::new();
     if let Some(keys_dir) = &args.validator_keys_out {
-        use std::path::Path;
         fs::create_dir_all(keys_dir)?;
         for (i, v) in staking.validators.iter().enumerate() {
             let (sk, pk) = kvnc_crypto::generate_keypair();
@@ -231,7 +229,10 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
         fs::write(&args.output, serde_json::to_string_pretty(&output)?)
             .with_context(|| format!("writing genesis {}", args.output))?;
     } else if fs::metadata(&args.output).is_ok() {
-        anyhow::bail!("output file {} exists; use --force to overwrite", args.output);
+        anyhow::bail!(
+            "output file {} exists; use --force to overwrite",
+            args.output
+        );
     } else {
         fs::write(&args.output, serde_json::to_string_pretty(&output)?)
             .with_context(|| format!("writing genesis {}", args.output))?;
@@ -328,6 +329,20 @@ where
         &validator_address,
         &config.listen_addr,
     )?;
+
+    // Register committee public keys with the crypto batch verifier (used by the
+    // hot path on network ingest). Without this every remote block is rejected
+    // with `InvalidPublicKey` (the static key list stays empty).
+    let committee_keys: Vec<PublicKey> = committee
+        .authorities()
+        .iter()
+        .map(|a| a.public_key)
+        .collect();
+    kvnc_crypto::set_validator_keys_from_public(committee_keys);
+    info!(
+        committee = committee.authorities().len(),
+        "committee public keys registered with batch verifier"
+    );
 
     // Determine our authority index from the committee (match local public key)
     let our_authority = if config.run_validator {
@@ -640,13 +655,13 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
                 genesis_validators_path.display()
             )
         })?;
-        let wrapper: GenesisValidators = toml::from_str(&text).with_context(|| {
+        let validators: GenesisValidatorsFile = toml::from_str(&text).with_context(|| {
             format!(
                 "parsing genesis validators {}",
                 genesis_validators_path.display()
             )
         })?;
-        let validators = wrapper.validators;
+        let validators = validators.validator;
         let count = validators.len();
         for v in validators {
             let address = parse_address_hex(Some(&v.address))?;
@@ -1230,10 +1245,10 @@ struct GenesisValidatorEntry {
     public_key: Option<String>,
 }
 
-/// Wrapper for TOML deserialization ([[validators]] array-of-tables).
+/// Top-level shape of `genesis_validators.toml` (`[[validator]]` array of tables).
 #[derive(Debug, Deserialize)]
-struct GenesisValidators {
-    validators: Vec<GenesisValidatorEntry>,
+struct GenesisValidatorsFile {
+    validator: Vec<GenesisValidatorEntry>,
 }
 
 /// Parse a 32-byte hex public key (PublicKey is [u8; 32]).

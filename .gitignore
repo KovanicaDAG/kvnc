@@ -47,3 +47,6 @@ keystore/
 
 # Generated devnet databases (rebuilt at runtime, never commit)
 data/*.redb
+
+# Phase 16.6 generated devnet genesis + seeds (regenerate with ops/docker/validators/generate.sh)
+ops/docker/validators/genesis_validators.toml

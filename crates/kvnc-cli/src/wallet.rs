@@ -482,6 +482,7 @@ pub fn parse_address(value: &str, what: &str) -> Result<Address> {
 }
 
 pub fn seed_from_raw_hex(raw: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let raw = raw.trim();
     let bytes = Zeroizing::new(
         hex::decode(raw.strip_prefix("0x").unwrap_or(raw)).context("invalid seed hex")?,
     );
@@ -624,6 +625,13 @@ mod tests {
         assert_eq!(seed_from_mnemonic(&phrase).unwrap().as_ref(), &seed);
         assert_eq!(
             seed_from_raw_hex(&hex::encode(seed)).unwrap().as_ref(),
+            &seed
+        );
+        // Trailing whitespace/newline from a seed file must be tolerated.
+        assert_eq!(
+            seed_from_raw_hex(&format!("{}\n", hex::encode(seed)))
+                .unwrap()
+                .as_ref(),
             &seed
         );
         assert!(seed_from_mnemonic("abandon abandon abandon").is_err());
