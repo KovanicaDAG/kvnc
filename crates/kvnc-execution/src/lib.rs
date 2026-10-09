@@ -33,8 +33,8 @@ use tracing::{debug, info};
 
 pub mod contracts;
 pub use contracts::{
-    execute_contract_call, is_entry_point, ContractEvent, ContractHost, ContractRunner, WasmCall,
-    ENTRY_POINTS,
+    execute_contract_call, execute_contract_call_in_txn, is_entry_point, ContractEvent,
+    ContractHost, ContractRunner, WasmCall, ENTRY_POINTS,
 };
 
 /// Table tracking executed sub-DAG leaders (idempotency).
@@ -795,6 +795,9 @@ impl ExecutionContext {
             timestamp: block_height, // Simplified: use height as timestamp
             args,
             storage,
+            // Single writer: the host reads and writes through the sub-DAG's
+            // open write transaction instead of opening a second one.
+            txn: Some(&*txn),
             config: &config,
         };
 
@@ -1889,5 +1892,288 @@ mod tests {
         let b = run();
         assert_eq!(a.5, vec![true, false, true, false]);
         assert_eq!(a, b);
+    }
+    // ---- single redb writer for contract calls --------------------------
+
+    fn leb_u32(out: &mut Vec<u8>, mut v: u32) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn leb_i32(out: &mut Vec<u8>, mut v: i32) {
+        loop {
+            let b = (v as u8) & 0x7f;
+            v >>= 7;
+            let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+            out.push(if done { b } else { b | 0x80 });
+            if done {
+                break;
+            }
+        }
+    }
+
+    fn section(wasm: &mut Vec<u8>, id: u8, payload: &[u8]) {
+        wasm.push(id);
+        leb_u32(wasm, payload.len() as u32);
+        wasm.extend(payload);
+    }
+
+    fn name(out: &mut Vec<u8>, n: &str) {
+        leb_u32(out, n.len() as u32);
+        out.extend(n.as_bytes());
+    }
+
+    /// Hand-assembled probe contract (entry `probe`): reads the caller's
+    /// native balance via `kvnc_balance_of`, stores it (i64 LE) under raw
+    /// key `[0]`, then succeeds if `args` is empty and fails (contract
+    /// error) otherwise — i.e. a failing call that already wrote its overlay.
+    fn probe_wasm() -> Vec<u8> {
+        let mut w = b"\0asm\x01\0\0\0".to_vec();
+        let mut types = vec![5];
+        types.extend([0x60, 2, 0x7f, 0x7f, 1, 0x7e]); // 0 (i32,i32)->i64
+        types.extend([0x60, 1, 0x7f, 1, 0x7f]); // 1 i32->i32
+        types.extend([0x60, 2, 0x7f, 0x7f, 0]); // 2 (i32,i32)->()
+        types.extend([0x60, 1, 0x7f, 0]); // 3 i32->()
+        types.extend([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f]); // 4
+        section(&mut w, 1, &types);
+        let mut imports = vec![3];
+        for (n, t) in [
+            ("kvnc_caller", 3u8),
+            ("kvnc_balance_of", 0),
+            ("kvnc_storage_set", 4),
+        ] {
+            name(&mut imports, "env");
+            name(&mut imports, n);
+            imports.extend([0, t]);
+        }
+        section(&mut w, 2, &imports);
+        section(&mut w, 3, &[3, 1, 2, 0]);
+        section(&mut w, 5, &[1, 0, 1]);
+        let mut exports = vec![4];
+        for (n, kind, idx) in [
+            ("memory", 2u8, 0u8),
+            ("kvnc_alloc", 0, 3),
+            ("kvnc_dealloc", 0, 4),
+            ("probe", 0, 5),
+        ] {
+            name(&mut exports, n);
+            exports.extend([kind, idx]);
+        }
+        section(&mut w, 7, &exports);
+
+        let mut alloc = vec![0, 0x41];
+        leb_i32(&mut alloc, 64);
+        alloc.push(0x0b);
+        let dealloc = vec![0, 0x0b];
+        let c = |v: i32| {
+            let mut o = vec![0x41];
+            leb_i32(&mut o, v);
+            o
+        };
+        let mut entry = vec![0];
+        entry.extend(c(256));
+        entry.extend([0x10, 0]); // kvnc_caller(256)
+        entry.extend(c(512));
+        entry.extend(c(256));
+        entry.extend(c(32));
+        entry.extend([0x10, 1]); // kvnc_balance_of(256, 32)
+        entry.extend([0x37, 0x03, 0x00]); // i64.store [512]
+        entry.extend(c(600));
+        entry.extend(c(1));
+        entry.extend(c(512));
+        entry.extend(c(8));
+        entry.extend([0x10, 2, 0x1a]); // kvnc_storage_set(...); drop
+        entry.extend([0x20, 1, 0x04, 0x40, 0x42, 0x7f, 0x0f, 0x0b]); // if len { return -1 }
+        entry.extend([0x42, 0x00, 0x0b]); // i64.const 0; end
+        let mut code = vec![3];
+        for body in [&alloc, &dealloc, &entry] {
+            leb_u32(&mut code, body.len() as u32);
+            code.extend(body.iter());
+        }
+        section(&mut w, 10, &code);
+        w
+    }
+
+    const PROBE_CONTRACT: Address = Address([0xC0; 32]);
+
+    fn deploy_probe(storage: &Storage) {
+        let txn = storage.begin_write().expect("write txn");
+        let code = probe_wasm();
+        storage
+            .state()
+            .set_account(
+                &txn,
+                &PROBE_CONTRACT,
+                &Account {
+                    balance: 0,
+                    nonce: 0,
+                    code_hash: kvnc_common::hash(&code),
+                    code,
+                },
+            )
+            .expect("deploy probe");
+        txn.commit().expect("commit");
+    }
+
+    fn probe_call(key: &SigningKey, fail: bool, nonce: u64, fee: u64) -> Transaction {
+        let kind = TransactionKind::Call {
+            contract: PROBE_CONTRACT,
+            method: "probe".to_string(),
+            args: if fail { vec![1] } else { Vec::new() },
+            gas_limit: 1_000_000,
+        };
+        signed_tx(key, kind, nonce, fee)
+    }
+
+    fn probe_slot(storage: &Storage) -> Option<u64> {
+        let txn = storage.begin_read().expect("read");
+        storage
+            .state()
+            .get_storage(&txn, &PROBE_CONTRACT, &kvnc_common::hash(&[0u8]))
+            .expect("storage read")
+            .map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")))
+    }
+
+    /// Run `f` on a worker thread; fail (instead of hanging the suite) if it
+    /// does not finish within 30 s. The old code deadlocked here.
+    fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("contract call hung: a second redb writer was opened (deadlock)")
+    }
+
+    // Call via execute_committed_subdag must not hang, and the contract must
+    // see the fee already deducted in the same open write transaction.
+    #[test]
+    fn wasm_call_in_subdag_uses_single_writer_and_sees_fee() {
+        let (receipt, slot, balance) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call(&key, false, 0, 1000));
+            (
+                r.receipts[0].clone(),
+                probe_slot(&storage),
+                read_balance(&storage, &sender),
+            )
+        });
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert_eq!(
+            slot,
+            Some(1_000_000 - 1000),
+            "contract saw the fee deducted"
+        );
+        assert_eq!(balance, 1_000_000 - 1000);
+    }
+
+    // A transfer earlier in the same block is visible to the contract.
+    #[test]
+    fn wasm_call_sees_earlier_writes_in_same_block() {
+        let (ok, slot) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let txs = vec![
+                create_transfer_tx(&key, &Address([2u8; 32]), 100_000, 0, 1000),
+                probe_call(&key, false, 1, 1000),
+            ];
+            let subdag = CommittedSubDag {
+                leader: sample_block(0),
+                blocks: vec![sample_block_with_txs(0, txs)],
+                leader_round: 1,
+                leader_author: 0,
+            };
+            let r = ctx
+                .execute_committed_subdag(&subdag, &storage)
+                .expect("execute");
+            (
+                r.receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+                probe_slot(&storage),
+            )
+        });
+        assert_eq!(ok, vec![true, true]);
+        assert_eq!(slot, Some(1_000_000 - 100_000 - 2000));
+    }
+
+    // A failing call (after it already wrote its overlay) leaves no storage
+    // write; only fee and nonce are charged.
+    #[test]
+    fn failed_wasm_call_leaves_no_storage_writes() {
+        let (receipt, slot, balance, nonce) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call(&key, true, 0, 1000));
+            (
+                r.receipts[0].clone(),
+                probe_slot(&storage),
+                read_balance(&storage, &sender),
+                read_nonce(&storage, &sender),
+            )
+        });
+        assert!(!receipt.success);
+        assert_eq!(slot, None, "failed call must not write contract storage");
+        assert_eq!(balance, 1_000_000 - 1000);
+        assert_eq!(nonce, 1);
+    }
+
+    // Deterministic replay with successful and failing contract calls.
+    #[test]
+    fn replay_with_contract_calls_is_deterministic() {
+        let run = || {
+            with_timeout(|| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+                let key = test_keypair(1);
+                let sender = address_of(&key);
+                let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+                deploy_probe(&storage);
+                let txs = vec![
+                    probe_call(&key, true, 0, 1000),
+                    create_transfer_tx(&key, &Address([2u8; 32]), 5_000, 1, 1000),
+                    probe_call(&key, false, 2, 1000),
+                ];
+                let subdag = CommittedSubDag {
+                    leader: sample_block(0),
+                    blocks: vec![sample_block_with_txs(0, txs)],
+                    leader_round: 1,
+                    leader_author: 0,
+                };
+                let r = ctx
+                    .execute_committed_subdag(&subdag, &storage)
+                    .expect("execute");
+                (
+                    bincode::serialize(&r.receipts).expect("receipts"),
+                    staking_state_bytes(&ctx.staking),
+                    probe_slot(&storage),
+                    read_balance(&storage, &sender),
+                    read_nonce(&storage, &sender),
+                )
+            })
+        };
+        let a = run();
+        assert_eq!(a.2, Some(1_000_000 - 5_000 - 3000));
+        assert_eq!(a, run());
     }
 }

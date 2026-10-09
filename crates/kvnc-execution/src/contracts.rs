@@ -39,6 +39,13 @@
 //! - [`ContractHost::commit`] is called *only* after the entry point returned
 //!   `Ok`. It flushes the overlay into a single redb write transaction
 //!   (snapshot dropped first) and returns the emitted events.
+//! - **Single-writer mode** ([`ContractHost::new_in_txn`], used for every
+//!   on-chain `Call`): reads go through the sub-DAG's open
+//!   [`redb::WriteTransaction`] (so earlier writes such as the fee are
+//!   visible) and `commit` applies the overlay into that same transaction —
+//!   no second redb writer is ever opened. The apply is all-or-nothing via a
+//!   pre-image journal. Standalone mode (`new`) keeps the snapshot + own
+//!   write commit and must not be used while another writer is open.
 //! - On a contract error (`ContractError`) the host is simply dropped:
 //!   nothing — no storage write, no balance delta, no event — is committed.
 //! - A failed backing read sets a *sticky* read error; `commit` then refuses
@@ -102,11 +109,11 @@ use kvnc_htlc::Htlc;
 use kvnc_multisig::Multisig;
 use kvnc_runtime::{ExecutionConfig, Runtime};
 use kvnc_storage::state_store::Account;
-use kvnc_storage::{Storage, StorageError};
+use kvnc_storage::{tables, BincodeSerialize, Storage, StorageError};
 use kvnc_token::Token;
 use kvnc_types::Address;
 use kvnc_vault::Vault;
-use redb::ReadTransaction;
+use redb::{ReadTransaction, ReadableTable, WriteTransaction};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::debug;
@@ -205,8 +212,9 @@ pub struct ContractHost<'a> {
     caller: Address,
     block_height: u64,
     timestamp: u64,
-    /// Read snapshot held for the whole call (repeatable reads).
-    reads: ReadTransaction,
+    /// Read view held for the whole call: a standalone snapshot, or the
+    /// caller's open write transaction (single-writer mode).
+    reads: Reads<'a>,
     /// Raw contract key → value; the contract address is applied at commit.
     storage_writes: BTreeMap<Vec<u8>, Vec<u8>>,
     /// Accounts touched by `transfer`/`balance_of` (balance possibly
@@ -235,7 +243,7 @@ impl<'a> ContractHost<'a> {
         block_height: u64,
         timestamp: u64,
     ) -> Result<Self, ExecutionError> {
-        let reads = storage.begin_read()?;
+        let reads = Reads::Snapshot(storage.begin_read()?);
         Ok(Self {
             storage,
             contract,
@@ -251,6 +259,36 @@ impl<'a> ContractHost<'a> {
         })
     }
 
+    /// Open a host that reads from and commits into the caller's already
+    /// open write transaction (single-writer mode).
+    ///
+    /// Reads see every write made earlier in that transaction (e.g. the fee
+    /// already deducted). On success, [`ContractHost::commit`] applies the
+    /// overlay into `txn` (no second redb writer, no redb commit); on
+    /// failure the host is dropped and `txn` is untouched.
+    pub fn new_in_txn(
+        storage: &'a Storage,
+        txn: &'a WriteTransaction,
+        contract: Address,
+        caller: Address,
+        block_height: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            storage,
+            contract,
+            caller,
+            block_height,
+            timestamp,
+            reads: Reads::Txn(txn),
+            storage_writes: BTreeMap::new(),
+            accounts: BTreeMap::new(),
+            events: Vec::new(),
+            read_error: RefCell::new(None),
+            caller_approval: None,
+        }
+    }
+
     /// Grant the interim create approval: `amount` may be pulled exactly
     /// once, from the caller only, into custody only.
     pub(crate) fn grant_caller_approval(&mut self, amount: Option<u64>) {
@@ -259,10 +297,7 @@ impl<'a> ContractHost<'a> {
 
     /// Whether the contract account has deployed code (snapshot read).
     fn contract_has_code(&self) -> Result<bool, ExecutionError> {
-        let account = self
-            .storage
-            .state()
-            .get_account_or_default(&self.reads, &self.contract)?;
+        let account = self.reads.account(&self.contract)?;
         Ok(!account.code.is_empty())
     }
 
@@ -271,11 +306,10 @@ impl<'a> ContractHost<'a> {
         let raw = if let Some(value) = self.storage_writes.get(raw_key) {
             Some(value.clone())
         } else {
-            match self.storage.state().get_storage(
-                &self.reads,
-                &self.contract,
-                &Self::namespace(raw_key),
-            ) {
+            match self
+                .reads
+                .storage(&self.contract, &Self::namespace(raw_key))
+            {
                 Ok(value) => value,
                 Err(err) => {
                     self.record_read_error(format!("custody read failed: {err}"));
@@ -358,11 +392,7 @@ impl<'a> ContractHost<'a> {
         if let Some(account) = self.accounts.get(&address.0) {
             return Ok(account.clone());
         }
-        match self
-            .storage
-            .state()
-            .get_account_or_default(&self.reads, address)
-        {
+        match self.reads.account(address) {
             Ok(account) => Ok(account),
             Err(err) => {
                 self.record_read_error(format!("account read failed for {address:?}: {err}"));
@@ -403,20 +433,152 @@ impl<'a> ContractHost<'a> {
             events,
             ..
         } = self;
-        drop(reads);
-        let txn = storage.begin_write()?;
-        for (raw_key, value) in storage_writes {
-            storage
-                .state()
-                .set_storage(&txn, &contract, Self::namespace(&raw_key), value)?;
+        match reads {
+            Reads::Txn(txn) => {
+                // Single-writer mode: apply into the caller's transaction.
+                // All-or-nothing: pre-images are captured first and restored
+                // if any write fails, so `txn` never holds a partial call.
+                let journal = WriteJournal::capture(txn, &contract, &storage_writes, &accounts)?;
+                if let Err(err) = apply_overlay(storage, txn, &contract, storage_writes, accounts) {
+                    journal.restore(txn)?;
+                    return Err(err);
+                }
+                Ok(events)
+            }
+            Reads::Snapshot(snapshot) => {
+                drop(snapshot);
+                let txn = storage.begin_write()?;
+                apply_overlay(storage, &txn, &contract, storage_writes, accounts)?;
+                txn.commit().map_err(StorageError::Commit)?;
+                Ok(events)
+            }
         }
-        for (address, account) in accounts {
-            storage
-                .state()
-                .set_account(&txn, &Address(address), &account)?;
+    }
+}
+
+/// Read view of a [`ContractHost`].
+enum Reads<'a> {
+    /// Standalone call: one redb read snapshot for the whole call.
+    Snapshot(ReadTransaction),
+    /// Single-writer mode: the caller's open write transaction.
+    Txn(&'a WriteTransaction),
+}
+
+fn decode_account(raw: Option<Vec<u8>>) -> Account {
+    raw.map(|v| Account::from_bytes(&v).unwrap_or_default())
+        .unwrap_or_default()
+}
+
+fn get_row<K, T>(table: &T, key: K) -> Result<Option<Vec<u8>>, ExecutionError>
+where
+    K: redb::Key + for<'k> std::borrow::Borrow<K::SelfType<'k>> + 'static,
+    T: ReadableTable<K, Vec<u8>>,
+{
+    Ok(table.get(key)?.map(|v| v.value()))
+}
+
+impl Reads<'_> {
+    fn account(&self, address: &Address) -> Result<Account, ExecutionError> {
+        let raw = match self {
+            Reads::Snapshot(rt) => get_row(&rt.open_table(tables::ACCOUNTS)?, address.0)?,
+            Reads::Txn(txn) => get_row(&txn.open_table(tables::ACCOUNTS)?, address.0)?,
+        };
+        Ok(decode_account(raw))
+    }
+
+    fn storage(
+        &self,
+        contract: &Address,
+        key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, ExecutionError> {
+        let k = (contract.0, *key);
+        match self {
+            Reads::Snapshot(rt) => get_row(&rt.open_table(tables::CONTRACT_STORAGE)?, k),
+            Reads::Txn(txn) => get_row(&txn.open_table(tables::CONTRACT_STORAGE)?, k),
         }
-        txn.commit().map_err(StorageError::Commit)?;
-        Ok(events)
+    }
+}
+
+/// Write the overlay of one successful call into `txn`.
+fn apply_overlay(
+    storage: &Storage,
+    txn: &WriteTransaction,
+    contract: &Address,
+    storage_writes: BTreeMap<Vec<u8>, Vec<u8>>,
+    accounts: BTreeMap<[u8; 32], Account>,
+) -> Result<(), ExecutionError> {
+    for (raw_key, value) in storage_writes {
+        storage
+            .state()
+            .set_storage(txn, contract, ContractHost::namespace(&raw_key), value)?;
+    }
+    for (address, account) in accounts {
+        storage
+            .state()
+            .set_account(txn, &Address(address), &account)?;
+    }
+    Ok(())
+}
+
+/// `CONTRACT_STORAGE` key: (contract address, namespaced key).
+type StorageRowKey = ([u8; 32], [u8; 32]);
+
+/// Pre-images of every row a call overlay is about to write.
+struct WriteJournal {
+    storage_rows: Vec<(StorageRowKey, Option<Vec<u8>>)>,
+    account_rows: Vec<([u8; 32], Option<Vec<u8>>)>,
+}
+
+impl WriteJournal {
+    fn capture(
+        txn: &WriteTransaction,
+        contract: &Address,
+        storage_writes: &BTreeMap<Vec<u8>, Vec<u8>>,
+        accounts: &BTreeMap<[u8; 32], Account>,
+    ) -> Result<Self, ExecutionError> {
+        let table = txn.open_table(tables::CONTRACT_STORAGE)?;
+        let mut storage_rows = Vec::with_capacity(storage_writes.len());
+        for raw_key in storage_writes.keys() {
+            let k = (contract.0, ContractHost::namespace(raw_key));
+            storage_rows.push((k, get_row(&table, k)?));
+        }
+        drop(table);
+        let table = txn.open_table(tables::ACCOUNTS)?;
+        let mut account_rows = Vec::with_capacity(accounts.len());
+        for address in accounts.keys() {
+            account_rows.push((*address, get_row(&table, *address)?));
+        }
+        Ok(Self {
+            storage_rows,
+            account_rows,
+        })
+    }
+
+    fn restore(self, txn: &WriteTransaction) -> Result<(), ExecutionError> {
+        let mut table = txn.open_table(tables::CONTRACT_STORAGE)?;
+        for (k, pre) in self.storage_rows {
+            match pre {
+                Some(v) => {
+                    table.insert(k, v)?;
+                }
+                None => {
+                    table.remove(k)?;
+                }
+            }
+        }
+        drop(table);
+        let mut table = txn.open_table(tables::ACCOUNTS)?;
+        for (k, pre) in self.account_rows {
+            match pre {
+                Some(v) => {
+                    table.insert(k, v)?;
+                }
+                None => {
+                    table.remove(k)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -520,11 +682,7 @@ impl Host for ContractHost<'_> {
         if let Some(value) = self.storage_writes.get(key) {
             return Some(value.clone());
         }
-        match self
-            .storage
-            .state()
-            .get_storage(&self.reads, &self.contract, &Self::namespace(key))
-        {
+        match self.reads.storage(&self.contract, &Self::namespace(key)) {
             Ok(value) => value,
             Err(err) => {
                 self.record_read_error(format!("storage read failed: {err}"));
@@ -584,6 +742,33 @@ pub fn execute_contract_call(
     let events = host.commit()?;
     log_events(&events);
     Ok(out)
+}
+
+/// [`execute_contract_call`] in single-writer mode: reads see `txn`'s
+/// earlier writes and a successful call is applied into `txn` (the caller
+/// commits). A failed call leaves `txn` untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_contract_call_in_txn(
+    entry: &str,
+    contract: Address,
+    caller: Address,
+    height: u64,
+    timestamp: u64,
+    args: &[u8],
+    storage: &Storage,
+    txn: &WriteTransaction,
+) -> Result<(Vec<u8>, Vec<ContractEvent>), ExecutionError> {
+    let mut host = ContractHost::new_in_txn(storage, txn, contract, caller, height, timestamp);
+    if !host.contract_has_code()? {
+        return Err(ExecutionError::Validation(
+            "Contract not found: no deployed code at the contract address".to_string(),
+        ));
+    }
+    host.grant_caller_approval(create_approval(entry, args));
+    let out = dispatch_entry(entry, &mut host, args)?;
+    let events = host.commit()?;
+    log_events(&events);
+    Ok((out, events))
 }
 
 /// Decode bincode arguments; failure maps to the same error the wasm entry
@@ -749,6 +934,10 @@ pub struct WasmCall<'a> {
     pub args: &'a [u8],
     /// Persistent storage backing the [`ContractHost`].
     pub storage: &'a Storage,
+    /// Open write transaction to run in (single-writer mode). `None` runs
+    /// standalone with its own read snapshot and its own write commit —
+    /// never use `None` while another write transaction is open.
+    pub txn: Option<&'a WriteTransaction>,
     /// Gas / memory limits for this call.
     pub config: &'a ExecutionConfig,
 }
@@ -816,13 +1005,23 @@ impl ContractRunner {
         }
         let module = &self.modules[&key];
 
-        let mut host = ContractHost::new(
-            call.storage,
-            call.contract,
-            call.caller,
-            call.height,
-            call.timestamp,
-        )?;
+        let mut host = match call.txn {
+            Some(txn) => ContractHost::new_in_txn(
+                call.storage,
+                txn,
+                call.contract,
+                call.caller,
+                call.height,
+                call.timestamp,
+            ),
+            None => ContractHost::new(
+                call.storage,
+                call.contract,
+                call.caller,
+                call.height,
+                call.timestamp,
+            )?,
+        };
         host.grant_caller_approval(create_approval(call.entry, call.args));
         // Runtime errors propagate before `commit` — nothing is persisted.
         let out = self
@@ -1629,6 +1828,7 @@ mod tests {
                 timestamp: 1_000,
                 args: &create,
                 storage: &storage,
+                txn: None,
                 config: &config,
             })
             .expect("wasm token_create");
@@ -1644,6 +1844,7 @@ mod tests {
                 timestamp: 1_100,
                 args: &transfer,
                 storage: &storage,
+                txn: None,
                 config: &config,
             })
             .expect("wasm token_transfer");
@@ -1671,5 +1872,73 @@ mod tests {
         let token = token_state(&storage, &contract);
         assert_eq!(token.balances.get(&creator.0), Some(&500));
         assert_eq!(token.balances.get(&recipient.0), Some(&500));
+    }
+    // Native path in single-writer mode: reads see uncommitted writes of the
+    // outer transaction, and the result is applied into it (no 2nd writer).
+    #[test]
+    fn native_call_in_txn_sees_outer_writes_and_applies_into_it() {
+        let (_dir, storage) = open_storage();
+        let caller = addr(1);
+        let contract = addr(50);
+        deploy(&storage, &contract);
+        let txn = storage.begin_write().expect("outer txn");
+        // Uncommitted funding, visible only through `txn`.
+        storage
+            .state()
+            .set_account(
+                &txn,
+                &caller,
+                &Account {
+                    balance: 700,
+                    ..Default::default()
+                },
+            )
+            .expect("fund in txn");
+        let args = htlc_create_args(&addr(2), 700, 10_000);
+        execute_contract_call_in_txn(
+            "htlc_create",
+            contract,
+            caller,
+            1,
+            1_000,
+            &args,
+            &storage,
+            &txn,
+        )
+        .expect("htlc_create in outer txn");
+        // Still inside the same transaction, nothing else opened a writer.
+        txn.commit().expect("outer commit");
+        assert_eq!(native_balance(&storage, &caller), 0);
+        assert_eq!(native_balance(&storage, &contract), 700);
+        assert_eq!(custody_total(&storage, &contract), 700);
+    }
+
+    // Native path in single-writer mode: a failing call writes nothing.
+    #[test]
+    fn failed_native_call_in_txn_writes_nothing() {
+        let (_dir, storage) = open_storage();
+        let caller = addr(1);
+        let contract = addr(51);
+        deploy(&storage, &contract);
+        fund(&storage, &caller, 100);
+        let txn = storage.begin_write().expect("outer txn");
+        // Approval amount exceeds the balance → InsufficientBalance.
+        let args = htlc_create_args(&addr(2), 500, 10_000);
+        let err = execute_contract_call_in_txn(
+            "htlc_create",
+            contract,
+            caller,
+            1,
+            1_000,
+            &args,
+            &storage,
+            &txn,
+        )
+        .expect_err("must fail");
+        assert!(matches!(err, ExecutionError::Contract(_)), "{err:?}");
+        txn.commit().expect("outer commit");
+        assert_eq!(native_balance(&storage, &caller), 100);
+        assert_eq!(native_balance(&storage, &contract), 0);
+        assert_eq!(custody_total(&storage, &contract), 0);
     }
 }
