@@ -1,6 +1,6 @@
-# KVNC Signature Format v1 (SPEC — PROPOSED)
+# KVNC Signature Format v1 (SPEC — FINAL)
 
-Status: **PROPOSED spec, not implemented.** The signing code on `main`
+Status: **FINAL spec, ready for migration** (approved by Main/owner). Not yet implemented: The signing code on `main`
 (`Vote::signature_data`, `Transaction::signing_hash`) is unchanged and remains
 **PROVISIONAL** until all crates listed in [Migration](#migration) switch together.
 Owner: Exec-Foundation (kvnc-types / kvnc-crypto). Format decisions: Main.
@@ -11,7 +11,7 @@ Address format (`kvnc…dag`) and `docs/TOKENOMICS.md` are not affected.
 1. **Domain separation**: a vote signature can never be valid as a transaction signature, and the reverse is also true.
 2. **Replay protection across networks**: every signed message commits to `chain_id`.
 3. **Voter binding**: the vote commits to the voter's index and the epoch, so a signature cannot be reassigned to another committee slot or epoch.
-4. **Single format change**: everything that changes the signed bytes, including the open `Call.value` question, lands in v1 at once.
+4. **Single format change**: everything that changes the signed bytes, including `Call.value`, lands in v1 at once.
 
 ## Conventions
 
@@ -31,8 +31,7 @@ The downside (two networks could choose the same number) is handled by a registr
 in this document. The node MUST refuse to start if the configured `chain_id` does
 not match the one in its genesis config.
 
-Proposed registry (**open for Main**): `1` = mainnet, `2` = public testnet,
-`3` = devnet, `1337` = local/dev. The test vectors below use `chain_id = 2`.
+Registry (**final**): `1` = mainnet, `2` = testnet, `3` = devnet, `1337` = local. The test vectors below use `chain_id = 2`.
 
 ## 1. Vote `signature_data` v1 (74 bytes, signed directly)
 
@@ -78,7 +77,7 @@ Preimage:
 | Stake          | 1      | `amount` u64 LE |
 | Unstake        | 2      | `amount` u64 LE |
 | Deploy         | 3      | `len(code)` u64 LE, `code` bytes |
-| Call           | 4      | `contract` 32 B, [`value` u64 LE, *open, see §3*], `len(method)` u64 LE, `method` UTF-8 bytes, `len(args)` u64 LE, `args`, `gas_limit` u64 LE |
+| Call           | 4      | `contract` 32 B, `value` u64 LE (new in v1, see §3), `len(method)` u64 LE, `method` UTF-8 bytes, `len(args)` u64 LE, `args`, `gas_limit` u64 LE |
 | Delegate       | 5      | `validator` 32 B, `amount` u64 LE |
 | ClaimRewards   | 6      | `0x00` (None) or `0x01` + `validator` 32 B |
 
@@ -92,15 +91,14 @@ The keyed-hash key (`Hash::DOMAIN_TX`) is kept as it is. The in-preimage tag `KV
 stays equal to `signing_hash` (checked in `kvnc-dag/src/block_manager.rs:358`).
 
 Current PROVISIONAL format for comparison: the same preimage **without** the first 24 bytes (tag + chain_id)
-and without `Call.value`.
+and without `Call.value`. In v1 `kind` is byte-identical to PROVISIONAL **except** `Call`, which gains `value`.
 
-## 3. Open: `value: u64` in `TransactionKind::Call` (Exec-Execution request)
+## 3. `value: u64` in `TransactionKind::Call` (decided: IN v1)
 
-Exec-Execution has asked for a signed `value: u64` (native KVNC sent with a contract call).
-**Proposal:** include it in v1 so the signed format changes only once. Position: right after
-`contract`, before `method`, fixed 8 bytes u64 LE, always present (`0` when there is no transfer).
-It has no optional flag, so the encoding stays fixed-shape.
-**Status: OPEN for Main's decision.** Vectors are given both with and without it.
+Requested by Exec-Execution and decided by Main. `Call` carries a signed `value: u64`, the native KVNC
+transferred to the contract. Position: right after `contract`, before `method`, 8 bytes u64 LE, **always present**
+(`0` when unused). There is no optional flag, so the encoding has a fixed shape. Adding the field to
+`TransactionKind::Call` is part of the v1 migration.
 
 ## 4. Test vectors
 
@@ -124,15 +122,15 @@ signing_hash = 0aae8c1832e09bf7da6f897d20b8bc6a017aaeefd50ea10015218a5c4a54c21d
 sig          = c24cd02ec98045a34e4b3102a1cafe70883a83763d5915528554b54797b139df1768cad71220e78bcb6702b109f37bb79513c1f768bacab4bf6e96f4e16cdf06
 ```
 
-### T2: Call WITHOUT value (chain_id=2, nonce=6, contract=`33`×32, method="transfer", args=010203, gas_limit=100000, fee=10)
+### T2: Call, value=0 (chain_id=2, nonce=6, contract=`33`×32, value=0, method="transfer", args=010203, gas_limit=100000, fee=10)
 ```
-len          = 140
-preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c060000000000000004333333333333333333333333333333333333333333333333333333333333333308000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
-signing_hash = 29440c1f5bdf3088f33761473c82d39227f0dbbf94fc234ad6996dbab62af429
-sig          = 4835ac6bced827c7ca14d0642d7f84a7ab51efda72335a8d8ca0a9f40565f7d9d10691d9f17c791f16bffb89bd512f86f5db09c37a4c2d3190203ad87df74e06
+len          = 148
+preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333000000000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
+signing_hash = e6ee05c494bc9197cdbf32f02558a36c0bf9f9ce92d7aceff99b65fa7ee3df92
+sig          = 938f46f0d12493a4a9f6b12b6b2270d519b3704006db70f1406f844d51d79a9e89169816863e2c9d3a86680a01ca09593ca63d53c350b133156e3c5a73f2b904
 ```
 
-### T3: Call WITH value=500 (proposal §3; otherwise identical to T2)
+### T3: Call, value=500 (otherwise identical to T2)
 ```
 len          = 148
 preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333f40100000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
@@ -148,10 +146,11 @@ This is a hard fork of the signed bytes. Every node must switch at the same rele
 window (accepting both formats would bring back the cross-chain replay that v1 removes).
 These must change **in the same release**:
 
-- **kvnc-types** (Foundation): `Vote::signature_data(ctx)`, `Transaction::signing_hash(ctx)`, `SigningContext { chain_id, epoch }`, golden vectors. If §3 is accepted: `TransactionKind::Call.value`.
+- **kvnc-types** (Foundation): `Vote::signature_data(ctx)`, `Transaction::signing_hash(ctx)`, `SigningContext { chain_id, epoch }`, golden vectors. `TransactionKind::Call.value: u64`.
 - **kvnc-crypto** (Foundation): `verify_vote_signature(ctx, vote, pubkey)`.
 - **kvnc-consensus** (Consensus): `engine.rs:510` signs `vote.signature_data()`. `engine.rs:532` has a **duplicate** `vote_signature_data(leader_round, leader_hash)` helper with the old encoding. It must be deleted, not updated, so there is only one encoder. Vote verification must use the kvnc-crypto API.
-- **kvnc-execution** (Execution): signing-hash callers (`lib.rs:904`), removal of the test-signature shortcut (`lib.rs:304-307`), and `Call.value` semantics if accepted.
+- **kvnc-execution** (Execution): signing-hash callers (`lib.rs:904`), removal of the test-signature shortcut (`lib.rs:304-307`), and `Call.value` semantics (transfer `value` to the contract; insufficient balance = reject).
+- **Open PRs with vote signature verification: #3 (consensus) and #4 (network)** must verify against v1 `signature_data` (via the kvnc-crypto API with `SigningContext`) before or together with the migration. Merging them with the PROVISIONAL 40-byte encoding would add a third encoder to remove.
 - **kvnc-network / kvnc-rpc / kvnc-node** (Network): votes and txs on the wire stay the same shape except for `Call.value`. `chain_id` must be in node config and checked against genesis, and RPC `chain_methods.rs:795` must verify with the context.
 - **kvnc-mempool** (`lib.rs:410,451`), **kvnc-dag** (`block_manager.rs:358`), **kvnc-cli**, **kvnc-faucet** (`main.rs:341`), and test helpers in `kvnc-node/tests/live_vote_integration.rs:215`: pass the `chain_id`.
 - Genesis/config: add `chain_id`. Existing devnets must be reset (old signatures do not verify).
