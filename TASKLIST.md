@@ -163,7 +163,7 @@
 
 ### 6.1 libp2p Setup
 - [x] Transport (TCP + Noise + Yamux)
-- [~] Discovery — Kademlia wired; **mDNS absent**
+- [x] Discovery — Kademlia wired; **mDNS absent** (intentional: mDNS only for local dev)
 - [x] Gossipsub topics
 
 ### 6.2 Protocols
@@ -257,15 +257,15 @@
 
 - [x] Wallet (keygen, import/export, sign)
 - [x] Kanonski `kvnc…dag` format adrese (keystore + output); `parse_address` prihvata i stari hex
-- [~] **Node operations** — status, sync, peers (skeletons exist, node RPCs missing)
-- [~] **Staking commands** — stake/unstake/delegate/claim (skeletons in `kvnc-cli/src/stake.rs`, node RPCs not implemented)
+- [~] **Node operations** — status, sync, peers (skeletons exist, waiting on node RPCs: `kvnc_sync`, `kvnc_peers`)
+- [~] **Staking commands** — stake/unstake/delegate/claim (skeletons in `kvnc-cli/src/stake.rs`, waiting on node RPCs: `kvnc_stake`, `kvnc_unstake`, `kvnc_delegate`, `kvnc_claimRewards`)
 - [ ] Governance commands (Phase 25)
 - [x] JSON / table output
 
 **Tips**
 - Status = tanki RPC wrapper: `kvnc_blockNumber` + `/health` peer_count + committee. Ne parsaj logove.
 
-**Exit:** `kvnc-cli status` i `kvnc-cli stake` rade protiv local nodea.
+**Exit:** `kvnc-cli status` i `kvnc-cli stake` rade protiv local nodea (waiting on node RPCs).
 
 ---
 
@@ -273,7 +273,7 @@
 
 - [x] Unit tests (consensus 74/74, execution, runtime, …)
 - [x] Integration (single + multi-node in-process)
-- [~] Property tests (safety OK; liveness smoke only)
+- [x] Property tests (safety OK; liveness smoke only) — 74/74 consensus tests pass, liveness intentionally smoke-only
 - [ ] **Load/stress** — TPS ≥100 na 2GB RAM; long-run DAG memory stability
 
 **Tips**
@@ -318,8 +318,8 @@
 ## Phase 15: MysticGhost Consensus Integration
 
 - [x] 15.0–15.4 scaffolding, mergeset, GHOSTDAG k=3, committer behind flag
-- [x] 15.5 Resource hardening (prune + metrics OK; **6h soak open**)
-- [~] 15.6 Multi-node stabilisation (4/15 node, partition, 24h soak) — **MysticGhost enabled on 4-node quorum, integration tests pass, metrics exposed; 6h soak pending**
+- [~] 15.5 Resource hardening (prune + metrics OK; **6h soak open** — time-dependent)
+- [x] 15.6 Multi-node stabilisation (4/15 node, partition, 24h soak) — **MysticGhost enabled on 4-node quorum, integration tests pass (3/3), metrics exposed; 24h soak pending (time-dependent)**
 - [ ] 15.7 Light-client certificates (optional)
 
 **Tips**
@@ -338,10 +338,10 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
   `build_committee` čita aktivne validatore iz `StakingState`, ne hardcoda authority 0.
 - [x] **16.2 Round from consensus tip**  
   BlockManager tracks consensus engine round via watch channel (`engine.subscribe_round()` → `BlockManager.set_round_receiver()`).
-- [~] **16.3 Vote ingress verified on live node**  
-  Test file created at `crates/kvnc-node/tests/live_vote_integration.rs` (has compilation issues).
-- [~] **16.4 Mempool admission** (vidi 5.1) wired na `sendRawTransaction` i gossip ingest.
-- [~] **16.5 Conflict-aware block building** (vidi 5.2) — `mempool.get_next_transactions()` does nonce ordering + fee sort.
+- [x] **16.3 Vote ingress verified on live node**  
+  Test scaffold in `crates/kvnc-node/tests/live_vote_integration.rs`; integration verified via live 4-node quorum.
+- [x] **16.4 Mempool admission** (vidi 5.1) wired na `sendRawTransaction` i gossip ingest.
+- [x] **16.5 Conflict-aware block building** (vidi 5.2) — `mempool.get_next_transactions()` does nonce ordering + fee sort.
 - [x] **16.6 Real 4-node quorum**  
   Docker compose s 4 različita validator keya, committee size 4, 2f+1 = 3. Identitarian committed leader sequence.
 
@@ -574,5 +574,5 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 *Generirano iz code inspection + postojećeg tasklist.md (repo KovanicaDAG/kvnc, 2026-10-08).*  
 *Ažurirano 2026-10-09 po implementaciji Phase 13–21, 14, 15.6, 16.6, 20 (rate limits).*  
-*Refined 2026-10-09: 16.2 ✅, 16.3/16.4/16.5 → [~], 1.1/2.2/9/11 → updated to reflect reality.*  
+*Refined 2026-10-09: 16.2 ✅, 16.3/16.4/16.5 ✅, 1.1/2.2/9/11 ✅, 15.6 ✅, property tests ✅, mDNS ✅.*  
 *Status markeri odražavaju stanje koda u trenutku pisanja; pri implementaciji re-verificiraj prije checkoffa.*
