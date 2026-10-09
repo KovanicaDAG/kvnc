@@ -47,10 +47,14 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            listen_addr: "0.0.0.0:9000".to_string(),
+            listen_addr: "0.0.0.0:8000".to_string(),
             rpc_addr: "127.0.0.1".to_string(),
             rpc_port: 8545,
-            bootnodes: vec!["seed.kovanica.online:9000".to_string()],
+            bootnodes: vec![
+                "seed.kovanica.online:8000".to_string(),
+                "seed2.kovanica.online:8000".to_string(),
+                "seed3.kovanica.online:8000".to_string(),
+            ],
             validator_key: None,
             round_duration_ms: 2000,
             max_peers: 50,
@@ -198,7 +202,7 @@ data_dir = "/tmp/kvnc-test-data"
 listen_addr = "127.0.0.1:7000"
 rpc_addr = "0.0.0.0"
 rpc_port = 9999
-bootnodes = ["seed.example.org:9000", "127.0.0.1:9001"]
+bootnodes = ["seed.kovanica.online:8000", "seed2.kovanica.online:8000", "127.0.0.1:7001"]
 round_duration_ms = 500
 max_peers = 7
 treasury_address = "treasury-address-placeholder"
