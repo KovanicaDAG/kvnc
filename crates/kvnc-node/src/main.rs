@@ -452,8 +452,10 @@ where
         },
     ));
 
-    // Subscribe to consensus engine's round changes
-    let _round_rx = engine.subscribe_round();
+    // Set the round watch receiver on the block manager so it can track the current round
+    // from the consensus engine's watch channel (Phase 16.2).
+    let round_rx = engine.subscribe_round();
+    block_manager.set_round_receiver(round_rx);
 
     // Set up block broadcaster to gossip proposed blocks
     let broadcast_tx = network_cmd_tx.clone();

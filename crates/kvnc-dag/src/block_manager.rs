@@ -15,6 +15,7 @@ use kvnc_types::{
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use tokio::sync::watch;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -50,6 +51,8 @@ pub struct BlockManager {
     authority_keys: RwLock<HashMap<AuthorityIndex, PublicKey>>,
     /// Stake amounts for each authority (for parent selection filtering).
     authority_stakes: RwLock<HashMap<AuthorityIndex, u64>>,
+    /// Optional round watch receiver from consensus engine for current round tracking.
+    round_receiver: RwLock<Option<watch::Receiver<Round>>>,
 }
 
 impl BlockManager {
@@ -62,6 +65,7 @@ impl BlockManager {
             signing_key: RwLock::new(None),
             authority_keys: RwLock::new(HashMap::new()),
             authority_stakes: RwLock::new(HashMap::new()),
+            round_receiver: RwLock::new(None),
         }
     }
 
@@ -88,6 +92,22 @@ impl BlockManager {
     /// Get our authority index.
     pub fn our_authority(&self) -> AuthorityIndex {
         *self.our_authority.read()
+    }
+
+    /// Set the round watch receiver from the consensus engine.
+    /// This allows the block manager to track the current round from the consensus engine's watch channel.
+    pub fn set_round_receiver(&self, receiver: watch::Receiver<Round>) {
+        *self.round_receiver.write() = Some(receiver);
+    }
+
+    /// Get the current round from the consensus engine's watch channel.
+    /// Returns 0 if no receiver is set or the channel is closed.
+    pub fn current_round(&self) -> Round {
+        if let Some(receiver) = self.round_receiver.read().as_ref() {
+            *receiver.borrow()
+        } else {
+            0
+        }
     }
 
     /// Add a transaction to the pending pool.
