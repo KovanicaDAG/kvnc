@@ -48,6 +48,13 @@
 //! Native balances are moved through the `ACCOUNTS` table
 //! (`kvnc_storage::state_store::Account`); `amount > u64::MAX` maps to
 //! `ContractError::Overflow`, a balance shortfall to `InsufficientBalance`.
+//!
+//! **Spend authorization:** [`Host::transfer`] only accepts
+//! `from == contract address`; any other `from` (the caller, a third party,
+//! a derived escrow address) fails with `ContractError::Unauthorized` and
+//! nothing is moved. No native allowance mechanism exists yet, so flows that
+//! pull funds from the caller or from per-record escrow addresses
+//! (`htlc_*`, `vault_*`) are rejected until one is specified.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -267,6 +274,15 @@ impl Host for ContractHost<'_> {
     }
 
     fn transfer(&mut self, from: &[u8; 32], to: &[u8; 32], amount: u128) -> ContractResult<()> {
+        // Spend authorization: a contract may only move native funds out of
+        // its OWN account. Neither the caller's account nor any other address
+        // (including derived escrow addresses) is spendable: there is no
+        // native allowance/approval mechanism, and signing a `Call` is not an
+        // approval of an amount. Rejected before any account is loaded, so
+        // the overlay is untouched.
+        if *from != self.contract.0 {
+            return Err(ContractError::Unauthorized);
+        }
         if amount > u64::MAX as u128 {
             return Err(ContractError::Overflow);
         }
@@ -800,11 +816,14 @@ mod tests {
         assert_eq!(token.balances.get(&recipient.0), Some(&400));
     }
 
-    // (b) HTLC e2e through native dispatch with REAL balance movement:
-    // create moves sender → escrow, claim moves escrow → claimer, and a
-    // double claim is rejected without moving anything.
+    // (b) HTLC through native dispatch. `htlc_create` pulls funds from the
+    // caller into a derived escrow address. Since `ContractHost::transfer`
+    // only allows spending from the contract's own account (no native
+    // allowance mechanism exists), the call is rejected and NOTHING moves.
+    // When an explicit approval mechanism is specified, restore the full
+    // create → claim balance-movement test here.
     #[test]
-    fn native_htlc_create_claim_moves_native_balances() {
+    fn native_htlc_create_rejected_without_spend_authorization() {
         let (_dir, storage) = open_storage();
         let sender = addr(1);
         let claimer = addr(2);
@@ -816,49 +835,73 @@ mod tests {
         let expiry = 1_000u64;
 
         let create = bincode::serialize(&(claimer.0, 500u128, hash_lock, expiry)).expect("encode");
-        let out = execute_contract_call(
-            "htlc_create",
-            contract,
-            sender,
-            1,
-            100, // created at t=100, long before expiry
-            &create,
-            &storage,
-        )
-        .expect("htlc_create");
-        let id: [u8; 32] = bincode::deserialize(&out).expect("swap id");
-        let escrow = kvnc_htlc::escrow_address(&id);
-
-        // Real movement: sender → per-record escrow address.
-        assert_eq!(native_balance(&storage, &sender), 500);
-        assert_eq!(native_balance(&storage, &Address(escrow)), 500);
-
-        // Claim with the revealed preimage before expiry pays the claimer.
-        let claim = bincode::serialize(&(id, preimage)).expect("encode");
-        execute_contract_call(
-            "htlc_claim",
-            contract,
-            claimer,
-            2,
-            500, // t=500 < expiry=1000
-            &claim,
-            &storage,
-        )
-        .expect("htlc_claim");
-        assert_eq!(native_balance(&storage, &Address(escrow)), 0);
-        assert_eq!(native_balance(&storage, &claimer), 500);
-        assert_eq!(native_balance(&storage, &sender), 500);
-
-        // A second claim is rejected and moves nothing.
-        let again =
-            execute_contract_call("htlc_claim", contract, claimer, 3, 600, &claim, &storage)
-                .expect_err("double claim must fail");
+        let err = execute_contract_call("htlc_create", contract, sender, 1, 100, &create, &storage)
+            .expect_err("caller funds are not spendable by the contract");
         assert!(
-            matches!(again, ExecutionError::Contract(ContractError::InvalidInput)),
-            "unexpected error: {again:?}"
+            matches!(err, ExecutionError::Contract(ContractError::Unauthorized)),
+            "unexpected error: {err:?}"
         );
-        assert_eq!(native_balance(&storage, &claimer), 500);
-        assert_eq!(native_balance(&storage, &Address(escrow)), 0);
+        assert_eq!(native_balance(&storage, &sender), 1_000);
+        assert_eq!(native_balance(&storage, &contract), 0);
+    }
+
+    // Regression: a contract could move funds out of ANY account through
+    // `Host::transfer`. Draining a third party's account must fail with
+    // `Unauthorized` and leave every balance unchanged, even after commit.
+    #[test]
+    fn contract_cannot_drain_foreign_account() {
+        let (_dir, storage) = open_storage();
+        let victim = addr(1);
+        let caller = addr(2);
+        let attacker = addr(3);
+        let contract = addr(20);
+        fund(&storage, &victim, 1_000);
+        fund(&storage, &caller, 1_000);
+        fund(&storage, &contract, 50);
+
+        let mut host = ContractHost::new(&storage, contract, caller, 1, 100).expect("host");
+        assert_eq!(
+            host.transfer(&victim.0, &attacker.0, 1_000),
+            Err(ContractError::Unauthorized),
+            "third-party account must not be spendable"
+        );
+        assert_eq!(
+            host.transfer(&caller.0, &attacker.0, 1_000),
+            Err(ContractError::Unauthorized),
+            "the caller's account is not implicitly approved either"
+        );
+        // The overlay was not touched by the rejected transfers.
+        assert_eq!(host.balance_of(&victim.0), 1_000);
+        assert_eq!(host.balance_of(&caller.0), 1_000);
+        assert_eq!(host.balance_of(&attacker.0), 0);
+        host.commit().expect("commit");
+
+        assert_eq!(native_balance(&storage, &victim), 1_000);
+        assert_eq!(native_balance(&storage, &caller), 1_000);
+        assert_eq!(native_balance(&storage, &attacker), 0);
+        assert_eq!(native_balance(&storage, &contract), 50);
+    }
+
+    // The contract may still spend its own balance (multisig payout path).
+    #[test]
+    fn contract_can_spend_own_account() {
+        let (_dir, storage) = open_storage();
+        let caller = addr(2);
+        let recipient = addr(4);
+        let contract = addr(20);
+        fund(&storage, &contract, 500);
+
+        let mut host = ContractHost::new(&storage, contract, caller, 1, 100).expect("host");
+        host.transfer(&contract.0, &recipient.0, 200)
+            .expect("own funds are spendable");
+        assert_eq!(
+            host.transfer(&contract.0, &recipient.0, 1_000),
+            Err(ContractError::InsufficientBalance)
+        );
+        host.commit().expect("commit");
+
+        assert_eq!(native_balance(&storage, &contract), 300);
+        assert_eq!(native_balance(&storage, &recipient), 200);
     }
 
     // Every advertised entry point reaches the dispatcher: with an empty
