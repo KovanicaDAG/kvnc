@@ -100,6 +100,7 @@ validators = [
             .env("KVNC_MAX_PEERS", "8")
             .env("KVNC_ROUND_DURATION_MS", ROUND_DURATION_MS.to_string())
             .env("KVNC_RUN_VALIDATOR", "true")
+            .env("KVNC_RPC_AUTH", "disable")
             .env("KVNC_VALIDATOR_KEY", key_path.to_string_lossy().to_string())
             .env("KVNC_BOOTNODES", bootnodes.join(","))
             .env("RUST_LOG", "info")

@@ -390,6 +390,9 @@ where
     let (network, network_events) =
         NetworkService::new(network_config, dag_store.clone(), mempool.clone())
             .context("creating network service")?;
+    // Share one service between the swarm event loop and the broadcast command
+    // loop so broadcast commands never re-enter `start` or rebuild listeners.
+    let network = Arc::new(network);
     let peer_count = network.peer_count_handle();
     let peer_count_for_rpc = peer_count.clone();
     let (network_cmd_tx, network_cmd_rx) = mpsc::unbounded_channel::<NetworkCommand>();
@@ -406,6 +409,7 @@ where
     // Fan-out bus for WebSocket subscription events (newHeads,
     // newCommittedLeader, pendingTransactions).
     let events = EventBus::new();
+    let rate_limit_config = RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
     let rpc_state = RpcState {
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -414,14 +418,28 @@ where
         committee: committee.clone(),
         peer_count: peer_count_for_rpc,
         events: events.clone(),
-        rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
-        auth_config: Arc::new(AuthConfig::default()),
+        rate_limiter: Arc::new(RateLimiterState::new(rate_limit_config.clone())),
+        auth_config: Arc::new(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+            AuthConfig {
+                write_tokens: vec!["test".to_string()],
+                require_auth_for_writes: false,
+            }
+        } else {
+            AuthConfig::default()
+        }),
     };
     let rpc_server = RpcServer::new(
         rpc_socket,
         rpc_state,
-        Some(RateLimitConfig::default()),
-        Some(AuthConfig::default()),
+        Some(rate_limit_config),
+        Some(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+            AuthConfig {
+                write_tokens: vec!["test".to_string()],
+                require_auth_for_writes: false,
+            }
+        } else {
+            AuthConfig::default()
+        }),
     ).await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
 
@@ -714,17 +732,25 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
 
 /// Run the P2P network service and process outbound broadcast commands.
 ///
-/// The network task owns the [`NetworkService`] because
-/// `NetworkService::start` takes `&mut self`. Broadcasts are serviced by
-/// re-entering `start` after each command, which re-runs the (idempotent)
-/// listen/dial preamble.
-// TODO: replace with a shared network handle once `kvnc-network` exposes
-// `start(&self)` or a dedicated broadcast handle, to avoid the re-listen churn.
+/// `NetworkService::start` takes `&self` and runs the swarm event loop forever,
+/// so it is spawned once in its own task and owns the listen/dial preamble. The
+/// command loop only calls the `&self` broadcast methods (interior mutability),
+/// so a broadcast never cancels or re-enters `start` and never re-runs the
+/// preamble.
 async fn run_network(
-    mut service: NetworkService,
+    service: Arc<NetworkService>,
     mut cmd_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Run the swarm event loop exactly once, independent of command handling.
+    let swarm_service = service.clone();
+    let mut swarm_task = tokio::spawn(async move {
+        match swarm_service.start().await {
+            Ok(()) => info!("network service stopped"),
+            Err(e) => error!(error = %e, "network service error"),
+        }
+    });
+
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
@@ -748,10 +774,10 @@ async fn run_network(
                     break;
                 }
             },
-            res = service.start() => {
+            res = &mut swarm_task => {
                 match res {
-                    Ok(()) => info!("network service stopped"),
-                    Err(e) => error!(error = %e, "network service error"),
+                    Ok(()) => info!("network swarm loop exited"),
+                    Err(e) => error!(error = %e, "network swarm task failed"),
                 }
                 break;
             }
@@ -763,6 +789,12 @@ async fn run_network(
             }
         }
     }
+
+    // Cancelling the swarm loop drops the swarm (and closes its listeners),
+    // mirroring the previous shutdown behaviour; await it so the sockets are
+    // released before this task returns.
+    swarm_task.abort();
+    let _ = swarm_task.await;
 }
 
 /// Ingest events emitted by the network layer into the DAG store and mempool.
@@ -1019,6 +1051,18 @@ impl BlockManagerTrait for NodeBlockManager {
 }
 
 /// Reconstruct durable commit decisions for restart-safe execution replay.
+///
+/// M3: the ancestry walks below pass `min_round = 0` (unbounded, back to
+/// genesis) and rely on `DagStore::get_ancestors` being NotFound tolerant of
+/// dangling edges left by `prune_waves_before`, rather than bounding the walk.
+/// This mirrors the live committer's `get_previous_tips`; both places must
+/// stay consistent.
+///
+// TODO(M4): replay currently stops using the *global* `last_committed` in the
+// mergeset walk, so recovery of an older sub-DAG can be truncated by a newer
+// commit. Review whether replay should pass an explicit stop-round (the
+// sub-DAG's own leader) instead; leave behaviour unchanged until that is
+// clear to avoid destabilising recovery.
 fn recover_committed_subdags(
     dag_store: &DagStore,
     use_mysticghost: bool,
@@ -1041,7 +1085,13 @@ fn recover_committed_subdags(
 
     for round in rounds {
         for leader_hash in dag_store.get_decided_leaders(round)? {
-            let leader = dag_store.get_block(&leader_hash)?;
+            // Skip decided-round entries whose leader block has been pruned:
+            // recovery must remain possible after pruning rather than fail.
+            let leader = match dag_store.get_block(&leader_hash) {
+                Ok(block) => block,
+                Err(kvnc_dag::DagStoreError::NotFound(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
             if leader.round != round || leader.digest != leader_hash {
                 anyhow::bail!(
                     "persisted commit decision for round {round} references inconsistent leader block (block round {}, block digest {}, expected digest {leader_hash})",
@@ -1051,12 +1101,24 @@ fn recover_committed_subdags(
             }
 
             if use_mysticghost {
-                // MysticGhost path: use scoped GHOSTDAG colouring
+                // Previous tips must be the decided leaders that are neither
+                // this leader nor ancestors of it. This mirrors the live
+                // committer's `get_previous_tips` filter so restart recovery
+                // produces the same committed sub-DAG as first-time commit.
+                let ancestors: std::collections::HashSet<Hash> = dag_store
+                    .get_ancestors(&leader_hash, 0)?
+                    .into_iter()
+                    .collect();
+                let previous_tips: Vec<Hash> = all_previous_tips
+                    .iter()
+                    .copied()
+                    .filter(|h| *h != leader_hash && !ancestors.contains(h))
+                    .collect();
                 let subdag = recover_committed_subdag_mysticghost(
                     dag_store,
                     &leader,
                     round,
-                    &all_previous_tips,
+                    &previous_tips,
                 )?;
                 subdags.push(subdag);
             } else {
@@ -1428,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_subdag_recovery_rejects_missing_decided_block() {
+    fn committed_subdag_recovery_skips_missing_decided_block() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
         let dag = DagStore::new(storage).unwrap();
@@ -1449,7 +1511,11 @@ mod tests {
         let missing_digest = StatementBlock::compute_digest(0, 2, &[], &[]);
         dag.mark_round_decided(2, &missing_digest).unwrap();
 
-        assert!(recover_committed_subdags(&dag, false).is_err());
+        // A pruned/missing decided leader must be skipped, not fatal: recovery
+        // still reconstructs the decisions whose blocks remain available.
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].leader.digest, valid_digest);
     }
 
     #[test]
