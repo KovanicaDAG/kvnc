@@ -97,3 +97,95 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release --all-targets
+
+  # ---------------------------------------------------------------------------
+  # Per-crate status for foundation-owned crates (Exec-Foundation).
+  # One matrix job per crate so pass/fail of fmt / clippy / test is visible per
+  # crate in the PR checks list, plus one aggregated table in the run summary.
+  # Each step uses continue-on-error so all three checks always run; the job
+  # still fails at the end if any of them failed.
+  # ---------------------------------------------------------------------------
+  foundation-crates:
+    name: Foundation (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [kvnc-types, kvnc-crypto, kvnc-common, kvnc-cli]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: foundation-${{ matrix.crate }}
+      - name: fmt --check
+        id: fmt
+        continue-on-error: true
+        run: cargo fmt -p ${{ matrix.crate }} -- --check
+      - name: clippy -D warnings
+        id: clippy
+        continue-on-error: true
+        run: cargo clippy -p ${{ matrix.crate }} --all-targets --all-features -- -D warnings
+      - name: test
+        id: test
+        continue-on-error: true
+        run: |
+          cargo test -p ${{ matrix.crate }} --all-targets
+          cargo test -p ${{ matrix.crate }} --doc
+      - name: Record result
+        if: always()
+        env:
+          CRATE: ${{ matrix.crate }}
+          FMT: ${{ steps.fmt.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TEST: ${{ steps.test.outcome }}
+        run: |
+          icon() { case "$1" in success) echo "✅ pass";; failure) echo "❌ fail";; *) echo "⚪ $1";; esac; }
+          row="| \`$CRATE\` | $(icon "$FMT") | $(icon "$CLIPPY") | $(icon "$TEST") |"
+          mkdir -p foundation-result
+          echo "$row" > "foundation-result/$CRATE.md"
+          {
+            echo "| crate | fmt | clippy | test |"
+            echo "|---|---|---|---|"
+            echo "$row"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundation-result-${{ matrix.crate }}
+          path: foundation-result/
+          retention-days: 5
+      - name: Fail if any check failed
+        if: steps.fmt.outcome != 'success' || steps.clippy.outcome != 'success' || steps.test.outcome != 'success'
+        run: |
+          echo "fmt=${{ steps.fmt.outcome }} clippy=${{ steps.clippy.outcome }} test=${{ steps.test.outcome }}"
+          exit 1
+
+  foundation-summary:
+    name: Foundation summary
+    runs-on: ubuntu-latest
+    needs: foundation-crates
+    if: always()
+    steps:
+      - name: Download per-crate results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: foundation-result-*
+          path: results
+          merge-multiple: true
+      - name: Write summary table
+        run: |
+          {
+            echo "## Foundation crates: fmt / clippy / test"
+            echo
+            echo "| crate | fmt | clippy | test |"
+            echo "|---|---|---|---|"
+            for c in kvnc-types kvnc-crypto kvnc-common kvnc-cli; do
+              if [ -f "results/$c.md" ]; then cat "results/$c.md"; else echo "| \`$c\` | ⚪ no result | ⚪ no result | ⚪ no result |"; fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
