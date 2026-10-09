@@ -106,7 +106,7 @@ impl ColouringCertificate {
     /// Verify the certificate has sufficient witnesses for k=3 GHOSTDAG.
     /// For k=3, we need at least k+1 = 4 witnesses in the k-cluster.
     pub fn verify_witnesses(&self, k: usize) -> bool {
-        self.witnesses.len() >= k + 1
+        self.witnesses.len() > k
     }
 }
 
