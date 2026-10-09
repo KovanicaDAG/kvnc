@@ -27,3 +27,7 @@ parking_lot = "0.12"
 ed25519-dalek = { version = "2", features = ["rand_core", "batch"] }
 thiserror = { workspace = true }
 zeroize = "1"
+rpassword = "7.5"
+
+[dev-dependencies]
+tempfile = "3"
