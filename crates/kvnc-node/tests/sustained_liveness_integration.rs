@@ -152,8 +152,11 @@ impl QuorumNode {
 
         // Every node gets the *same* genesis validator set (all four members) so
         // that `build_committee` derives an identical committee everywhere.
-        std::fs::write(data_dir.path().join("genesis_validators.toml"), genesis_toml)
-            .with_context(|| format!("node {index}: write genesis_validators.toml"))?;
+        std::fs::write(
+            data_dir.path().join("genesis_validators.toml"),
+            genesis_toml,
+        )
+        .with_context(|| format!("node {index}: write genesis_validators.toml"))?;
 
         // 32-byte hex seed; the node derives its Ed25519 key from this.
         let key_path = data_dir.path().join("validator.key");
@@ -599,14 +602,13 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
     // Start nodes sequentially so each new node dials already-running peers;
     // the network layer also retries bootstrap dials, so late nodes converge.
     let mut quorum: Vec<QuorumNode> = Vec::with_capacity(NODES);
-    for i in 0..NODES {
+    for (i, (sk, pk, addr)) in validators.iter().cloned().enumerate() {
         let rpc_port = RPC_BASE_PORT + i as u16;
         let p2p_port = P2P_BASE_PORT + i as u16;
         let bootnodes = (0..NODES)
             .filter(|j| *j != i)
             .map(|j| format!("127.0.0.1:{}", P2P_BASE_PORT + j as u16))
             .collect::<Vec<_>>();
-        let (sk, pk, addr) = validators[i].clone();
 
         let node = QuorumNode::start(
             i,
@@ -685,7 +687,7 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
         &mut quorum,
         Duration::from_secs(GROWTH_TIMEOUT_SECS),
         &mut monotonic,
-        |s| max_height(s) >= base + 1,
+        |s| max_height(s) > base,
     )
     .await
     .context(

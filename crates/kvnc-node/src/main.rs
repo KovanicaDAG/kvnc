@@ -40,10 +40,13 @@ use kvnc_consensus::metrics::{record_mempool_size, record_peer_count};
 use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
-use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
-use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService, BlockSyncRequest, BlockSyncResponse, StateSyncResponse};
-use kvnc_rpc::{EventBus, RpcServer, RpcState, AuthConfig, RateLimitConfig, RateLimiterState};
 use kvnc_execution::{LogPublisher, TransactionReceipt};
+use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
+use kvnc_network::{
+    BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
+    StateSyncResponse,
+};
+use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -263,7 +266,7 @@ struct GenesisValidatorInput {
 
 /// Install the tracing subscriber, honouring `RUST_LOG` when set.
 fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let json_layer = fmt::layer()
@@ -493,7 +496,8 @@ where
     // Fan-out bus for WebSocket subscription events (newHeads,
     // newCommittedLeader, pendingTransactions).
     let events = EventBus::new();
-    let rate_limit_config = RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    let rate_limit_config =
+        RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
     let rpc_state = RpcState {
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -503,28 +507,33 @@ where
         peer_count: peer_count_for_rpc,
         events: events.clone(),
         rate_limiter: Arc::new(RateLimiterState::new(rate_limit_config.clone())),
-        auth_config: Arc::new(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-            AuthConfig {
-                write_tokens: vec!["test".to_string()],
-                require_auth_for_writes: false,
-            }
-        } else {
-            AuthConfig::default()
-        }),
+        auth_config: Arc::new(
+            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+                AuthConfig {
+                    write_tokens: vec!["test".to_string()],
+                    require_auth_for_writes: false,
+                }
+            } else {
+                AuthConfig::default()
+            },
+        ),
     };
     let rpc_server = RpcServer::new(
         rpc_socket,
         rpc_state,
         Some(rate_limit_config),
-        Some(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-            AuthConfig {
-                write_tokens: vec!["test".to_string()],
-                require_auth_for_writes: false,
-            }
-        } else {
-            AuthConfig::default()
-        }),
-    ).await;
+        Some(
+            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+                AuthConfig {
+                    write_tokens: vec!["test".to_string()],
+                    require_auth_for_writes: false,
+                }
+            } else {
+                AuthConfig::default()
+            },
+        ),
+    )
+    .await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
 
     // ------------------------------------------------------------------
@@ -992,8 +1001,12 @@ fn handle_network_event(
                         warn!(digest = %block.digest, error = %e, "rejected invalid block signature from sync response");
                     } else {
                         match dag_store.put_block(&block) {
-                            Ok(()) => debug!(digest = %block.digest, "synced block inserted into DAG"),
-                            Err(e) => warn!(digest = %block.digest, error = %e, "failed to insert synced block"),
+                            Ok(()) => {
+                                debug!(digest = %block.digest, "synced block inserted into DAG")
+                            }
+                            Err(e) => {
+                                warn!(digest = %block.digest, error = %e, "failed to insert synced block")
+                            }
                         }
                     }
                 }
@@ -1008,7 +1021,9 @@ fn handle_network_event(
                     // Re-request each missing block
                     for hash in hashes {
                         let request = BlockSyncRequest::ByHash(hash);
-                        if let Err(e) = network_cmd_tx.send(NetworkCommand::RequestSync(peer, request)) {
+                        if let Err(e) =
+                            network_cmd_tx.send(NetworkCommand::RequestSync(peer, request))
+                        {
                             debug!(error = %e, "failed to queue re-request for missing block");
                         }
                     }
