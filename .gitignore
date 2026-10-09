@@ -41,3 +41,9 @@ keystore/
 .slim/worktrees/
 .slim/worktrees.json
 # END oh-my-opencode-slim worktrees
+
+# Nested slim worktree copies (never track a full repo copy inside the repo)
+**/.slim/worktrees/
+
+# Generated devnet databases (rebuilt at runtime, never commit)
+data/*.redb
