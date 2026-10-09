@@ -276,7 +276,7 @@
 - [~] 15.4 6h soak — code exists; **never run in CI** (`ops/soak/soak.sh`).
 - [~] 15.5 multi-node stabilisation (4/15 node, partition, 24h soak) — integration tests pass; **24h soak never run**.
 - [x] Resource budgets enforcement — MemoryMax=3G via cgroup v2 in soak.sh; soak.sh monitors RSS every 30s and warns at 3G (`ops/soak/soak.sh:37-38`).
-- [ ] 15.6 light-client certificates — no light-client cert types or code found.
+- [x] 15.6 light-client certificates — `WaveCommitCertificate`, `ColouringCertificate`, `StateProof`, `LightClientCheckpoint` in `types/src/light_client.rs`; `verify_quorum` for 2f+1 stake, `verify_witnesses` for k=3 GHOSTDAG.
 
 ---
 
@@ -316,7 +316,7 @@
 - [~] state Merkle (2.2) — **sorted KV Merkle exists** (minimal path per 2.2 tips; not full MPT) (`state_store.rs:571-589`).
 - [x] snapshot/fast sync — `export_snapshot`/`import_snapshot` exist (`state_store.rs:418-567`); state sync protocol implemented in `network/src/state_sync.rs` with request-response over `/kvanc/state-sync/1.0.0`, gossip topic `state_sync`, and NetworkEvent handling.
 - [x] state pruning policy — `PruningConfig` with `keep_recent` and `max_state_roots` in `state_store.rs:44-58`; `prune_state_roots` method removes old state roots beyond retention (`state_store.rs:610-645`).
-- [ ] light-client wave commit + colouring certificate — no light-client cert types or code found.
+- [x] light-client wave commit + colouring certificate — `WaveCommitCertificate`, `ColouringCertificate`, `StateProof`, `LightClientCheckpoint` in `types/src/light_client.rs`; quorum verification (2f+1 stake), witness verification (k=3 GHOSTDAG).
 - [x] full missing-parent recovery via block-sync — `service.rs:427-445` enqueues sync on missing parent; BlockSyncResponse handling with MissingBlocks re-request implemented in `node/src/main.rs:895-930`.
 
 ---
@@ -327,7 +327,7 @@
 - [x] fuzzing harnesses (`fuzz/`: fuzz_block/fuzz_tx/fuzz_vote/fuzz_consensus) — all four targets exist.
 - [x] RPC/WS rate limit + optional auth token — token bucket 60/min burst 10 on `/rpc` returning 429; bearer token framework for write methods (`rpc/src/rpc_middleware.rs:20-64, 187-203`).
 - [x] resource budgets (6h MemoryMax=3G soak) — `ops/soak/soak.sh` enforces MemoryMax=3G via cgroup v2, monitors RSS every 30s, warns at 3G (`ops/soak/soak.sh:37-38`); CPU/disk caps not yet enforced.
-- [ ] keystore no-raw-hex enforcement — CLI accepts raw hex; no enforcement found.
+- [x] keystore no-raw-hex enforcement — `address` command requires `--allow-raw-hex` flag and enforces 0600 file permissions; `import-key` uses hidden prompt (secure by default) (`cli/src/main.rs:698-720`).
 
 ---
 

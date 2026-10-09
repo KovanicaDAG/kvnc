@@ -169,6 +169,9 @@ struct AddressArgs {
     /// File containing a 32-byte hex seed (the seed itself is never printed)
     #[arg(long, value_name = "FILE")]
     key_file: PathBuf,
+    /// Allow raw hex seed import (disabled by default for security; enable with caution)
+    #[arg(long, default_value_t = false)]
+    allow_raw_hex: bool,
 }
 
 /// Arguments for `kvnc sign`.
@@ -695,7 +698,35 @@ fn cmd_migrate(args: MigrateArgs, json_output: bool) -> Result<()> {
 /// `kvnc address --key-file <FILE>` — offline derivation of the canonical
 /// address and public key from a raw 32-byte hex seed. Prints only public
 /// identity material; the seed is never echoed.
+/// 
+/// Security: requires `--allow-raw-hex` flag and key file must have 0600 permissions.
 fn cmd_address(args: AddressArgs, json_output: bool) -> Result<()> {
+    if !args.allow_raw_hex {
+        anyhow::bail!(
+            "raw hex seed import is disabled by default for security. \
+            Use --allow-raw-hex to enable (ensure key file has 0600 permissions and is not shared)."
+        );
+    }
+
+    // Enforce key file permissions (0600) to prevent accidental exposure
+    let metadata = std::fs::metadata(&args.key_file)
+        .with_context(|| format!("reading key file metadata {}", args.key_file.display()))?;
+    let permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if permissions.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "key file {} has insecure permissions (mode: {:o}). \
+                Must be 0600 (readable/writable only by owner). \
+                Run: chmod 600 {}",
+                args.key_file.display(),
+                permissions.mode() & 0o777,
+                args.key_file.display()
+            );
+        }
+    }
+
     let raw = std::fs::read_to_string(&args.key_file)
         .with_context(|| format!("reading key file {}", args.key_file.display()))?;
     let seed = wallet::seed_from_raw_hex(&raw)?;
@@ -815,15 +846,22 @@ mod wallet_cli_security_tests {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("validator.pem");
         std::fs::write(&key_path, hex::encode([0x2a; 32])).unwrap();
+        // Set secure permissions (0600)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert!(cmd_address(
             AddressArgs {
-                key_file: key_path.clone()
+                key_file: key_path.clone(),
+                allow_raw_hex: true,
             },
             false
         )
         .is_ok());
         std::fs::write(&key_path, "00").unwrap();
-        assert!(cmd_address(AddressArgs { key_file: key_path }, false).is_err());
+        assert!(cmd_address(AddressArgs { key_file: key_path, allow_raw_hex: true }, false).is_err());
     }
 
     #[test]

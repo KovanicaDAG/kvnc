@@ -13,6 +13,7 @@ pub mod committee;
 pub mod crypto;
 pub mod error;
 pub mod hash;
+pub mod light_client;
 pub mod transaction;
 pub mod vote;
 
@@ -23,6 +24,9 @@ pub use committee::{Authority, Committee, Stake};
 pub use crypto::{PublicKey, Signature, SigningKey};
 pub use error::TypesError;
 pub use hash::Hash;
+pub use light_client::{
+    ColouringCertificate, LightClientCheckpoint, StateProof, WaveCommitCertificate,
+};
 pub use transaction::{Transaction, TransactionKind};
 pub use vote::Vote;
 
