@@ -12,8 +12,8 @@ use axum::{
     response::Response,
 };
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock as TokioRwLock;
 
 /// Rate limiter configuration
@@ -219,10 +219,9 @@ pub async fn rate_limit_middleware(
         let mut response = Response::new("Rate limit exceeded".into());
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("Retry-After", seconds.to_string().parse().unwrap());
         }
         return response;
     }
@@ -242,25 +241,30 @@ pub async fn auth_middleware(
         .get::<SocketAddr>()
         .copied()
         .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
+    let method = request
+        .uri()
+        .path()
+        .strip_prefix("/rpc")
+        .unwrap_or(request.uri().path());
 
     // Check if this is a write method
     let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
 
     if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
+        let auth_header = headers
+            .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
         let token = match auth_header {
             Some(t) => t,
             None => {
-                let mut response = Response::new("Authentication required for write operations".into());
+                let mut response =
+                    Response::new("Authentication required for write operations".into());
                 *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
+                response
+                    .headers_mut()
+                    .insert("WWW-Authenticate", "Bearer".parse().unwrap());
                 return response;
             }
         };
@@ -294,32 +298,36 @@ pub async fn combined_middleware(
         let mut response = Response::new("Rate limit exceeded".into());
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("Retry-After", seconds.to_string().parse().unwrap());
         }
         return response;
     }
 
     // Authentication for write methods
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
+    let method = request
+        .uri()
+        .path()
+        .strip_prefix("/rpc")
+        .unwrap_or(request.uri().path());
     let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
 
     if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
+        let auth_header = headers
+            .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
         let token = match auth_header {
             Some(t) => t,
             None => {
-                let mut response = Response::new("Authentication required for write operations".into());
+                let mut response =
+                    Response::new("Authentication required for write operations".into());
                 *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
+                response
+                    .headers_mut()
+                    .insert("WWW-Authenticate", "Bearer".parse().unwrap());
                 return response;
             }
         };

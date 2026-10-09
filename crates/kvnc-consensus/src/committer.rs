@@ -401,7 +401,9 @@ impl UniversalCommitter {
             }
 
             // Try indirect decision
-            let indirect_status = self.base.try_indirect_decide(dag_store, leader_info, &decided);
+            let indirect_status = self
+                .base
+                .try_indirect_decide(dag_store, leader_info, &decided);
             if indirect_status == LeaderStatus::Commit {
                 // Construct only; candidate-only callers do not publish it.
                 return self
@@ -655,8 +657,10 @@ impl UniversalCommitter {
         dag_store: &D,
         leader_hash: &Hash,
     ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
-        let ancestors: HashSet<Hash> =
-            dag_store.get_ancestors(leader_hash, 0)?.into_iter().collect();
+        let ancestors: HashSet<Hash> = dag_store
+            .get_ancestors(leader_hash, 0)?
+            .into_iter()
+            .collect();
         let decided_rounds = dag_store.get_decided_rounds(u64::MAX)?;
         let mut tips = Vec::new();
 

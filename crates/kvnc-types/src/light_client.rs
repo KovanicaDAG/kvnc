@@ -47,10 +47,7 @@ impl WaveCommitCertificate {
 
     /// Verify the certificate has sufficient stake weight (2f+1).
     /// Returns true if the signatures represent > 2/3 of committee stake.
-    pub fn verify_quorum(
-        &self,
-        committee: &crate::committee::Committee,
-    ) -> bool {
+    pub fn verify_quorum(&self, committee: &crate::committee::Committee) -> bool {
         let total_stake: u64 = committee.authorities.iter().map(|a| a.stake).sum();
         let signed_stake: u64 = self
             .signatures
@@ -128,7 +125,12 @@ pub struct StateProof {
 
 impl StateProof {
     /// Create a new state proof.
-    pub fn new(state_root: Hash, address: Address, value: Option<Vec<u8>>, proof: Vec<Hash>) -> Self {
+    pub fn new(
+        state_root: Hash,
+        address: Address,
+        value: Option<Vec<u8>>,
+        proof: Vec<Hash>,
+    ) -> Self {
         Self {
             state_root,
             address,
@@ -186,32 +188,19 @@ impl LightClientCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Address, hash::Hash};
+    use crate::{hash::Hash, Address};
 
     #[test]
     fn wave_commit_certificate_creation() {
         let sigs = BTreeMap::new();
-        let cert = WaveCommitCertificate::new(
-            Hash::zero(),
-            42,
-            100,
-            sigs,
-            Hash::zero(),
-        );
+        let cert = WaveCommitCertificate::new(Hash::zero(), 42, 100, sigs, Hash::zero());
         assert_eq!(cert.leader_round, 42);
         assert_eq!(cert.committed_height, 100);
     }
 
     #[test]
     fn colouring_certificate_creation() {
-        let cert = ColouringCertificate::new(
-            Hash::zero(),
-            true,
-            10,
-            5,
-            vec![],
-            Hash::zero(),
-        );
+        let cert = ColouringCertificate::new(Hash::zero(), true, 10, 5, vec![], Hash::zero());
         assert!(cert.is_blue);
         assert_eq!(cert.round, 10);
     }
@@ -230,13 +219,7 @@ mod tests {
     #[test]
     fn light_client_checkpoint_creation() {
         let sigs = BTreeMap::new();
-        let wave_cert = WaveCommitCertificate::new(
-            Hash::zero(),
-            42,
-            100,
-            sigs,
-            Hash::zero(),
-        );
+        let wave_cert = WaveCommitCertificate::new(Hash::zero(), 42, 100, sigs, Hash::zero());
         let checkpoint = LightClientCheckpoint::new(
             100,
             Hash::zero(),

@@ -362,7 +362,11 @@ impl BlockManager {
         }
 
         // Basic fee check: non-stake transactions must have a fee
-        let is_stake = matches!(tx.kind, kvnc_types::TransactionKind::Stake { .. } | kvnc_types::TransactionKind::Delegate { .. });
+        let is_stake = matches!(
+            tx.kind,
+            kvnc_types::TransactionKind::Stake { .. }
+                | kvnc_types::TransactionKind::Delegate { .. }
+        );
         if tx.fee == 0 && !is_stake {
             return Err(BlockManagerError::InvalidBlock(
                 "Transaction fee is zero".to_string(),

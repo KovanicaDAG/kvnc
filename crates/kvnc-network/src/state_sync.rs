@@ -5,7 +5,10 @@
 
 use crate::error::NetworkError;
 use futures::{AsyncReadExt, AsyncWriteExt};
-use libp2p::{request_response::{Codec, ProtocolSupport}, StreamProtocol};
+use libp2p::{
+    request_response::{Codec, ProtocolSupport},
+    StreamProtocol,
+};
 use serde::{Deserialize, Serialize};
 
 /// Protocol name for state sync request-response.
@@ -24,12 +27,16 @@ pub struct StateSyncRequest {
 impl StateSyncRequest {
     /// Create a request for the latest state.
     pub fn latest() -> Self {
-        Self { target_height: None }
+        Self {
+            target_height: None,
+        }
     }
 
     /// Create a request for a specific height.
     pub fn at_height(height: u64) -> Self {
-        Self { target_height: Some(height) }
+        Self {
+            target_height: Some(height),
+        }
     }
 
     /// Serialize the request for the wire.

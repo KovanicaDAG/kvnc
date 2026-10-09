@@ -152,8 +152,11 @@ impl QuorumNode {
 
         // Every node gets the *same* genesis validator set (all four members) so
         // that `build_committee` derives an identical committee everywhere.
-        std::fs::write(data_dir.path().join("genesis_validators.toml"), genesis_toml)
-            .with_context(|| format!("node {index}: write genesis_validators.toml"))?;
+        std::fs::write(
+            data_dir.path().join("genesis_validators.toml"),
+            genesis_toml,
+        )
+        .with_context(|| format!("node {index}: write genesis_validators.toml"))?;
 
         // 32-byte hex seed; the node derives its Ed25519 key from this.
         let key_path = data_dir.path().join("validator.key");

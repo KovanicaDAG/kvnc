@@ -95,66 +95,87 @@ pub fn generate_openapi_spec() -> OpenApiSpec {
     };
 
     // Add common schemas
-    spec.components.schemas.insert("JsonRpcRequest".to_string(), json!({
-        "type": "object",
-        "required": ["jsonrpc", "method"],
-        "properties": {
-            "jsonrpc": { "type": "string", "const": "2.0" },
-            "method": { "type": "string" },
-            "params": { "type": "array", "items": {} },
-            "id": { "type": ["string", "number", "null"] }
-        }
-    }));
+    spec.components.schemas.insert(
+        "JsonRpcRequest".to_string(),
+        json!({
+            "type": "object",
+            "required": ["jsonrpc", "method"],
+            "properties": {
+                "jsonrpc": { "type": "string", "const": "2.0" },
+                "method": { "type": "string" },
+                "params": { "type": "array", "items": {} },
+                "id": { "type": ["string", "number", "null"] }
+            }
+        }),
+    );
 
-    spec.components.schemas.insert("JsonRpcResponse".to_string(), json!({
-        "type": "object",
-        "properties": {
-            "jsonrpc": { "type": "string", "const": "2.0" },
-            "result": {},
-            "error": { "$ref": "#/components/schemas/JsonRpcError" },
-            "id": { "type": ["string", "number", "null"] }
-        }
-    }));
+    spec.components.schemas.insert(
+        "JsonRpcResponse".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "jsonrpc": { "type": "string", "const": "2.0" },
+                "result": {},
+                "error": { "$ref": "#/components/schemas/JsonRpcError" },
+                "id": { "type": ["string", "number", "null"] }
+            }
+        }),
+    );
 
-    spec.components.schemas.insert("JsonRpcError".to_string(), json!({
-        "type": "object",
-        "required": ["code", "message"],
-        "properties": {
-            "code": { "type": "integer" },
-            "message": { "type": "string" },
-            "data": {}
-        }
-    }));
+    spec.components.schemas.insert(
+        "JsonRpcError".to_string(),
+        json!({
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+                "code": { "type": "integer" },
+                "message": { "type": "string" },
+                "data": {}
+            }
+        }),
+    );
 
-    spec.components.schemas.insert("Address".to_string(), json!({
-        "type": "string",
-        "pattern": "^kvnc[a-f0-9]{64}dag$",
-        "description": "Canonical KVNC address format (kvnc<hex>dag with blake3 checksum)"
-    }));
+    spec.components.schemas.insert(
+        "Address".to_string(),
+        json!({
+            "type": "string",
+            "pattern": "^kvnc[a-f0-9]{64}dag$",
+            "description": "Canonical KVNC address format (kvnc<hex>dag with blake3 checksum)"
+        }),
+    );
 
-    spec.components.schemas.insert("Hash".to_string(), json!({
-        "type": "string",
-        "pattern": "^0x[a-f0-9]{64}$",
-        "description": "32-byte hash as 0x-prefixed hex"
-    }));
+    spec.components.schemas.insert(
+        "Hash".to_string(),
+        json!({
+            "type": "string",
+            "pattern": "^0x[a-f0-9]{64}$",
+            "description": "32-byte hash as 0x-prefixed hex"
+        }),
+    );
 
-    spec.components.schemas.insert("Quantity".to_string(), json!({
-        "type": "string",
-        "pattern": "^0x[a-f0-9]+$",
-        "description": "Ethereum-style quantity (minimal hex)"
-    }));
+    spec.components.schemas.insert(
+        "Quantity".to_string(),
+        json!({
+            "type": "string",
+            "pattern": "^0x[a-f0-9]+$",
+            "description": "Ethereum-style quantity (minimal hex)"
+        }),
+    );
 
-    spec.components.schemas.insert("Transaction".to_string(), json!({
-        "type": "object",
-        "properties": {
-            "hash": { "$ref": "#/components/schemas/Hash" },
-            "sender": { "$ref": "#/components/schemas/Address" },
-            "nonce": { "$ref": "#/components/schemas/Quantity" },
-            "fee": { "$ref": "#/components/schemas/Quantity" },
-            "kind": { "$ref": "#/components/schemas/TransactionKind" },
-            "signature": { "type": "string", "pattern": "^0x[a-f0-9]{128}$" }
-        }
-    }));
+    spec.components.schemas.insert(
+        "Transaction".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "hash": { "$ref": "#/components/schemas/Hash" },
+                "sender": { "$ref": "#/components/schemas/Address" },
+                "nonce": { "$ref": "#/components/schemas/Quantity" },
+                "fee": { "$ref": "#/components/schemas/Quantity" },
+                "kind": { "$ref": "#/components/schemas/TransactionKind" },
+                "signature": { "type": "string", "pattern": "^0x[a-f0-9]{128}$" }
+            }
+        }),
+    );
 
     spec.components.schemas.insert("TransactionKind".to_string(), json!({
         "oneOf": [
@@ -180,218 +201,338 @@ pub fn generate_openapi_spec() -> OpenApiSpec {
         }
     }));
 
-    spec.components.schemas.insert("Account".to_string(), json!({
-        "type": "object",
-        "properties": {
-            "address": { "$ref": "#/components/schemas/Address" },
-            "balance": { "$ref": "#/components/schemas/Quantity" },
-            "nonce": { "$ref": "#/components/schemas/Quantity" },
-            "code_hash": { "$ref": "#/components/schemas/Hash" },
-            "is_contract": { "type": "boolean" }
-        }
-    }));
+    spec.components.schemas.insert(
+        "Account".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "address": { "$ref": "#/components/schemas/Address" },
+                "balance": { "$ref": "#/components/schemas/Quantity" },
+                "nonce": { "$ref": "#/components/schemas/Quantity" },
+                "code_hash": { "$ref": "#/components/schemas/Hash" },
+                "is_contract": { "type": "boolean" }
+            }
+        }),
+    );
 
-    spec.components.schemas.insert("Validator".to_string(), json!({
-        "type": "object",
-        "properties": {
-            "address": { "$ref": "#/components/schemas/Address" },
-            "public_key": { "type": "string", "pattern": "^0x[a-f0-9]{64}$" },
-            "stake": { "$ref": "#/components/schemas/Quantity" },
-            "active": { "type": "boolean" },
-            "commission_bps": { "type": "integer" }
-        }
-    }));
+    spec.components.schemas.insert(
+        "Validator".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "address": { "$ref": "#/components/schemas/Address" },
+                "public_key": { "type": "string", "pattern": "^0x[a-f0-9]{64}$" },
+                "stake": { "$ref": "#/components/schemas/Quantity" },
+                "active": { "type": "boolean" },
+                "commission_bps": { "type": "integer" }
+            }
+        }),
+    );
 
     // Define all RPC methods
     let methods = vec![
-        ("kvnc_getBlockByHash", "Get block by hash", "Chain", json!({
-            "type": "array",
-            "items": [
-                { "$ref": "#/components/schemas/Hash" },
-                { "type": "boolean" }
-            ],
-            "minItems": 1,
-            "maxItems": 2
-        }), json!({
-            "type": "object",
-            "properties": {
-                "block": { "$ref": "#/components/schemas/Block" },
-                "full_transactions": { "type": "boolean" }
-            }
-        })),
-        ("kvnc_getBlockByNumber", "Get block by height/round", "Chain", json!({
-            "type": "array",
-            "items": [
-                { "$ref": "#/components/schemas/Quantity" },
-                { "type": "boolean" }
-            ],
-            "minItems": 1,
-            "maxItems": 2
-        }), json!({
-            "type": "object",
-            "properties": {
-                "block": { "$ref": "#/components/schemas/Block" },
-                "full_transactions": { "type": "boolean" }
-            }
-        })),
-        ("kvnc_sendRawTransaction", "Submit signed transaction", "Transactions", json!({
-            "type": "array",
-            "items": { "type": "string", "pattern": "^0x[a-f0-9]+$" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "type": "string",
-            "pattern": "^0x[a-f0-9]{64}$",
-            "description": "Transaction hash"
-        })),
-        ("kvnc_getTransactionReceipt", "Get transaction receipt", "Transactions", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Hash" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "type": "object",
-            "properties": {
-                "tx_hash": { "$ref": "#/components/schemas/Hash" },
-                "success": { "type": "boolean" },
-                "gas_used": { "$ref": "#/components/schemas/Quantity" },
-                "error": { "type": ["string", "null"] },
-                "events": { "type": "array", "items": { "type": "object" } }
-            }
-        })),
-        ("kvnc_getTransactionByHash", "Get transaction by hash", "Transactions", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Hash" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "$ref": "#/components/schemas/Transaction"
-        })),
-        ("kvnc_getBalance", "Get account balance", "Accounts", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Address" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
-        ("kvnc_getNonce", "Get account nonce", "Accounts", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Address" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
-        ("kvnc_getCode", "Get contract code", "Contracts", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Address" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "type": "string",
-            "pattern": "^0x[a-f0-9]*$"
-        })),
-        ("kvnc_getStorageAt", "Get contract storage slot", "Contracts", json!({
-            "type": "array",
-            "items": [
-                { "$ref": "#/components/schemas/Address" },
-                { "$ref": "#/components/schemas/Hash" }
-            ],
-            "minItems": 2,
-            "maxItems": 2
-        }), json!({
-            "type": "string",
-            "pattern": "^0x[a-f0-9]{64}$"
-        })),
-        ("kvnc_getValidators", "Get active validators", "Staking", json!({
-            "type": "array",
-            "items": {}
-        }), json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Validator" }
-        })),
-        ("kvnc_getStake", "Get total stake for address", "Staking", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Address" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
-        ("kvnc_getRewards", "Get cumulative rewards", "Staking", json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Address" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
-        ("kvnc_getPendingTransactions", "Get pending transaction hashes", "Mempool", json!({
-            "type": "array",
-            "items": {}
-        }), json!({
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Hash" }
-        })),
-        ("kvnc_estimateFee", "Estimate fee rate", "Mempool", json!({
-            "type": "array",
-            "items": {}
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
-        ("kvnc_getLeaderSchedule", "Get upcoming leader schedule", "Consensus", json!({
-            "type": "array",
-            "items": { "type": "integer" },
-            "minItems": 0,
-            "maxItems": 1
-        }), json!({
-            "type": "array",
-            "items": {
+        (
+            "kvnc_getBlockByHash",
+            "Get block by hash",
+            "Chain",
+            json!({
+                "type": "array",
+                "items": [
+                    { "$ref": "#/components/schemas/Hash" },
+                    { "type": "boolean" }
+                ],
+                "minItems": 1,
+                "maxItems": 2
+            }),
+            json!({
                 "type": "object",
                 "properties": {
-                    "round": { "$ref": "#/components/schemas/Quantity" },
-                    "leader": { "$ref": "#/components/schemas/Address" }
+                    "block": { "$ref": "#/components/schemas/Block" },
+                    "full_transactions": { "type": "boolean" }
                 }
-            }
-        })),
-        ("kvnc_getCommittee", "Get current committee", "Consensus", json!({
-            "type": "array",
-            "items": {}
-        }), json!({
-            "type": "object",
-            "properties": {
-                "epoch": { "$ref": "#/components/schemas/Quantity" },
-                "authorities": {
-                    "type": "array",
-                    "items": { "$ref": "#/components/schemas/Validator" }
+            }),
+        ),
+        (
+            "kvnc_getBlockByNumber",
+            "Get block by height/round",
+            "Chain",
+            json!({
+                "type": "array",
+                "items": [
+                    { "$ref": "#/components/schemas/Quantity" },
+                    { "type": "boolean" }
+                ],
+                "minItems": 1,
+                "maxItems": 2
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "block": { "$ref": "#/components/schemas/Block" },
+                    "full_transactions": { "type": "boolean" }
                 }
-            }
-        })),
-        ("kvnc_blockNumber", "Get committed leader height", "Chain", json!({
-            "type": "array",
-            "items": {}
-        }), json!({
-            "$ref": "#/components/schemas/Quantity"
-        })),
+            }),
+        ),
+        (
+            "kvnc_sendRawTransaction",
+            "Submit signed transaction",
+            "Transactions",
+            json!({
+                "type": "array",
+                "items": { "type": "string", "pattern": "^0x[a-f0-9]+$" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "string",
+                "pattern": "^0x[a-f0-9]{64}$",
+                "description": "Transaction hash"
+            }),
+        ),
+        (
+            "kvnc_getTransactionReceipt",
+            "Get transaction receipt",
+            "Transactions",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Hash" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "tx_hash": { "$ref": "#/components/schemas/Hash" },
+                    "success": { "type": "boolean" },
+                    "gas_used": { "$ref": "#/components/schemas/Quantity" },
+                    "error": { "type": ["string", "null"] },
+                    "events": { "type": "array", "items": { "type": "object" } }
+                }
+            }),
+        ),
+        (
+            "kvnc_getTransactionByHash",
+            "Get transaction by hash",
+            "Transactions",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Hash" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "$ref": "#/components/schemas/Transaction"
+            }),
+        ),
+        (
+            "kvnc_getBalance",
+            "Get account balance",
+            "Accounts",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Address" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
+        (
+            "kvnc_getNonce",
+            "Get account nonce",
+            "Accounts",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Address" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
+        (
+            "kvnc_getCode",
+            "Get contract code",
+            "Contracts",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Address" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "string",
+                "pattern": "^0x[a-f0-9]*$"
+            }),
+        ),
+        (
+            "kvnc_getStorageAt",
+            "Get contract storage slot",
+            "Contracts",
+            json!({
+                "type": "array",
+                "items": [
+                    { "$ref": "#/components/schemas/Address" },
+                    { "$ref": "#/components/schemas/Hash" }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+            }),
+            json!({
+                "type": "string",
+                "pattern": "^0x[a-f0-9]{64}$"
+            }),
+        ),
+        (
+            "kvnc_getValidators",
+            "Get active validators",
+            "Staking",
+            json!({
+                "type": "array",
+                "items": {}
+            }),
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Validator" }
+            }),
+        ),
+        (
+            "kvnc_getStake",
+            "Get total stake for address",
+            "Staking",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Address" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
+        (
+            "kvnc_getRewards",
+            "Get cumulative rewards",
+            "Staking",
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Address" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
+        (
+            "kvnc_getPendingTransactions",
+            "Get pending transaction hashes",
+            "Mempool",
+            json!({
+                "type": "array",
+                "items": {}
+            }),
+            json!({
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/Hash" }
+            }),
+        ),
+        (
+            "kvnc_estimateFee",
+            "Estimate fee rate",
+            "Mempool",
+            json!({
+                "type": "array",
+                "items": {}
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
+        (
+            "kvnc_getLeaderSchedule",
+            "Get upcoming leader schedule",
+            "Consensus",
+            json!({
+                "type": "array",
+                "items": { "type": "integer" },
+                "minItems": 0,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "round": { "$ref": "#/components/schemas/Quantity" },
+                        "leader": { "$ref": "#/components/schemas/Address" }
+                    }
+                }
+            }),
+        ),
+        (
+            "kvnc_getCommittee",
+            "Get current committee",
+            "Consensus",
+            json!({
+                "type": "array",
+                "items": {}
+            }),
+            json!({
+                "type": "object",
+                "properties": {
+                    "epoch": { "$ref": "#/components/schemas/Quantity" },
+                    "authorities": {
+                        "type": "array",
+                        "items": { "$ref": "#/components/schemas/Validator" }
+                    }
+                }
+            }),
+        ),
+        (
+            "kvnc_blockNumber",
+            "Get committed leader height",
+            "Chain",
+            json!({
+                "type": "array",
+                "items": {}
+            }),
+            json!({
+                "$ref": "#/components/schemas/Quantity"
+            }),
+        ),
         // WebSocket subscription methods
-        ("kvnc_subscribe", "Subscribe to events", "PubSub", json!({
-            "type": "array",
-            "items": { "type": "string", "enum": ["newHeads", "newCommittedLeader", "pendingTransactions", "logs"] },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "type": "string",
-            "description": "Subscription ID"
-        })),
-        ("kvnc_unsubscribe", "Unsubscribe from events", "PubSub", json!({
-            "type": "array",
-            "items": { "type": "string" },
-            "minItems": 1,
-            "maxItems": 1
-        }), json!({
-            "type": "boolean"
-        })),
+        (
+            "kvnc_subscribe",
+            "Subscribe to events",
+            "PubSub",
+            json!({
+                "type": "array",
+                "items": { "type": "string", "enum": ["newHeads", "newCommittedLeader", "pendingTransactions", "logs"] },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "string",
+                "description": "Subscription ID"
+            }),
+        ),
+        (
+            "kvnc_unsubscribe",
+            "Unsubscribe from events",
+            "PubSub",
+            json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "maxItems": 1
+            }),
+            json!({
+                "type": "boolean"
+            }),
+        ),
     ];
 
     // Create method enum schema for oneOf discriminator
@@ -428,7 +569,9 @@ pub fn generate_openapi_spec() -> OpenApiSpec {
     for (method, _, _, _, result_schema) in &methods {
         let result_schema_name = format!("{}Result", method.replace("kvnc_", "").replace(".", ""));
         // Add result schema to components
-        spec.components.schemas.insert(result_schema_name.clone(), result_schema.clone());
+        spec.components
+            .schemas
+            .insert(result_schema_name.clone(), result_schema.clone());
         response_variants.push(json!({
             "type": "object",
             "required": ["jsonrpc", "result", "id"],
@@ -524,8 +667,17 @@ mod tests {
         let spec = generate_openapi_spec();
         let json = serde_json::to_string_pretty(&spec).unwrap();
         // The method name appears in the request body schema as a const value
-        assert!(json.contains("\"kvnc_getBlockByHash\""), "Missing kvnc_getBlockByHash");
-        assert!(json.contains("\"kvnc_sendRawTransaction\""), "Missing kvnc_sendRawTransaction");
-        assert!(json.contains("\"kvnc_subscribe\""), "Missing kvnc_subscribe");
+        assert!(
+            json.contains("\"kvnc_getBlockByHash\""),
+            "Missing kvnc_getBlockByHash"
+        );
+        assert!(
+            json.contains("\"kvnc_sendRawTransaction\""),
+            "Missing kvnc_sendRawTransaction"
+        );
+        assert!(
+            json.contains("\"kvnc_subscribe\""),
+            "Missing kvnc_subscribe"
+        );
     }
 }
