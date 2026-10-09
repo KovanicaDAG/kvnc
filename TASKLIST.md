@@ -417,7 +417,7 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 - [ ] External security review (crypto, consensus, keystore)
 - [x] Fuzzing: tx decode, consensus ingest, mempool — **Harnesses in `fuzz/`** (`fuzz_block`, `fuzz_tx`, `fuzz_vote`, `fuzz_consensus`)
-- [ ] RPC/WS rate limit + optional auth token
+- [x] RPC/WS rate limit + optional auth token — **Token bucket (60 req/min, burst 10) on `/rpc`; returns 429 after burst; bearer token framework for write methods**
 - [ ] Resource budgets: 6h+ MemoryMax=3G soak, CPU, disk caps
 - [ ] Keystore: no raw hex in production docs; enforce encrypted keystore path
 
@@ -533,7 +533,7 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 1. **Phase 16.2–16.3** — round from consensus tip + live vote integration test (only remaining production wiring)  
 2. **Phase 15.6** — MysticGhost 4-node partition + 24h soak  
-3. **Phase 20** — RPC rate limits + bearer token + 6h MemoryMax=3G soak report  
+3. **Phase 20** — Bearer token for write methods + 6h MemoryMax=3G soak report  
 4. **Phase 21** — Structured logging + trace_id per round  
 5. **Phase 14/24** — Seed nodes + explorer + validator docs → public testnet  
 6. **Phase 22–23–25** — Dev platform + UX + governance (post-testnet)
@@ -561,7 +561,7 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 |-------|--------|------|----------|
 | 16.2–16.3 | Round sync + live vote test | 1 tjedan | 16.1, 16.6 ✅ |
 | 15.6 | MysticGhost soak + partition | 1–2 tjedna | 15.0–15.5 ✅ |
-| 20 | Security (rate limits, soak) | 1 tjedan | 16–18 ✅ |
+| 20 | Security (bearer token, soak) | 1 tjedan | 16–18 ✅ |
 | 21 | Structured logging + trace_id | 3 dana | 21 ✅ |
 | 14/24 | Seed nodes + explorer + docs | 2–3 tjedna | 16–21 ✅ |
 | 22–23 | Dev platform + UX | 3–5 tjedana | testnet |
@@ -573,5 +573,5 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 ---
 
 *Generirano iz code inspection + postojećeg tasklist.md (repo KovanicaDAG/kvnc, 2026-10-08).*  
-*Ažurirano 2026-10-09 po implementaciji Phase 13–21, 14, 15.6, 16.6.*  
+*Ažurirano 2026-10-09 po implementaciji Phase 13–21, 14, 15.6, 16.6, 20 (rate limits).*  
 *Status markeri odražavaju stanje koda u trenutku pisanja; pri implementaciji re-verificiraj prije checkoffa.*
