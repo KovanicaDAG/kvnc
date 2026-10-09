@@ -17,11 +17,15 @@ use std::num::NonZeroU32;
 use tokio::sync::RwLock as TokioRwLock;
 
 /// Rate limiter configuration
+///
+/// A `requests_per_minute` of `0` disables rate limiting entirely (every
+/// request is admitted); this is the documented `KVNC_RPC_RATE_LIMIT_PER_MIN=0`
+/// escape hatch for tests and trusted local tooling.
 #[derive(Clone, Debug)]
 pub struct RateLimitConfig {
-    /// Requests per minute per IP
+    /// Requests per minute per IP. `0` disables rate limiting.
     pub requests_per_minute: u32,
-    /// Burst allowance
+    /// Burst allowance (token-bucket capacity)
     pub burst: u32,
 }
 
@@ -31,6 +35,31 @@ impl Default for RateLimitConfig {
             requests_per_minute: 60, // 1 req/sec
             burst: 10,
         }
+    }
+}
+
+impl RateLimitConfig {
+    /// Build a config from a requests-per-minute figure, deriving the burst.
+    ///
+    /// Burst rule: `burst = max(1, requests_per_minute / 6)`, preserving the
+    /// historical default (`60` rpm -> `10` burst). `requests_per_minute == 0`
+    /// disables rate limiting (burst is irrelevant and set to `0`).
+    pub fn from_requests_per_minute(requests_per_minute: u32) -> Self {
+        if requests_per_minute == 0 {
+            return Self {
+                requests_per_minute: 0,
+                burst: 0,
+            };
+        }
+        Self {
+            requests_per_minute,
+            burst: (requests_per_minute / 6).max(1),
+        }
+    }
+
+    /// Whether rate limiting is disabled (`requests_per_minute == 0`).
+    pub fn is_disabled(&self) -> bool {
+        self.requests_per_minute == 0
     }
 }
 
@@ -107,6 +136,11 @@ impl RateLimiterState {
 
     /// Check if request is allowed, returns (allowed, retry_after_secs)
     pub fn check_limit(&self, addr: SocketAddr) -> (bool, Option<u64>) {
+        // A configured rate of 0 disables rate limiting (admit everything).
+        if self.config.is_disabled() {
+            return (true, None);
+        }
+
         let mut limiters = self.limiters.write();
 
         // Cleanup old entries periodically
@@ -120,7 +154,7 @@ impl RateLimiterState {
 
         let refill_rate = self.config.requests_per_minute as f64 / 60.0;
         let limiter = limiters.entry(addr).or_insert_with(|| IpRateLimiter {
-            bucket: TokenBucket::new(self.config.burst, self.config.requests_per_minute as f64 / 60.0),
+            bucket: TokenBucket::new(self.config.burst, refill_rate),
             last_seen: Instant::now(),
         });
 

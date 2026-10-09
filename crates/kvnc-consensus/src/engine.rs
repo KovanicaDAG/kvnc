@@ -208,10 +208,6 @@ where
     mempool: Option<Arc<Mempool>>,
     /// Timeout deadline for the current leader slot (round, instant).
     leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
-    /// Last round where this engine proposed a leader block.
-    last_proposed_round: RwLock<Round>,
-    /// Timeout factor (rounds) after which a missing leader is skipped.
-    timeout_factor: u64,
 }
 
 impl<D, B> ConsensusEngine<D, B>
@@ -273,8 +269,6 @@ where
             commit_trigger_lock: Mutex::new(()),
             mempool,
             leader_deadline: RwLock::new(None),
-            last_proposed_round: RwLock::new(0),
-            timeout_factor: 3,
         }
     }
 
@@ -317,20 +311,6 @@ where
         let mut round_interval = interval(Duration::from_millis(self.config.round_duration_ms));
 
         while *self.running.read() {
-            // Timeout check via timeout_factor: when current_round advances past
-            // last_proposed_round + timeout_factor, emit Skip for missing leader.
-            {
-                let current = *self.current_round.read();
-                let last_prop = *self.last_proposed_round.read();
-                if current > last_prop + self.timeout_factor {
-                    let target = last_prop + self.timeout_factor;
-                    if let Some(leader_author) = self.scheduled_leader_for_round(target) {
-                        self.committer.register_skip(target, leader_author);
-                    }
-                    *self.last_proposed_round.write() = current;
-                }
-            }
-
             // Timeout check: skip leader if no block after leader_timeout_ms
             {
                 let deadline_opt = *self.leader_deadline.read();
@@ -463,8 +443,7 @@ where
                 };
                 self.committer.update_leader(leader_info);
 
-                // Mark as proposed and record last proposed round for timeout
-                *self.last_proposed_round.write() = round;
+                // Mark as proposed for this round.
                 self.state.write().proposed = true;
 
                 info!(

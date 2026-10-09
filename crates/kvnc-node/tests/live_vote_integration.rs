@@ -4,8 +4,6 @@
 //! has them connect via P2P, and verifies the full consensus pipeline:
 //! block proposal → vote → commit → execution.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -18,7 +16,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::info;
 
 use kvnc_crypto::{generate_keypair, sign as crypto_sign};
 use kvnc_types::{
@@ -31,10 +29,10 @@ use kvnc_staking::{MIN_VALIDATOR_STAKE, ONE_KVNC};
 /// Test configuration
 const ROUND_DURATION_MS: u64 = 1000;
 const TIMEOUT_SECS: u64 = 30;
-const NODE1_RPC: u16 = 8545;
-const NODE2_RPC: u16 = 8546;
-const NODE1_P2P: u16 = 9000;
-const NODE2_P2P: u16 = 9001;
+const NODE1_RPC: u16 = 19545;
+const NODE2_RPC: u16 = 19546;
+const NODE1_P2P: u16 = 19000;
+const NODE2_P2P: u16 = 19001;
 
 /// Node process handle with cleanup
 struct NodeProcess {
@@ -55,7 +53,7 @@ impl NodeProcess {
         p2p_port: u16,
         bootnodes: Vec<String>,
         validator_key: Option<SigningKey>,
-        treasury_address: Address,
+        _treasury_address: Address,
     ) -> Result<Self> {
         // Generate or use provided validator key
         let (signing_key, public_key) = match validator_key {

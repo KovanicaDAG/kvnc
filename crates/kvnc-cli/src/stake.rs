@@ -1,46 +1,39 @@
-//! Phase 8.2 CLI — delegation commands (stake / unstake / delegate / claim-rewards).
+//! Phase 8.2 CLI — delegation commands (delegate / claim-rewards).
 //! Deterministic output; no HashMap ordering; tokenomics untouched.
 //!
-//! NOTE: the node-side staking RPC methods (`kvnc_stake`, `kvnc_unstake`,
-//! `kvnc_delegate`, `kvnc_claimRewards`) are not implemented yet, so these
-//! commands report `not_implemented` instead of silently faking success.
+//! `stake` / `unstake` are implemented in `main.rs` as signed native
+//! transactions (`TransactionKind::Stake` / `TransactionKind::Unstake`) that go
+//! out over the ordinary `kvnc_sendRawTransaction` path — no staking-specific
+//! node RPC is introduced and private key material never leaves the machine.
+//!
+//! `delegate` / `claim-rewards` have no matching `TransactionKind` variant yet,
+//! so they report a clear "not yet supported" message instead of fabricating
+//! success or inventing a node-side RPC method.
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::node::not_implemented;
+use crate::output::print_json;
 use crate::rpc::RpcClient;
 
-/// `kvnc stake --amount <atoms>` — node-side `kvnc_stake` RPC not implemented yet.
-pub async fn stake_skeleton(
-    _client: &RpcClient,
-    amount: u64,
-    validator: Option<&str>,
-    json_output: bool,
-) -> Result<()> {
-    not_implemented(
-        "stake",
-        "kvnc_stake",
-        json!({ "amount": amount, "validator": validator }),
-        json_output,
-    )
+/// Emit a clear unsupported-operation result for commands that cannot be
+/// expressed as an existing [`kvnc_types::transaction::TransactionKind`].
+fn unsupported(operation: &str, params: Value, json_output: bool) -> Result<()> {
+    if json_output {
+        return print_json(&json!({
+            "status": "not_supported",
+            "operation": operation,
+            "reason": "not yet supported — requires a new TransactionKind variant and a node-side handler; no RPC exists for this",
+            "params": params,
+        }));
+    }
+
+    println!("`{operation}` is not yet supported.");
+    println!("      Requires a new TransactionKind variant and a node-side handler.");
+    println!("      Params: {params}");
+    Ok(())
 }
 
-/// `kvnc unstake --amount <atoms>` — node-side `kvnc_unstake` RPC not implemented yet.
-pub async fn unstake_skeleton(
-    _client: &RpcClient,
-    amount: u64,
-    validator: Option<&str>,
-    json_output: bool,
-) -> Result<()> {
-    not_implemented(
-        "unstake",
-        "kvnc_unstake",
-        json!({ "amount": amount, "validator": validator }),
-        json_output,
-    )
-}
-
-/// `kvnc delegate --validator <hex> --amount <atoms>` — `kvnc_delegate` RPC not implemented yet.
+/// `kvnc delegate --validator <hex> --amount <atoms>` — no matching transaction kind.
 pub async fn delegate_skeleton(
     _client: &RpcClient,
     validator: &str,
@@ -48,23 +41,21 @@ pub async fn delegate_skeleton(
     _extra: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    not_implemented(
+    unsupported(
         "delegate",
-        "kvnc_delegate",
         json!({ "validator": validator, "amount": amount }),
         json_output,
     )
 }
 
-/// `kvnc claim-rewards` — node-side `kvnc_claimRewards` RPC not implemented yet.
+/// `kvnc claim-rewards` — no matching transaction kind.
 pub async fn claim_rewards_skeleton(
     _client: &RpcClient,
     validator: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    not_implemented(
+    unsupported(
         "claim-rewards",
-        "kvnc_claimRewards",
         json!({ "validator": validator }),
         json_output,
     )

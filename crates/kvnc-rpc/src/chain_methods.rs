@@ -577,6 +577,7 @@ pub async fn handle_get_committee(_params: Value, state: RpcState) -> Result<Val
 mod tests {
     use super::*;
     use kvnc_consensus::{AuthorityInfo, CommitteeInfo};
+    use kvnc_dag::DagStore;
     use kvnc_mempool::{Mempool, MempoolConfig};
     use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
     use kvnc_storage::Storage;
@@ -597,12 +598,17 @@ mod tests {
             network_address: "127.0.0.1:9000".to_string(),
         };
         RpcState {
+            consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
             mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
             committee: CommitteeInfo::try_new(0, vec![authority]).expect("test committee is valid"),
             peer_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             events: crate::EventBus::new(),
+            rate_limiter: Arc::new(crate::RateLimiterState::new(
+                crate::RateLimitConfig::default(),
+            )),
+            auth_config: Arc::new(crate::AuthConfig::default()),
         }
     }
 

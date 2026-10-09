@@ -64,6 +64,17 @@ docker compose up --build
 
 <!-- TODO: verify the exact binary name and CLI flags -->
 
+### Configuration
+
+Any `config.toml` value can be overridden with a `KVNC_*` environment variable
+(see `config.example.toml` for the full mapping), including:
+
+| Env var | Meaning | Default |
+| --- | --- | --- |
+| `KVNC_RPC_RATE_LIMIT_PER_MIN` | JSON-RPC requests per minute per client IP (`0` disables rate limiting) | `60` |
+
+Burst capacity is derived from the configured rate as `max(1, rate / 6)`.
+
 ## Tokenomics
 
 | Parameter | Value |

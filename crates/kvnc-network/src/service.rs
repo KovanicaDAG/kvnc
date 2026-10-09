@@ -253,7 +253,12 @@ impl NetworkService {
     ///
     /// The loop only returns on an unrecoverable (storage) error; transport and
     /// dial failures are logged and tolerated.
-    pub async fn start(&mut self) -> Result<(), NetworkError> {
+    ///
+    /// Takes `&self`: the swarm and all bookkeeping use interior mutability, so
+    /// the listen/dial preamble is executed exactly once per call. Callers must
+    /// run this loop in its own task, not inside a `select!` that can cancel it
+    /// and re-enter the preamble (which leaks listeners/file descriptors).
+    pub async fn start(&self) -> Result<(), NetworkError> {
         for addr in &self.config.listen_addrs {
             match self.swarm().listen_on(addr.clone()) {
                 Ok(_) => info!(%addr, "listening"),

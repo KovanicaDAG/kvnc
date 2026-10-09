@@ -174,16 +174,17 @@ impl BlockManager {
         Ok(signed_block)
     }
 
-    /// Select valid parent blocks from the previous round.
+    /// Select valid parent blocks from the most recent populated earlier round.
     /// Filters by: author in committee, stake > 0, valid signature (already validated on ingress).
-    /// Returns up to committee_size parents (or MAX_TXS_PER_BLOCK as fallback).
+    /// Returns up to committee_size parents (or a small default as fallback).
+    ///
+    /// Walks backwards from `round - 1` to `round - MAX_PARENT_ROUND_GAP` and
+    /// uses the first round that actually contains blocks, so a gap in the DAG
+    /// (a round with no committee-backed blocks) cannot orphan a block.
     fn select_parents(&self, round: Round) -> Result<Vec<BlockReference>, BlockManagerError> {
         if round == 0 {
             return Ok(Vec::new());
         }
-
-        let prev_round = round - 1;
-        let blocks = self.dag_store.get_blocks_by_round(prev_round)?;
 
         let authority_keys = self.authority_keys.read();
         let authority_stakes = self.authority_stakes.read();
@@ -195,6 +196,22 @@ impl BlockManager {
             // Fallback: use a small number to avoid excessive parent sets
             3usize
         };
+
+        // Find the most recent populated round within the allowed gap.
+        let min_round = round.saturating_sub(kvnc_types::MAX_PARENT_ROUND_GAP);
+        let mut blocks = Vec::new();
+        let mut probe = round - 1;
+        loop {
+            let candidate = self.dag_store.get_blocks_by_round(probe)?;
+            if !candidate.is_empty() {
+                blocks = candidate;
+                break;
+            }
+            if probe <= min_round {
+                break;
+            }
+            probe -= 1;
+        }
 
         // Filter blocks: author must be in committee with stake > 0
         let parents: Vec<BlockReference> = blocks
@@ -377,15 +394,43 @@ impl BlockManager {
         Ok(())
     }
 
-    /// Check that each referenced parent exists and its round and author match
-    /// the reference, and that the edge advances exactly one round.
+    /// Check that each referenced parent exists, its round and author match
+    /// the reference, that the parent strictly precedes the block, that the
+    /// gap is within `MAX_PARENT_ROUND_GAP`, and that the parent count does not
+    /// exceed the committee size (minimum 3).
     fn validate_parent_references(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
+        // Parent-count ceiling: committee size, but never below the wave width.
+        let committee_size = {
+            let stakes = self.authority_stakes.read();
+            let keys = self.authority_keys.read();
+            if !stakes.is_empty() {
+                stakes.len()
+            } else {
+                keys.len()
+            }
+        };
+        let max_parents = committee_size.max(kvnc_types::WAVE_LENGTH as usize);
+        if block.parents.len() > max_parents {
+            return Err(BlockManagerError::ParentValidation(format!(
+                "too many parents: {} (max {})",
+                block.parents.len(),
+                max_parents
+            )));
+        }
+
         for parent_ref in &block.parents {
-            if parent_ref.round.checked_add(1) != Some(block.round) {
+            if parent_ref.round >= block.round {
                 return Err(BlockManagerError::ParentValidation(format!(
-                    "Parent round {} is not previous round {}",
+                    "Parent round {} is not before block round {}",
+                    parent_ref.round, block.round
+                )));
+            }
+            if block.round - parent_ref.round > kvnc_types::MAX_PARENT_ROUND_GAP {
+                return Err(BlockManagerError::ParentValidation(format!(
+                    "Parent round {} is too far behind block round {} (max gap {})",
                     parent_ref.round,
-                    block.round.saturating_sub(1)
+                    block.round,
+                    kvnc_types::MAX_PARENT_ROUND_GAP
                 )));
             }
 
@@ -902,5 +947,144 @@ mod tests {
         let block = manager.propose_block(1).expect("propose with fed tx");
         assert_eq!(block.transactions.len(), 1);
         assert_eq!(block.transactions[0].hash, tx_hash);
+    }
+
+    fn make_block(
+        author: AuthorityIndex,
+        round: Round,
+        parents: Vec<BlockReference>,
+        tag: &str,
+    ) -> StatementBlock {
+        StatementBlock {
+            author,
+            round,
+            parents,
+            transactions: Vec::new(),
+            statements: tag.as_bytes().to_vec(),
+            signature: Signature([0; 64]),
+            digest: Hash::new(format!("kvnc-block-manager-test/{tag}").as_bytes()),
+            merkle_root: Default::default(),
+        }
+    }
+
+    // #3: parent selection walks over empty rounds instead of stopping at the
+    // immediately preceding (possibly empty) round.
+    #[test]
+    fn select_parents_skips_empty_rounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (_key, public_key) = crypto::generate_keypair();
+        manager.set_authority_keys(HashMap::from([(0, public_key)]));
+        manager.set_authority_stakes(HashMap::from([(0, 100)]));
+
+        // Only round 5 is populated; rounds 6 and 7 are empty.
+        let round5 = make_block(0, 5, vec![], "round-5");
+        store.put_block(&round5).unwrap();
+
+        let parents = manager.select_parents(8).unwrap();
+        assert_eq!(parents.len(), 1, "walk skips empty rounds 7 and 6");
+        assert_eq!(parents[0].round, 5);
+        assert_eq!(parents[0].digest, round5.digest);
+    }
+
+    // #3: a block exactly `MAX_PARENT_ROUND_GAP` behind is reachable; anything
+    // further is outside the window and yields no parents.
+    #[test]
+    fn select_parents_respects_gap_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (_key, public_key) = crypto::generate_keypair();
+        manager.set_authority_keys(HashMap::from([(0, public_key)]));
+        manager.set_authority_stakes(HashMap::from([(0, 100)]));
+
+        let genesis = make_block(0, 0, vec![], "genesis");
+        store.put_block(&genesis).unwrap();
+
+        // Gap == MAX_PARENT_ROUND_GAP: round 0 is still inside the window.
+        let at_limit = manager
+            .select_parents(kvnc_types::MAX_PARENT_ROUND_GAP)
+            .unwrap();
+        assert_eq!(at_limit.len(), 1);
+        assert_eq!(at_limit[0].digest, genesis.digest);
+
+        // Gap > MAX_PARENT_ROUND_GAP: round 0 is unreachable.
+        let beyond = manager
+            .select_parents(kvnc_types::MAX_PARENT_ROUND_GAP + 2)
+            .unwrap();
+        assert!(
+            beyond.is_empty(),
+            "no parent within the MAX_PARENT_ROUND_GAP window"
+        );
+    }
+
+    // #3: `validate_parent_references` enforces the gap, ordering and count
+    // bounds.
+    #[test]
+    fn validate_parent_references_enforces_gap_round_and_count_bounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+
+        let genesis = make_block(0, 0, vec![], "genesis");
+        store.put_block(&genesis).unwrap();
+        let genesis_ref = BlockReference {
+            author: genesis.author,
+            round: genesis.round,
+            digest: genesis.digest,
+        };
+
+        // Gap exactly at the limit is accepted.
+        let at_limit = make_block(
+            0,
+            kvnc_types::MAX_PARENT_ROUND_GAP,
+            vec![genesis_ref],
+            "at-limit",
+        );
+        manager
+            .validate_parent_references(&at_limit)
+            .expect("gap == MAX_PARENT_ROUND_GAP must be accepted");
+
+        // Gap beyond the limit is rejected.
+        let beyond = make_block(
+            0,
+            kvnc_types::MAX_PARENT_ROUND_GAP + 1,
+            vec![genesis_ref],
+            "beyond-limit",
+        );
+        assert!(
+            manager.validate_parent_references(&beyond).is_err(),
+            "gap > MAX_PARENT_ROUND_GAP must be rejected"
+        );
+
+        // A parent that is not strictly behind the block is rejected.
+        let same_round_parent = BlockReference {
+            author: 0,
+            round: 5,
+            digest: Hash::new(b"kvnc-block-manager-test/same-round"),
+        };
+        let same_round = make_block(0, 5, vec![same_round_parent], "same-round");
+        assert!(
+            manager.validate_parent_references(&same_round).is_err(),
+            "parent round >= block round must be rejected"
+        );
+
+        // More parents than the committee/wave ceiling (3) is rejected.
+        let too_many_parents: Vec<BlockReference> = (0..4)
+            .map(|i| BlockReference {
+                author: 0,
+                round: 0,
+                digest: Hash::new(format!("kvnc-block-manager-test/many-{i}").as_bytes()),
+            })
+            .collect();
+        let too_many = make_block(0, 10, too_many_parents, "too-many");
+        assert!(
+            manager.validate_parent_references(&too_many).is_err(),
+            "more than max_parents parents must be rejected"
+        );
     }
 }

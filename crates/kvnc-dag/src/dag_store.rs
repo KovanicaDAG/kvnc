@@ -51,10 +51,29 @@ impl DagStore {
         })
     }
 
+    /// Wrap an existing shared [`Storage`] handle.
+    ///
+    /// All stores (block, state, consensus) already share a single redb
+    /// database, so a caller that already holds an `Arc<Storage>` can build a
+    /// `DagStore` over it without reopening the database (handy for tests and
+    /// for exposing the DAG view alongside the state view).
+    pub fn from_storage(storage: Arc<Storage>) -> Self {
+        Self { storage }
+    }
+
     /// Get a block by hash.
+    ///
+    /// A missing block is reported as [`DagStoreError::NotFound`] (rather than
+    /// the wrapped `ConsensusStoreError::NotFound`) so that every caller which
+    /// tolerates a pruned/absent block can match on the same variant — the
+    /// in-memory DAG implementations used in tests behave the same way.
     pub fn get_block(&self, hash: &Hash) -> Result<StatementBlock, DagStoreError> {
         let txn = self.storage.begin_read()?;
-        Ok(self.storage.consensus().get_dag_block(&txn, hash)?)
+        match self.storage.consensus().get_dag_block(&txn, hash) {
+            Ok(block) => Ok(block),
+            Err(ConsensusStoreError::NotFound(msg)) => Err(DagStoreError::NotFound(msg)),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get multiple blocks by their hashes.
@@ -77,9 +96,17 @@ impl DagStore {
     }
 
     /// Get parent hashes for a block.
+    ///
+    /// A missing parent list is reported as [`DagStoreError::NotFound`] for the
+    /// same reason as [`Self::get_block`]: the M2 backstop treats a deleted
+    /// block's parent edge as a leaf rather than a hard error.
     pub fn get_parents(&self, hash: &Hash) -> Result<Vec<Hash>, DagStoreError> {
         let txn = self.storage.begin_read()?;
-        Ok(self.storage.consensus().get_parents(&txn, hash)?)
+        match self.storage.consensus().get_parents(&txn, hash) {
+            Ok(parents) => Ok(parents),
+            Err(ConsensusStoreError::NotFound(msg)) => Err(DagStoreError::NotFound(msg)),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get child hashes for a block.
@@ -159,12 +186,25 @@ impl DagStore {
             }
             visited.insert(current);
 
-            let parents = self.get_parents(&current)?;
+            // A parent list may be missing if the block was deleted during
+            // pruning; treat it as a leaf rather than failing the whole walk.
+            let parents = match self.get_parents(&current) {
+                Ok(parents) => parents,
+                Err(DagStoreError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             for parent in parents {
                 if parent.0 == current.0 {
                     continue;
                 }
-                let block = self.get_block(&parent)?;
+                // A surviving child may still reference a parent that was
+                // pruned away; skip that dangling edge instead of aborting the
+                // traversal (M2 backstop).
+                let block = match self.get_block(&parent) {
+                    Ok(block) => block,
+                    Err(DagStoreError::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
                 if block.round >= min_round {
                     ancestors.push(parent);
                     queue.push_back(parent);
@@ -267,8 +307,6 @@ impl DagStore {
         blue_hashes: &[Hash],
         committed_wave: u64,
     ) -> Result<u64, DagStoreError> {
-        use std::collections::HashSet;
-
         let txn = self.storage.begin_write()?;
 
         // Convert blue_hashes to a HashSet for O(1) lookup
@@ -278,6 +316,34 @@ impl DagStore {
         let wave_length = kvnc_types::WAVE_LENGTH;
         let wave_start = committed_wave * wave_length;
         let wave_end = wave_start + wave_length - 1;
+
+        // Blocks that must never be pruned even if not present in the blue set:
+        // the last committed leader (`last_committed` must always resolve) and
+        // every decided leader in this wave.
+        //
+        // The consensus helpers take a `&ReadTransaction` and redb's
+        // `WriteTransaction` does not deref-coerce to it, so read the tables
+        // directly from this transaction (same schema, same encoding).
+        let mut protected: HashSet<Hash> = HashSet::new();
+        let last_committed = {
+            let last_table = txn.open_table(tables::LAST_COMMITED)?;
+            let last = last_table.get("last")?.map(|v| Hash(v.value()));
+            last
+        };
+        if let Some(h) = last_committed {
+            protected.insert(h);
+        }
+        let decided_table = txn.open_table(tables::DECIDED_ROUNDS)?;
+        for round in wave_start..=wave_end {
+            let hashes: Vec<[u8; 32]> = decided_table
+                .get(round)?
+                .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            for h in hashes {
+                protected.insert(Hash(h));
+            }
+        }
+        drop(decided_table);
 
         // Collect all blocks in the committed wave
         let round_table = txn.open_table(tables::DAG_BY_ROUND)?;
@@ -301,9 +367,13 @@ impl DagStore {
             }
         }
 
-        // Delete non-blue blocks and their links
+        // Delete non-blue blocks and their links, never touching blue blocks or
+        // protected leaders (last committed / decided leaders in this wave).
         let mut pruned = 0;
         for block_hash in blocks_to_prune {
+            if blue_set.contains(&block_hash) || protected.contains(&block_hash) {
+                continue;
+            }
             self.delete_block_internal(&txn, &block_hash)?;
             pruned += 1;
         }
@@ -362,6 +432,20 @@ impl DagStore {
     ) -> Result<(), DagStoreError> {
         let key = hash_to_bytes(block_hash);
 
+        // Read the block's (round, author) before removing it so the round and
+        // author indices can be cleaned up as well.
+        let round_author: Option<(Round, AuthorityIndex)> = {
+            let table = txn.open_table(tables::DAG_BLOCKS)?;
+            let result = match table.get(key)? {
+                Some(value) => {
+                    let block = StatementBlock::from_bytes(&value.value())?;
+                    Some((block.round, block.author))
+                }
+                None => None,
+            };
+            result
+        };
+
         // Remove from dag_blocks
         {
             let mut table = txn.open_table(tables::DAG_BLOCKS)?;
@@ -398,13 +482,72 @@ impl DagStore {
             }
         }
 
+        // Capture this block's children before its child link is removed so
+        // each surviving child can drop the now-deleted block from its parent
+        // list. Without this, a surviving child keeps a reference to a missing
+        // parent and `get_ancestors`/`mergeset` fail with NotFound one wave
+        // later.
+        let children: Vec<[u8; 32]> = {
+            let table = txn.open_table(tables::DAG_CHILDREN)?;
+            let value = table.get(key)?;
+            value
+                .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default()
+        };
+
         // Remove from dag_children
         {
             let mut table = txn.open_table(tables::DAG_CHILDREN)?;
             table.remove(key)?;
         }
 
-        // Remove from dag_by_round (handled by the caller's round range scan)
+        // Drop this block from each surviving child's parent list.
+        for child_hash in children {
+            let mut table = txn.open_table(tables::DAG_PARENTS)?;
+            let existing: Vec<[u8; 32]> = table
+                .get(child_hash)?
+                .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            let filtered: Vec<[u8; 32]> = existing.into_iter().filter(|h| *h != key).collect();
+            if filtered.is_empty() {
+                table.remove(child_hash)?;
+            } else {
+                table.insert(child_hash, filtered.to_bytes()?)?;
+            }
+        }
+
+        // Remove from the round and author indices so a deleted block cannot
+        // linger as a dangling index entry.
+        if let Some((round, author)) = round_author {
+            {
+                let mut table = txn.open_table(tables::DAG_BY_ROUND)?;
+                let existing: Vec<[u8; 32]> = table
+                    .get((round, author))?
+                    .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                    .unwrap_or_default();
+                let filtered: Vec<[u8; 32]> =
+                    existing.into_iter().filter(|h| *h != key).collect();
+                if filtered.is_empty() {
+                    table.remove((round, author))?;
+                } else {
+                    table.insert((round, author), filtered.to_bytes()?)?;
+                }
+            }
+            {
+                let mut table = txn.open_table(tables::DAG_BY_AUTHOR)?;
+                let existing: Vec<[u8; 32]> = table
+                    .get((author, round))?
+                    .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                    .unwrap_or_default();
+                let filtered: Vec<[u8; 32]> =
+                    existing.into_iter().filter(|h| *h != key).collect();
+                if filtered.is_empty() {
+                    table.remove((author, round))?;
+                } else {
+                    table.insert((author, round), filtered.to_bytes()?)?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -424,10 +567,13 @@ impl DagStore {
         // Get the last committed leader's round to know where to stop.
         // If there's no committed leader yet, we don't stop at any round.
         let committed_leader_round = match self.get_last_committed()? {
-            Some(last_committed_hash) => {
-                let block = self.get_block(&last_committed_hash)?;
-                Some(block.round)
-            }
+            Some(last_committed_hash) => match self.get_block(&last_committed_hash) {
+                Ok(block) => Some(block.round),
+                // Tolerate a pruned last-committed block: fall back to "no stop
+                // round" rather than failing the whole mergeset walk.
+                Err(DagStoreError::NotFound(_)) => None,
+                Err(e) => return Err(e),
+            },
             None => None, // No committed leaders yet - don't stop
         };
 
@@ -435,7 +581,13 @@ impl DagStore {
         visited.insert(*leader);
 
         while let Some(current) = queue.pop_front() {
-            let block = self.get_block(&current)?;
+            // A pruned block can still be referenced by a surviving child's
+            // parent list; skip the dangling edge instead of failing (M2).
+            let block = match self.get_block(&current) {
+                Ok(block) => block,
+                Err(DagStoreError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
 
             // If there's a committed leader and this block's round is <= committed_leader_round,
             // it's already in a previous sub-DAG. Don't include it and don't traverse further.
@@ -450,7 +602,12 @@ impl DagStore {
             result.push(current);
 
             // Traverse parents
-            for parent in self.get_parents(&current)? {
+            let parents = match self.get_parents(&current) {
+                Ok(parents) => parents,
+                Err(DagStoreError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            for parent in parents {
                 if visited.insert(parent) {
                     queue.push_back(parent);
                 }
@@ -458,5 +615,164 @@ impl DagStore {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvnc_types::crypto::Signature;
+
+    fn make_block(
+        author: AuthorityIndex,
+        round: Round,
+        parents: Vec<BlockReference>,
+        tag: &str,
+    ) -> StatementBlock {
+        StatementBlock {
+            author,
+            round,
+            parents,
+            transactions: Vec::new(),
+            statements: tag.as_bytes().to_vec(),
+            signature: Signature([0u8; 64]),
+            digest: Hash::new(format!("kvnc-dag-store-test/{tag}").as_bytes()),
+            merkle_root: Hash::zero(),
+        }
+    }
+
+    fn block_ref(block: &StatementBlock) -> BlockReference {
+        BlockReference {
+            author: block.author,
+            round: block.round,
+            digest: block.digest,
+        }
+    }
+
+    /// A real on-disk store backed by `kvnc-storage`. The returned `TempDir`
+    /// must be kept alive for the store to remain usable.
+    fn store() -> (tempfile::TempDir, DagStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("dag.redb")).expect("storage");
+        let store = DagStore::new(storage).expect("dag store");
+        (dir, store)
+    }
+
+    // #2: prune_non_blue keeps protected leaders (decided + last committed)
+    // and deletes red blocks in the committed wave.
+    #[test]
+    fn prune_non_blue_keeps_decided_and_last_committed_and_removes_red() {
+        let (_dir, store) = store();
+
+        let leader = make_block(0, 3, vec![], "leader-3");
+        let red = make_block(1, 4, vec![], "red-4");
+        store.put_block(&leader).unwrap();
+        store.put_block(&red).unwrap();
+
+        store.mark_round_decided(3, &leader.digest).unwrap();
+        store.commit_leader(&leader.digest).unwrap();
+
+        // Wave 1 covers rounds 3..=5. The red block is deleted; the decided /
+        // last-committed leader is protected even though it is not blue.
+        let pruned = store.prune_non_blue(&[], 1).unwrap();
+        assert_eq!(pruned, 1, "only the red block is pruned");
+        assert!(store.get_block(&leader.digest).is_ok(), "leader survives");
+        assert!(
+            matches!(
+                store.get_block(&red.digest),
+                Err(DagStoreError::NotFound(_))
+            ),
+            "red block is gone"
+        );
+
+        // Empty waves delete nothing.
+        assert_eq!(store.prune_non_blue(&[], 2).unwrap(), 0);
+        assert_eq!(store.prune_non_blue(&[], 3).unwrap(), 0);
+    }
+
+    // #5a: a pruned sibling must be dropped from the (round, author) index, and
+    // a stale index entry must not resurrect a missing block.
+    #[test]
+    fn prune_non_blue_removes_pruned_sibling_from_round_index() {
+        let (_dir, store) = store();
+
+        let sibling_a = make_block(0, 3, vec![], "sibling-a");
+        let sibling_b = make_block(0, 3, vec![], "sibling-b");
+        store.put_block(&sibling_a).unwrap();
+        store.put_block(&sibling_b).unwrap();
+
+        // Keep B (blue), delete A.
+        let pruned = store.prune_non_blue(&[sibling_b.digest], 1).unwrap();
+        assert_eq!(pruned, 1, "sibling A pruned");
+        assert!(matches!(
+            store.get_block(&sibling_a.digest),
+            Err(DagStoreError::NotFound(_))
+        ));
+        assert_eq!(
+            store
+                .get_block_by_author_round(0, 3)
+                .unwrap()
+                .map(|block| block.digest),
+            Some(sibling_b.digest),
+            "round/author index resolves the surviving sibling"
+        );
+
+        // Inject a stale A-hash into the (round=3, author=0) index entry and
+        // confirm the reader skips it instead of failing.
+        {
+            let txn = store.storage.begin_write().unwrap();
+            let mut table = txn.open_table(tables::DAG_BY_ROUND).unwrap();
+            let mut existing: Vec<[u8; 32]> = table
+                .get((3u64, 0u16))
+                .unwrap()
+                .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                .unwrap_or_default();
+            existing.push(hash_to_bytes(&sibling_a.digest));
+            table
+                .insert((3u64, 0u16), existing.to_bytes().unwrap())
+                .unwrap();
+            drop(table);
+            txn.commit().unwrap();
+        }
+
+        let blocks = store.get_blocks_by_round(3).unwrap();
+        assert_eq!(blocks.len(), 1, "only the surviving sibling is returned");
+        assert_eq!(blocks[0].digest, sibling_b.digest);
+    }
+
+    // #6 (M2 regression): deleting a block in the middle of a chain must not
+    // leave a surviving child with a dangling parent edge that later makes
+    // `get_ancestors`/`mergeset` fail.
+    #[test]
+    fn pruning_middle_block_leaves_surviving_child_traversable() {
+        let (_dir, store) = store();
+
+        let grandparent = make_block(0, 1, vec![], "grandparent-1");
+        let parent = make_block(0, 3, vec![block_ref(&grandparent)], "parent-3");
+        let child = make_block(0, 9, vec![block_ref(&parent)], "child-9");
+        store.put_block(&grandparent).unwrap();
+        store.put_block(&parent).unwrap();
+        store.put_block(&child).unwrap();
+
+        // Delete the middle parent through the non-blue wave prune...
+        assert_eq!(store.prune_non_blue(&[], 1).unwrap(), 1);
+        assert!(matches!(
+            store.get_block(&parent.digest),
+            Err(DagStoreError::NotFound(_))
+        ));
+        // ...and the grandparent through the wave prune.
+        assert_eq!(store.prune_waves_before(3, 2).unwrap(), 1);
+
+        // The surviving child must still be traversable: no dangling edge may
+        // turn the walk into an error.
+        assert!(store.get_block(&child.digest).is_ok(), "child survives");
+        let ancestors = store
+            .get_ancestors(&child.digest, 0)
+            .expect("ancestry walk tolerates pruned parents");
+        assert!(ancestors.is_empty(), "all ancestors were pruned");
+        let mergeset = store
+            .mergeset(&child.digest)
+            .expect("mergeset walk tolerates pruned parents");
+        assert_eq!(mergeset, vec![child.digest]);
     }
 }

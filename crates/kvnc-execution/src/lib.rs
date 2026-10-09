@@ -939,6 +939,7 @@ mod tests {
         let mut ctx = ExecutionContext {
             staking: initial_staking,
             contract_runner: ContractRunner::new(),
+            log_publisher: None,
         };
         let initial_bytes = staking_state_bytes(&ctx.staking);
         let subdag = sample_committed_subdag(1, 0);
@@ -980,10 +981,12 @@ mod tests {
         let mut context_a = ExecutionContext {
             staking: bincode::deserialize(&genesis_bytes).expect("genesis state a"),
             contract_runner: ContractRunner::new(),
+            log_publisher: None,
         };
         let mut context_b = ExecutionContext {
             staking: bincode::deserialize(&genesis_bytes).expect("genesis state b"),
             contract_runner: ContractRunner::new(),
+            log_publisher: None,
         };
         persist_initial_staking_state(&storage_a, &context_a.staking);
         persist_initial_staking_state(&storage_b, &context_b.staking);
@@ -1204,6 +1207,7 @@ mod tests {
             let mut context = ExecutionContext {
                 staking: genesis_staking_state(),
                 contract_runner: ContractRunner::new(),
+                log_publisher: None,
             };
             persist_initial_staking_state(&storage, &context.staking);
             first_reward = context
@@ -1219,6 +1223,7 @@ mod tests {
         let mut context = ExecutionContext {
             staking: load_staking_state(&storage),
             contract_runner: ContractRunner::new(),
+            log_publisher: None,
         };
         let replay = context
             .execute_committed_subdag(&subdag, &storage)

@@ -13,6 +13,11 @@
 #   round_duration_ms -> KVNC_ROUND_DURATION_MS
 #   max_peers         -> KVNC_MAX_PEERS
 #   treasury_address  -> KVNC_TREASURY_ADDRESS
+#   rpc_rate_limit_per_min -> KVNC_RPC_RATE_LIMIT_PER_MIN
+
+# Extra env-only overrides without a TOML equivalent:
+#   KVNC_MYSTICGHOST    (true|false, default off)
+#   KVNC_RUN_VALIDATOR  (true|false, default on)
 
 # Directory where chain data is stored (consensus.redb + state.redb).
 data_dir = "./data"
@@ -38,6 +43,11 @@ round_duration_ms = 2000
 
 # Maximum number of connected peers.
 max_peers = 50
+
+# JSON-RPC rate limit per client IP, in requests per minute. Burst capacity is
+# derived as max(1, rpc_rate_limit_per_min / 6). Set to 0 to disable rate
+# limiting (e.g. for local tests or trusted tooling).
+rpc_rate_limit_per_min = 60
 
 # Genesis treasury address as 32 bytes of hex. When omitted, the zero address is
 # used. Only read the first time the database is created (fresh genesis).

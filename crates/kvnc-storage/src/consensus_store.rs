@@ -184,7 +184,13 @@ impl ConsensusStore {
             let (_, block_hashes) = entry?;
             let hashes: Vec<[u8; 32]> = BincodeSerialize::from_bytes(&block_hashes.value())?;
             for hash in hashes {
-                blocks.push(self.get_dag_block(txn, &Hash(hash))?);
+                // Tolerate dangling index entries: a block may have been
+                // pruned without its index key fully cleaned up.
+                match self.get_dag_block(txn, &Hash(hash)) {
+                    Ok(block) => blocks.push(block),
+                    Err(ConsensusStoreError::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(blocks)
@@ -355,9 +361,10 @@ impl ConsensusStore {
     ) -> Result<u64, ConsensusStoreError> {
         let mut pruned = 0;
 
-        // Collect blocks to prune and round index keys to remove
+        // Collect blocks to prune and round/author index keys to remove
         let mut blocks_to_prune = Vec::new();
         let mut round_keys_to_remove = Vec::new();
+        let mut author_keys_to_remove = Vec::new();
 
         {
             let table = txn.open_table(crate::tables::DAG_BY_ROUND)?;
@@ -367,7 +374,9 @@ impl ConsensusStore {
                 for hash in hashes {
                     blocks_to_prune.push(hash);
                 }
-                round_keys_to_remove.push(key.value());
+                let (round, author) = key.value();
+                round_keys_to_remove.push((round, author));
+                author_keys_to_remove.push((author, round));
             }
         } // table is dropped here
 
@@ -383,7 +392,9 @@ impl ConsensusStore {
                 let mut table = txn.open_table(crate::tables::DAG_PARENTS)?;
                 table.remove(block_hash)?;
             }
-            // Remove from dag_children (need to update parents' children lists)
+            // Update the deleted block's parents' children lists, and drop the
+            // deleted block from each surviving child's parent list so no
+            // dangling parent edge survives pruning (M2).
             {
                 let parents = self.get_parents_internal(&*txn, &block_hash)?;
                 for parent_hash in parents {
@@ -391,6 +402,25 @@ impl ConsensusStore {
                     children.retain(|h| *h != block_hash);
                     let mut child_table = txn.open_table(crate::tables::DAG_CHILDREN)?;
                     child_table.insert(parent_hash, children.to_bytes()?)?;
+                }
+
+                let children = self.get_children_internal(&*txn, &block_hash)?;
+                for child_hash in children {
+                    if child_hash == block_hash {
+                        continue;
+                    }
+                    let mut table = txn.open_table(crate::tables::DAG_PARENTS)?;
+                    let existing: Vec<[u8; 32]> = table
+                        .get(child_hash)?
+                        .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                        .unwrap_or_default();
+                    let filtered: Vec<[u8; 32]> =
+                        existing.into_iter().filter(|h| *h != block_hash).collect();
+                    if filtered.is_empty() {
+                        table.remove(child_hash)?;
+                    } else {
+                        table.insert(child_hash, filtered.to_bytes()?)?;
+                    }
                 }
             }
             // Remove from dag_children
@@ -409,12 +439,14 @@ impl ConsensusStore {
             }
         }
 
-        // Clean up author index
+        // Clean up author index alongside the round index so the author index
+        // does not grow without bound and `get_block_by_author_round` cannot
+        // resolve a pruned block (M2 m2).
         {
             let mut author_table = txn.open_table(crate::tables::DAG_BY_AUTHOR)?;
-            // We need to scan all entries and remove those with round < min_round
-            // For efficiency, we'd need a separate index by round, but for now we skip this
-            // In production, we'd maintain a round->author index
+            for key in author_keys_to_remove {
+                author_table.remove(key)?;
+            }
         }
 
         Ok(pruned)
@@ -431,5 +463,70 @@ impl ConsensusStore {
         Ok(value
             .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{tables, Storage};
+    use kvnc_types::crypto::Signature;
+    use std::collections::HashSet;
+    use tempfile::tempdir;
+
+    fn make_block(author: AuthorityIndex, round: Round, tag: &str) -> StatementBlock {
+        StatementBlock {
+            author,
+            round,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: tag.as_bytes().to_vec(),
+            signature: Signature([0u8; 64]),
+            digest: Hash::new(format!("kvnc-consensus-store-test/{tag}").as_bytes()),
+            merkle_root: Hash::zero(),
+        }
+    }
+
+    // #5a: `get_blocks_by_round` must skip index entries whose block no longer
+    // exists (e.g. a hash left behind after pruning).
+    #[test]
+    fn get_blocks_by_round_skips_dangling_index_entries() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("consensus.redb")).unwrap();
+        let store = storage.consensus();
+
+        let block_a = make_block(0, 3, "a");
+        let block_b = make_block(1, 3, "b");
+        let stale = Hash::new(b"kvnc-consensus-store-test/stale");
+
+        {
+            let txn = storage.begin_write().unwrap();
+            store.put_dag_block(&txn, &block_a).unwrap();
+            store.put_dag_block(&txn, &block_b).unwrap();
+
+            // Inject a hash that has no corresponding block into the
+            // (round=3, author=0) index entry.
+            {
+                let mut table = txn.open_table(tables::DAG_BY_ROUND).unwrap();
+                let mut existing: Vec<[u8; 32]> = table
+                    .get((3u64, 0u16))
+                    .unwrap()
+                    .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
+                    .unwrap_or_default();
+                existing.push(hash_to_bytes(&stale));
+                table
+                    .insert((3u64, 0u16), existing.to_bytes().unwrap())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let txn = storage.begin_read().unwrap();
+        let round_blocks = store.get_blocks_by_round(&txn, 3).unwrap();
+        assert_eq!(round_blocks.len(), 2, "stale index entry must be skipped");
+        let digests: HashSet<Hash> = round_blocks.iter().map(|block| block.digest).collect();
+        assert!(digests.contains(&block_a.digest));
+        assert!(digests.contains(&block_b.digest));
+        assert!(!digests.contains(&stale), "missing block must not surface");
     }
 }

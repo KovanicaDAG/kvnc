@@ -16,8 +16,9 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use kvnc_consensus::{AuthorityInfo, CommitteeInfo};
+use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolConfig};
-use kvnc_rpc::{EventBus, RpcServer, RpcState};
+use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
 use kvnc_staking::{StakingState, MIN_VALIDATOR_STAKE};
 use kvnc_storage::Storage;
 use kvnc_types::{crypto::PublicKey, Address, Hash, Signature, StatementBlock};
@@ -38,12 +39,15 @@ fn test_state(storage: Arc<Storage>, events: EventBus) -> RpcState {
         network_address: "127.0.0.1:9000".to_string(),
     };
     RpcState {
+        consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
         mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
         storage,
         staking: Arc::new(RwLock::new(StakingState::new())),
         committee: CommitteeInfo::try_new(0, vec![authority]).expect("valid committee"),
         peer_count: Arc::new(AtomicUsize::new(0)),
         events,
+        rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
+        auth_config: Arc::new(AuthConfig::default()),
     }
 }
 
@@ -59,7 +63,7 @@ async fn start_server() -> (
     let events = EventBus::new();
     let state = test_state(storage, events.clone());
     let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
-    let server = RpcServer::new(addr, state).await;
+    let server = RpcServer::new(addr, state, None, None).await;
     let handle = server.start().await.expect("start rpc server");
     (handle, addr, events, dir)
 }

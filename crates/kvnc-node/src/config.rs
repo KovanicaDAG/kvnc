@@ -38,6 +38,9 @@ pub struct NodeConfig {
     /// Run as a validator (produce blocks, participate in consensus).
     /// When false, the node runs as an RPC/read-only node without consensus participation.
     pub run_validator: bool,
+    /// JSON-RPC rate limit, in requests per minute per client IP. `0` disables
+    /// rate limiting. Overridable with `KVNC_RPC_RATE_LIMIT_PER_MIN`.
+    pub rpc_rate_limit_per_min: u32,
 }
 
 impl Default for NodeConfig {
@@ -54,6 +57,7 @@ impl Default for NodeConfig {
             treasury_address: None,
             use_mysticghost: false,
             run_validator: true,
+            rpc_rate_limit_per_min: 60,
         }
     }
 }
@@ -139,6 +143,14 @@ impl NodeConfig {
                 "1" | "true" | "yes" | "on" => self.run_validator = true,
                 "0" | "false" | "no" | "off" => self.run_validator = false,
                 _ => tracing::warn!(value = %v, "ignoring invalid KVNC_RUN_VALIDATOR"),
+            }
+        }
+        if let Ok(v) = std::env::var("KVNC_RPC_RATE_LIMIT_PER_MIN") {
+            match v.parse() {
+                Ok(rate) => self.rpc_rate_limit_per_min = rate,
+                Err(_) => {
+                    tracing::warn!(value = %v, "ignoring invalid KVNC_RPC_RATE_LIMIT_PER_MIN")
+                }
             }
         }
     }

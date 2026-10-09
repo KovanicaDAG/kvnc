@@ -69,9 +69,9 @@ enum Commands {
     Info,
     /// Query an account balance
     Balance { address: String },
-    /// Stake KVNC (not yet supported by the node)
+    /// Stake KVNC (builds and submits a signed Stake transaction)
     Stake(AmountArgs),
-    /// Unstake KVNC (not yet supported by the node)
+    /// Unstake KVNC (builds and submits a signed Unstake transaction)
     Unstake(AmountArgs),
     /// Delegate stake to a validator (not yet supported by the node)
     Delegate(DelegateArgs),
@@ -202,12 +202,18 @@ struct TransferArgs {
     fee: u64,
 }
 
-/// Arguments carrying a single amount.
+/// Arguments carrying a single amount plus the signing keystore.
 #[derive(Args)]
 struct AmountArgs {
     /// Amount in atoms
     #[arg(long)]
     amount: u64,
+    /// Keystore file path
+    #[arg(long, short, default_value = "keystore.json")]
+    keystore: PathBuf,
+    /// Fee in atoms (the mempool rejects zero-fee transactions)
+    #[arg(long, default_value_t = 1)]
+    fee: u64,
 }
 
 /// Arguments for `kvnc delegate`.
@@ -257,8 +263,8 @@ async fn main() -> Result<()> {
         Commands::Transfer(args) => cmd_transfer(&client, args, json).await,
         Commands::Status | Commands::Info => node::status(&client, json).await,
         Commands::Balance { address } => node::balance(&client, &address, json).await,
-        Commands::Stake(args) => stake::stake_skeleton(&client, args.amount, None, json).await,
-        Commands::Unstake(args) => stake::unstake_skeleton(&client, args.amount, None, json).await,
+        Commands::Stake(args) => cmd_stake(&client, args, json).await,
+        Commands::Unstake(args) => cmd_unstake(&client, args, json).await,
         Commands::Delegate(args) => {
             stake::delegate_skeleton(&client, &args.validator, args.amount, None, json).await
         }
@@ -445,6 +451,91 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
     println!("Submitted transaction {tx_hash}");
     println!("  from:   {}", sender);
     println!("  to:     {}", recipient);
+    println!("  amount: {} atoms", args.amount);
+    println!("  fee:    {} atoms", args.fee);
+    println!("  nonce:  {nonce}");
+    Ok(())
+}
+
+/// Sign a self-addressed transaction kind with the local keystore and submit it.
+///
+/// Mirrors [`cmd_transfer`]'s flow: nonce is read from `kvnc_getNonce`, the
+/// signable hash is built offline, and only the bincode-encoded signed
+/// transaction is sent over `kvnc_sendRawTransaction`. Private key material
+/// never leaves the machine and no staking-specific node RPC is introduced.
+async fn sign_and_submit_self(
+    client: &RpcClient,
+    keystore_path: &std::path::Path,
+    kind: TransactionKind,
+    fee: u64,
+) -> Result<(String, kvnc_types::Address, u64)> {
+    let keystore = wallet::load(keystore_path)?;
+    let password = prompt_keystore_password(&keystore)?;
+    let signing_key = wallet::signing_key(&keystore, password.as_ref().map(|p| p.as_str()))?;
+    let sender = wallet::address(&keystore)?;
+
+    // The account nonce is the next unused nonce, so it is used as-is.
+    let nonce_value = client
+        .call("kvnc_getNonce", json!([sender.to_string()]))
+        .await?;
+    let nonce = rpc::parse_quantity(&nonce_value)?;
+
+    let transaction = tx::build_signed(sender, nonce, kind, fee, &signing_key)?;
+    let raw = tx::encode_raw(&transaction)?;
+
+    let result = client.call("kvnc_sendRawTransaction", json!([raw])).await?;
+    let tx_hash = result.as_str().unwrap_or_default().to_string();
+    Ok((tx_hash, sender, nonce))
+}
+
+async fn cmd_stake(client: &RpcClient, args: AmountArgs, json_output: bool) -> Result<()> {
+    let (tx_hash, sender, nonce) = sign_and_submit_self(
+        client,
+        &args.keystore,
+        TransactionKind::Stake { amount: args.amount },
+        args.fee,
+    )
+    .await?;
+
+    if json_output {
+        return output::print_json(&json!({
+            "transactionHash": tx_hash,
+            "sender": sender.to_string(),
+            "amount": args.amount,
+            "fee": args.fee,
+            "nonce": nonce,
+        }));
+    }
+
+    println!("Submitted transaction {tx_hash}");
+    println!("  from:   {}", sender);
+    println!("  amount: {} atoms", args.amount);
+    println!("  fee:    {} atoms", args.fee);
+    println!("  nonce:  {nonce}");
+    Ok(())
+}
+
+async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) -> Result<()> {
+    let (tx_hash, sender, nonce) = sign_and_submit_self(
+        client,
+        &args.keystore,
+        TransactionKind::Unstake { amount: args.amount },
+        args.fee,
+    )
+    .await?;
+
+    if json_output {
+        return output::print_json(&json!({
+            "transactionHash": tx_hash,
+            "sender": sender.to_string(),
+            "amount": args.amount,
+            "fee": args.fee,
+            "nonce": nonce,
+        }));
+    }
+
+    println!("Submitted transaction {tx_hash}");
+    println!("  from:   {}", sender);
     println!("  amount: {} atoms", args.amount);
     println!("  fee:    {} atoms", args.fee);
     println!("  nonce:  {nonce}");
@@ -703,5 +794,31 @@ mod wallet_cli_security_tests {
         );
         assert!(result.is_err());
         assert!(!constructed);
+    }
+
+    #[test]
+    fn stake_and_unstake_accept_keystore_and_fee() {
+        let cli = Cli::try_parse_from([
+            "kvnc", "stake", "--amount", "42", "--fee", "3", "--keystore", "wallet.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Stake(args) => {
+                assert_eq!(args.amount, 42);
+                assert_eq!(args.fee, 3);
+                assert_eq!(args.keystore, PathBuf::from("wallet.json"));
+            }
+            _ => panic!("expected stake command"),
+        }
+
+        let cli = Cli::try_parse_from(["kvnc", "unstake", "--amount", "7"]).unwrap();
+        match cli.command {
+            Commands::Unstake(args) => {
+                assert_eq!(args.amount, 7);
+                assert_eq!(args.fee, 1);
+                assert_eq!(args.keystore, PathBuf::from("keystore.json"));
+            }
+            _ => panic!("expected unstake command"),
+        }
     }
 }
