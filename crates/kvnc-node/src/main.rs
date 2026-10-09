@@ -46,7 +46,9 @@ use kvnc_network::{
     BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
     StateSyncResponse,
 };
-use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
+use kvnc_rpc::{
+    AuthConfig, EventBus, NodeHealth, RateLimitConfig, RateLimiterState, RpcServer, RpcState,
+};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -498,7 +500,10 @@ where
     let events = EventBus::new();
     let rate_limit_config =
         RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    // Liveness of the execution worker and consensus engine, surfaced on /health.
+    let node_health = NodeHealth::new();
     let rpc_state = RpcState {
+        health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
         mempool: mempool.clone(),
@@ -644,12 +649,19 @@ where
         state_storage.clone(),
         events.clone(),
         shutdown_rx.clone(),
+        node_health.clone(),
     ));
 
     let engine_for_task = engine.clone();
+    let engine_health = node_health.clone();
     let engine_task = tokio::spawn(async move {
-        if let Err(e) = engine_for_task.start().await {
-            error!(error = %e, "consensus engine stopped with an error");
+        engine_health.consensus_running();
+        match engine_for_task.start().await {
+            Ok(()) => engine_health.consensus_stopped(),
+            Err(e) => {
+                error!(error = %e, "consensus engine stopped with an error");
+                engine_health.consensus_failed(&e.to_string());
+            }
         }
     });
 
@@ -1049,6 +1061,7 @@ async fn run_execution(
     state_storage: Arc<Storage>,
     events: EventBus,
     mut shutdown: watch::Receiver<bool>,
+    health: NodeHealth,
 ) {
     let mut ctx = ExecutionContext::new();
     ctx.log_publisher = Some(Box::new(EventLogPublisher(events.clone())));
@@ -1071,6 +1084,7 @@ async fn run_execution(
                             "executed committed sub-DAG"
                         );
                         events.publish_committed_leader(&subdag);
+                        health.execution_progress(subdag.leader_round);
                     }
                     Err(e) => {
                         error!(
@@ -1078,10 +1092,14 @@ async fn run_execution(
                             round = subdag.leader_round,
                             "execution failed; stopping worker so committed decisions replay after restart"
                         );
+                        health.execution_failed(&format!("round {}: {e}", subdag.leader_round));
                         break;
                     }
                 },
-                None => break,
+                None => {
+                    warn!("committed sub-DAG channel closed; execution worker stopping");
+                    break;
+                }
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1090,6 +1108,7 @@ async fn run_execution(
             }
         }
     }
+    health.execution_stopped();
 }
 
 /// Adapter implementing [`DagStoreTrait`] over the concrete [`DagStore`].
@@ -1840,6 +1859,7 @@ mod tests {
             state_storage.clone(),
             EventBus::new(),
             shutdown_rx,
+            NodeHealth::new(),
         ));
 
         let leader_round = 3;
@@ -1933,7 +1953,17 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        run_execution(exec_rx, state_storage.clone(), EventBus::new(), shutdown_rx).await;
+        let health = NodeHealth::new();
+        run_execution(
+            exec_rx,
+            state_storage.clone(),
+            EventBus::new(),
+            shutdown_rx,
+            health.clone(),
+        )
+        .await;
+        assert_eq!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+        assert!(!health.is_healthy());
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();
