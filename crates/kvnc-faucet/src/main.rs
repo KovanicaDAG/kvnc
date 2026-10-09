@@ -16,8 +16,8 @@ use axum::{
 use clap::Parser;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use ed25519_dalek::{Signer, SigningKey};
 use kvnc_cli::wallet;
@@ -34,10 +34,6 @@ struct FaucetConfig {
     max_requests_per_window: usize,
     /// RPC endpoint of the node
     rpc_url: String,
-    /// Faucet keystore path
-    keystore_path: String,
-    /// Faucet keystore passphrase
-    passphrase: String,
 }
 
 /// Rate limiter state
@@ -120,19 +116,23 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Load faucet keystore
     let keystore = wallet::load(std::path::Path::new(&cli.keystore))
         .with_context(|| format!("loading faucet keystore {}", cli.keystore))?;
+    // The passphrase is only needed to decrypt the seed; it is wiped right
+    // after and never stored in config/state or logged.
+    let cli_passphrase = Zeroizing::new(std::mem::take(&mut cli.passphrase));
     let passphrase = if keystore.encrypted {
-        Some(cli.passphrase.as_str())
+        Some(cli_passphrase.as_str())
     } else {
         None
     };
     let seed =
         wallet::secret_seed(&keystore, passphrase).with_context(|| "decrypting faucet keystore")?;
     let signer = SigningKey::from_bytes(&seed);
+    drop(cli_passphrase);
     let faucet_address = Address::from_public_key(&PublicKey::from(signer.verifying_key()));
 
     info!(faucet_address = %faucet_address, "faucet identity loaded");
@@ -142,8 +142,6 @@ async fn main() -> Result<()> {
         rate_limit_window: cli.rate_limit_window,
         max_requests_per_window: cli.max_requests,
         rpc_url: cli.rpc_url.clone(),
-        keystore_path: cli.keystore,
-        passphrase: cli.passphrase,
     };
 
     let state = Arc::new(FaucetState {
@@ -228,7 +226,7 @@ async fn faucet_handler(
     }
 
     // Get faucet nonce from RPC
-    let nonce = match get_nonce(&state.config.rpc_url, &state.faucet_address).await {
+    let nonce = match get_nonce(&state.client, &state.config.rpc_url, &state.faucet_address).await {
         Ok(n) => n,
         Err(e) => {
             warn!("Failed to get faucet nonce: {}", e);
@@ -275,7 +273,7 @@ async fn faucet_handler(
     };
 
     // Submit transaction
-    match submit_transaction(&state.config.rpc_url, &signed_tx).await {
+    match submit_transaction(&state.client, &state.config.rpc_url, &signed_tx).await {
         Ok(tx_hash) => {
             info!(to = %to_address, amount = state.config.dispense_amount, tx_hash = %tx_hash, "faucet dispensed");
             (
@@ -320,8 +318,7 @@ fn parse_address(s: &str) -> Result<Address> {
     Ok(Address(arr))
 }
 
-async fn get_nonce(rpc_url: &str, address: &Address) -> Result<u64> {
-    let client = reqwest::Client::new();
+async fn get_nonce(client: &reqwest::Client, rpc_url: &str, address: &Address) -> Result<u64> {
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "kvnc_getNonce",
@@ -345,8 +342,11 @@ fn sign_transaction(mut tx: Transaction, signer: &SigningKey) -> Result<Transact
     Ok(tx)
 }
 
-async fn submit_transaction(rpc_url: &str, tx: &Transaction) -> Result<String> {
-    let client = reqwest::Client::new();
+async fn submit_transaction(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    tx: &Transaction,
+) -> Result<String> {
     let raw = bincode::serialize(tx)?;
     let req = serde_json::json!({
         "jsonrpc": "2.0",

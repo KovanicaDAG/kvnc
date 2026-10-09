@@ -26,3 +26,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 ed25519-dalek = { version = "2", features = ["rand_core", "batch"] }
 thiserror = { workspace = true }
+zeroize = "1"
