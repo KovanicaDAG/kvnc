@@ -233,7 +233,7 @@
 - [x] Wallet keygen/import/export/sign — `wallet.rs` handles key operations.
 - [x] Canonical address format — CLI uses `Address::encode`/`FromStr` for display/input.
 - [~] Node operations status/sync/peers — `status` command works; `sync`/`peers` commands are skeletons returning "not yet implemented" (`cli/src/main.rs:200-250`).
-- [~] Staking commands stake/unstake/delegate/claim — `stake`/`unstake` work; `delegate`/`claim-rewards` are skeletons returning "not yet supported" (`cli/src/stake.rs:37-62`).
+- [x] Staking commands stake/unstake/delegate/claim — all implemented via `TransactionKind::Stake`/`Unstake`/`Delegate`/`ClaimRewards` with keystore signing (`cli/src/main.rs:568-615`).
 - [x] Governance commands — placeholder; marked Phase 25.
 - [x] JSON/table output — `output.rs` handles formatting.
 
@@ -262,7 +262,7 @@
 - [x] Premine allocation (founder 200K + treasury) — genesis tool allocates founder 200K KVNC, treasury 8M KVNC (`node/src/main.rs:350-360`).
 - [~] Faucet service (kvnc-faucet, 3/hr/IP, 10 KVNC via `/faucet`) — implemented but **not running in CI** (`faucet/src/main.rs:1-335`).
 - [ ] Key distribution ceremony — no ceremony tool or docs.
-- [x] Seed nodes (3+) — three DNS seeds (`seed.kovanica.online:8000`, `seed2.kovanica.online:8000`, `seed3.kovanica.online:8000`) in `network/src/lib.rs:97-106`; node config also has 3 bootnodes (`config.rs:53-57`).
+- [x] Seed nodes (3+) — three DNS seeds (`seed.kovanica.online:8000`, `seed2.kovanica.online:8000`, `seed3.kovanica.online:8000`) in `network/src/lib.rs:97-106`; node config has 3 bootnodes (`config.rs:53-57`).
 - [ ] Explorer + validator onboarding docs — no docs found.
 
 ---
@@ -326,7 +326,7 @@
 - [ ] external security review — no evidence of external audit.
 - [x] fuzzing harnesses (`fuzz/`: fuzz_block/fuzz_tx/fuzz_vote/fuzz_consensus) — all four targets exist.
 - [x] RPC/WS rate limit + optional auth token — token bucket 60/min burst 10 on `/rpc` returning 429; bearer token framework for write methods (`rpc/src/rpc_middleware.rs:20-64, 187-203`).
-- [~] resource budgets (6h MemoryMax=3G soak) — `ops/soak/soak.sh` exists but not run in CI; no CPU/disk caps enforced.
+- [x] resource budgets (6h MemoryMax=3G soak) — `ops/soak/soak.sh` enforces MemoryMax=3G via cgroup v2, monitors RSS every 30s, warns at 3G (`ops/soak/soak.sh:37-38`); CPU/disk caps not yet enforced.
 - [ ] keystore no-raw-hex enforcement — CLI accepts raw hex; no enforcement found.
 
 ---
@@ -362,7 +362,7 @@
 
 - [~] genesis ceremony tool + docs — **no standalone genesis CLI subcommand**; genesis is inline in node startup (`node/src/main.rs:334-372`).
 - [x] faucet — `faucet/src/main.rs` — implemented.
-- [ ] seed nodes (3+) with DNS — no seed node DNS config or deployment.
+- [x] seed nodes (3+) with DNS — three DNS seeds (`seed.kovanica.online:8000`, `seed2.kovanica.online:8000`, `seed3.kovanica.online:8000`) in `network/src/lib.rs:97-106`; node config has 3 bootnodes (`config.rs:53-57`).
 - [ ] explorer + validator onboarding docs — no docs found.
 - [ ] mainnet freeze checklist — no checklist file.
 - [ ] mainnet launch + monitoring runbook — no runbook.
