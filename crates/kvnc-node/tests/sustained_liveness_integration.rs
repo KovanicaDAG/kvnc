@@ -168,7 +168,7 @@ impl QuorumNode {
 
         // 32-byte hex seed; the node derives its Ed25519 key from this.
         let key_path = data_dir.path().join("validator.key");
-        std::fs::write(&key_path, hex::encode(signing_key.to_bytes()))
+        write_private(&key_path, hex::encode(signing_key.to_bytes()))
             .with_context(|| format!("node {index}: write validator.key"))?;
 
         // Capture node stdout/stderr. The live log lives inside the data dir
@@ -745,5 +745,21 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
         "[sustained_liveness] node logs archived under: {}",
         log_dir.display()
     );
+    Ok(())
+}
+
+/// Write a validator seed file readable only by the owner (the node refuses
+/// group/world-accessible key files).
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }

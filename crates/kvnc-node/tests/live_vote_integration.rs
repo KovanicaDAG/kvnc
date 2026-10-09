@@ -85,7 +85,7 @@ validators = [
         // Write validator key file
         let key_path = temp_dir.path().join("validator.key");
         let key_hex = hex::encode(signing_key.to_bytes());
-        std::fs::write(&key_path, key_hex)?;
+        write_private(&key_path, key_hex)?;
 
         // Start node process
         // Use the workspace root's target directory for the binary
@@ -283,11 +283,11 @@ validators = [
         dir2.path().join("genesis_validators.toml"),
         &genesis_content,
     )?;
-    std::fs::write(
+    write_private(
         dir1.path().join("validator.pem"),
         hex::encode(sk1.to_bytes()),
     )?;
-    std::fs::write(
+    write_private(
         dir2.path().join("validator.pem"),
         hex::encode(sk2.to_bytes()),
     )?;
@@ -416,11 +416,11 @@ validators = [
         dir2.path().join("genesis_validators.toml"),
         &genesis_content,
     )?;
-    std::fs::write(
+    write_private(
         dir1.path().join("validator.pem"),
         hex::encode(sk1.to_bytes()),
     )?;
-    std::fs::write(
+    write_private(
         dir2.path().join("validator.pem"),
         hex::encode(sk2.to_bytes()),
     )?;
@@ -478,5 +478,21 @@ validators = [
     node1.kill().await?;
     node2.kill().await?;
 
+    Ok(())
+}
+
+/// Write a validator seed file readable only by the owner (the node refuses
+/// group/world-accessible key files).
+fn write_private(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }

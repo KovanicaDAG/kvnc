@@ -159,6 +159,34 @@ impl NodeConfig {
         }
     }
 
+    /// Reject configurations the node cannot run safely with.
+    ///
+    /// Called at startup, after environment overrides are applied, so a
+    /// misconfigured node fails fast instead of limping along on defaults.
+    pub fn validate(&self) -> Result<()> {
+        if self.run_validator
+            && self
+                .validator_key
+                .as_deref()
+                .is_none_or(|k| k.trim().is_empty())
+        {
+            anyhow::bail!(
+                "run_validator=true requires validator_key (or KVNC_VALIDATOR_KEY) pointing at a 0600 seed file"
+            );
+        }
+        if self.listen_addr.trim().is_empty() {
+            anyhow::bail!("listen_addr must not be empty");
+        }
+        if self.round_duration_ms == 0 {
+            anyhow::bail!("round_duration_ms must be greater than 0");
+        }
+        if self.max_peers == 0 {
+            anyhow::bail!("max_peers must be greater than 0");
+        }
+        self.rpc_socket_addr()?;
+        Ok(())
+    }
+
     /// Resolve the JSON-RPC socket address.
     pub fn rpc_socket_addr(&self) -> Result<SocketAddr> {
         let raw = format!("{}:{}", self.rpc_addr, self.rpc_port);
@@ -248,5 +276,52 @@ treasury_address = "treasury-address-placeholder"
         std::env::remove_var("KVNC_MAX_PEERS");
         assert_eq!(config.rpc_port, 1234);
         assert_eq!(config.max_peers, 3);
+    }
+
+    #[test]
+    fn validate_requires_key_for_validators() {
+        let mut config = NodeConfig::default();
+        assert!(config.run_validator);
+        assert!(
+            config.validate().is_err(),
+            "validator without key must fail"
+        );
+
+        config.validator_key = Some("   ".into());
+        assert!(config.validate().is_err(), "blank key path must fail");
+
+        config.validator_key = Some("/etc/kvnc/validator.key".into());
+        config.validate().expect("validator with key path is valid");
+
+        config.validator_key = None;
+        config.run_validator = false;
+        config
+            .validate()
+            .expect("non-validator may run without a key");
+    }
+
+    #[test]
+    fn validate_rejects_nonsense_values() {
+        let base = NodeConfig {
+            run_validator: false,
+            ..NodeConfig::default()
+        };
+        base.validate().expect("base is valid");
+
+        let mut c = base.clone();
+        c.round_duration_ms = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base.clone();
+        c.max_peers = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base.clone();
+        c.listen_addr = " ".into();
+        assert!(c.validate().is_err());
+
+        let mut c = base;
+        c.rpc_addr = "not an ip".into();
+        assert!(c.validate().is_err());
     }
 }

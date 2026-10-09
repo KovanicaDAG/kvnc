@@ -13,6 +13,7 @@
 mod behaviour;
 mod block_sync;
 mod error;
+pub mod identity;
 mod service;
 mod state_sync;
 mod sync;
@@ -93,6 +94,10 @@ pub struct NetworkConfig {
     pub max_peers: usize,
     /// Ping interval.
     pub ping_interval: Duration,
+    /// File holding the persistent libp2p node identity (transport key, not
+    /// the validator key). Created with mode `0600` on first start. `None`
+    /// uses a fresh identity per process (tests).
+    pub node_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -119,6 +124,7 @@ impl Default for NetworkConfig {
             ],
             max_peers: 50,
             ping_interval: Duration::from_secs(10),
+            node_key_path: None,
         }
     }
 }
