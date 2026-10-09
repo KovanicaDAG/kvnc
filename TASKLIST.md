@@ -29,7 +29,7 @@
 - [x] Block/Transaction serialization (serde + bincode/postcard path)
 - [x] **Merkle roots** — `merkle_root` na `StatementBlock` za tx inclusion proofs
 - [x] Round / AuthorityIndex arithmetic traits
-- [~] Committee types — postoje; leader selection **stake-weighted completed** (17.1, types.rs)
+- [x] Committee types — postoje; leader selection **stake-weighted completed** (`CommitteeInfo::leader_for_round`)
 - [x] Address derivation (raw Ed25519 pubkey = address; kanonski `kvnc<hex>dag` encoding s blake3 checksumom)
 - [x] **Hash domain separation** — odvojeni domain tagovi za block / tx / state / vote
 
@@ -66,7 +66,7 @@
 ### 2.2 State Store
 - [x] Account state (balance, nonce, code/storage)
 - [x] Staking state persist
-- [~] **Merkle Patricia Trie** (sorted KV Merkle — minimalni put zadovoljen) (ili jednostavniji Merkle map) za state root
+- [x] **Merkle Patricia Trie** (sorted KV Merkle — minimalni put zadovoljen) (ili jednostavniji Merkle map) za state root
 - [x] **Snapshot / Restore** za fast sync
 
 **Tips**
@@ -231,7 +231,7 @@
 ## Phase 9: Node Binary (`kvnc-node`) — DONE core
 
 - [x] Config, core loop, graceful shutdown
-- [~] Genesis još bez full premine/validator set ceremony
+- [x] Genesis tool (`kvnc-node genesis` CLI with `--validators`, `--treasury-address`, `--founder-address`, `--validator-keys-out`, `--force`)
 
 **Tips**
 - Premine ostavi za Phase 24 genesis tool. Za dev: treasury + jedan validator iz configa.
@@ -257,8 +257,8 @@
 
 - [x] Wallet (keygen, import/export, sign)
 - [x] Kanonski `kvnc…dag` format adrese (keystore + output); `parse_address` prihvata i stari hex
-- [ ] **Node operations** — status, sync, peers
-- [ ] **Staking commands** — stake/unstake/delegate/claim
+- [~] **Node operations** — status, sync, peers (skeletons exist, node RPCs missing)
+- [~] **Staking commands** — stake/unstake/delegate/claim (skeletons in `kvnc-cli/src/stake.rs`, node RPCs not implemented)
 - [ ] Governance commands (Phase 25)
 - [x] JSON / table output
 
@@ -336,12 +336,12 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 - [x] **16.1 Committee from staking state**  (done: build_committee / CommitteeInfo / tests verified)
   `build_committee` čita aktivne validatore iz `StakingState`, ne hardcoda authority 0.
-- [ ] **16.2 Round from consensus tip**  
-  Block builder koristi `engine.current_round()` (ili watch channel), ne lokalni counter.
-- [ ] **16.3 Vote ingress verified on live node**  
-  Integration test: 2 procesa, stvarni TCP, vote → commit → execute.
-- [ ] **16.4 Mempool admission** (vidi 5.1) wired na `sendRawTransaction` i gossip ingest.
-- [ ] **16.5 Conflict-aware block building** (vidi 5.2).
+- [x] **16.2 Round from consensus tip**  
+  BlockManager tracks consensus engine round via watch channel (`engine.subscribe_round()` → `BlockManager.set_round_receiver()`).
+- [~] **16.3 Vote ingress verified on live node**  
+  Test file created at `crates/kvnc-node/tests/live_vote_integration.rs` (has compilation issues).
+- [~] **16.4 Mempool admission** (vidi 5.1) wired na `sendRawTransaction` i gossip ingest.
+- [~] **16.5 Conflict-aware block building** (vidi 5.2) — `mempool.get_next_transactions()` does nonce ordering + fee sort.
 - [x] **16.6 Real 4-node quorum**  
   Docker compose s 4 različita validator keya, committee size 4, 2f+1 = 3. Identitarian committed leader sequence.
 
@@ -574,4 +574,5 @@ Ovo je **trenutni bottleneck** — kod postoji, quorum još nije production-real
 
 *Generirano iz code inspection + postojećeg tasklist.md (repo KovanicaDAG/kvnc, 2026-10-08).*  
 *Ažurirano 2026-10-09 po implementaciji Phase 13–21, 14, 15.6, 16.6, 20 (rate limits).*  
+*Refined 2026-10-09: 16.2 ✅, 16.3/16.4/16.5 → [~], 1.1/2.2/9/11 → updated to reflect reality.*  
 *Status markeri odražavaju stanje koda u trenutku pisanja; pri implementaciji re-verificiraj prije checkoffa.*
