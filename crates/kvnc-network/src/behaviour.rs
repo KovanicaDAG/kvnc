@@ -209,23 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn build_swarm_reuses_persistent_identity() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = NetworkConfig {
-            node_key_path: Some(dir.path().join("p2p_node.key")),
-            ..NetworkConfig::default()
-        };
-        let first = *build_swarm(&config).expect("swarm builds").local_peer_id();
-        let second = *build_swarm(&config).expect("swarm builds").local_peer_id();
-        assert_eq!(first, second, "peer id must survive restarts");
-
-        let ephemeral = *build_swarm(&NetworkConfig::default())
-            .expect("swarm builds")
-            .local_peer_id();
-        assert_ne!(first, ephemeral);
-    }
-
-    #[test]
     fn build_swarm_subscribes_to_every_topic() {
         let swarm = build_swarm(&NetworkConfig::default()).expect("swarm builds");
         let subscribed: Vec<String> = swarm
@@ -241,5 +224,22 @@ mod tests {
             );
         }
         assert!(!swarm.local_peer_id().to_string().is_empty());
+    }
+
+    #[test]
+    fn build_swarm_reuses_persistent_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NetworkConfig {
+            node_key_path: Some(dir.path().join("p2p_node.key")),
+            ..NetworkConfig::default()
+        };
+        let first = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        let second = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        assert_eq!(first, second, "peer id must survive restarts");
+
+        let ephemeral = *build_swarm(&NetworkConfig::default())
+            .expect("swarm builds")
+            .local_peer_id();
+        assert_ne!(first, ephemeral);
     }
 }
