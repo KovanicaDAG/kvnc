@@ -777,7 +777,7 @@ impl StakingState {
         if total > 0 {
             stakes.sort_by_key(|(a, _)| a.0);
             for (addr, stake) in stakes {
-                let share = pool * stake / total;
+                let share = (pool * stake).checked_div(total).unwrap_or(0);
                 distributed += share;
                 *merged.entry(addr.0).or_default() += share;
             }
