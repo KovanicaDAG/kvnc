@@ -650,18 +650,19 @@ impl ExecutionContext {
     /// Execute a claim-rewards transaction (claim delegation rewards).
     fn execute_claim_rewards(
         &mut self,
-        txn: &mut WriteTransaction,
+        _txn: &mut WriteTransaction,
         _storage: &Storage,
         from: &Address,
         validator: Option<Address>,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
         // Collect rewards for the delegator
-        let mut total_claimed = 0u64;
+        let total_claimed = 0u64;
         let mut events = Vec::new();
 
         if let Some(validator_addr) = validator {
             // Claim rewards for specific validator
-            let shares = self.staking.reward_share(validator_addr, 0, 0); // We'll compute actual rewards
+            // We'll compute actual rewards
+            let shares = self.staking.reward_share(validator_addr, 0, 0);
             // For now, just emit event - actual reward distribution happens via staking module
             for (addr, _share) in shares {
                 if addr == *from {
