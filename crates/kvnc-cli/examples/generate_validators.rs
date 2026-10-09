@@ -39,13 +39,13 @@ fn main() -> anyhow::Result<()> {
         println!("  Saved to {}", keystore_path);
     }
 
-    // Generate genesis_validators.toml with [[validators]] array-of-tables format
+    // Generate genesis_validators.toml with [[validator]] array-of-tables format
     let mut toml = String::from("# Phase 16.6 — 4-node validator set for genesis\n");
     toml.push_str("# Stakes = MIN_VALIDATOR_STAKE = 50_000 KVNC (50_000_000_000_000 atoms)\n");
     toml.push_str("# Generated from keystores\n\n");
 
-    for (address, public_key_hex, _seed) in &validators {
-        toml.push_str("[[validators]]\n");
+    for (_address, public_key_hex, _seed) in &validators {
+        toml.push_str("[[validator]]\n");
         // Use raw public key hex (64 chars) as address - parse_address_hex expects 32-byte hex
         toml.push_str(&format!("address = \"{public_key_hex}\"\n"));
         toml.push_str("stake = 50000000000000\n");

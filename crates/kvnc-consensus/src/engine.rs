@@ -4,9 +4,9 @@
 //! Coordinates round advancement, leader selection, block production,
 //! and commit decisions using Mysticeti-style DAG consensus.
 
+use crate::metrics::{record_block_height, record_commit_latency, record_mergeset_size_metric};
 use crate::types::{CommitteeInfo, LeaderInfo, LeaderStatus};
 use crate::{committer::UniversalCommitter, is_leader_round, linearizer::Linearizer};
-use crate::metrics::{record_block_height, record_commit_latency, record_mergeset_size_metric};
 use kvnc_crypto::sign;
 use kvnc_mempool::Mempool;
 use kvnc_types::{

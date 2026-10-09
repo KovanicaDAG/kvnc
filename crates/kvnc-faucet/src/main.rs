@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use ed25519_dalek::{Signer, SigningKey};
 use kvnc_cli::wallet;
-use ed25519_dalek::{SigningKey, Signer};
-use kvnc_types::{Address, Transaction, TransactionKind, hash::Hash, PublicKey, Signature};
+use kvnc_types::{hash::Hash, Address, PublicKey, Signature, Transaction, TransactionKind};
 
 /// Faucet configuration
 #[derive(Clone)]
@@ -125,9 +125,13 @@ async fn main() -> Result<()> {
     // Load faucet keystore
     let keystore = wallet::load(std::path::Path::new(&cli.keystore))
         .with_context(|| format!("loading faucet keystore {}", cli.keystore))?;
-    let passphrase = if keystore.encrypted { Some(cli.passphrase.as_str()) } else { None };
-    let seed = wallet::secret_seed(&keystore, passphrase)
-        .with_context(|| "decrypting faucet keystore")?;
+    let passphrase = if keystore.encrypted {
+        Some(cli.passphrase.as_str())
+    } else {
+        None
+    };
+    let seed =
+        wallet::secret_seed(&keystore, passphrase).with_context(|| "decrypting faucet keystore")?;
     let signer = SigningKey::from_bytes(&seed);
     let faucet_address = Address::from_public_key(&PublicKey::from(signer.verifying_key()));
 
@@ -174,16 +178,24 @@ async fn faucet_handler(
     let ip_str = ip.ip().to_string();
 
     // Check rate limit
-    if !state.rate_limiter.check_and_record(&ip_str, state.config.rate_limit_window, state.config.max_requests_per_window) {
+    if !state.rate_limiter.check_and_record(
+        &ip_str,
+        state.config.rate_limit_window,
+        state.config.max_requests_per_window,
+    ) {
         warn!(ip = %ip_str, "rate limit exceeded");
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(FaucetResponse {
                 success: false,
-                message: format!("Rate limit exceeded. Max {} requests per {} seconds.", state.config.max_requests_per_window, state.config.rate_limit_window),
+                message: format!(
+                    "Rate limit exceeded. Max {} requests per {} seconds.",
+                    state.config.max_requests_per_window, state.config.rate_limit_window
+                ),
                 tx_hash: None,
             }),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Parse destination address
@@ -197,7 +209,8 @@ async fn faucet_handler(
                     message: format!("Invalid address: {}", e),
                     tx_hash: None,
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -210,7 +223,8 @@ async fn faucet_handler(
                 message: "Faucet cannot send to itself".to_string(),
                 tx_hash: None,
             }),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Get faucet nonce from RPC
@@ -225,7 +239,8 @@ async fn faucet_handler(
                     message: "Failed to get faucet nonce".to_string(),
                     tx_hash: None,
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -234,7 +249,10 @@ async fn faucet_handler(
         sender: state.faucet_address,
         nonce,
         fee: 1_000_000, // 0.001 KVNC fee
-        kind: TransactionKind::Transfer { to: to_address, amount: state.config.dispense_amount },
+        kind: TransactionKind::Transfer {
+            to: to_address,
+            amount: state.config.dispense_amount,
+        },
         signature: Signature([0; 64]),
         hash: Hash::zero(),
     };
@@ -251,7 +269,8 @@ async fn faucet_handler(
                     message: "Failed to sign transaction".to_string(),
                     tx_hash: None,
                 }),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -263,10 +282,14 @@ async fn faucet_handler(
                 StatusCode::OK,
                 Json(FaucetResponse {
                     success: true,
-                    message: format!("Dispensed {} KVNC", state.config.dispense_amount / 1_000_000_000),
+                    message: format!(
+                        "Dispensed {} KVNC",
+                        state.config.dispense_amount / 1_000_000_000
+                    ),
                     tx_hash: Some(tx_hash),
                 }),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
             warn!("Failed to submit transaction: {}", e);
@@ -277,7 +300,8 @@ async fn faucet_handler(
                     message: "Failed to submit transaction".to_string(),
                     tx_hash: None,
                 }),
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }
@@ -305,7 +329,9 @@ async fn get_nonce(rpc_url: &str, address: &Address) -> Result<u64> {
         "id": 1
     });
     let resp: serde_json::Value = client.post(rpc_url).json(&req).send().await?.json().await?;
-    let result = resp.get("result").and_then(|v| v.as_str())
+    let result = resp
+        .get("result")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("invalid nonce response"))?;
     let nonce = u64::from_str_radix(result.strip_prefix("0x").unwrap_or(result), 16)?;
     Ok(nonce)
@@ -329,7 +355,9 @@ async fn submit_transaction(rpc_url: &str, tx: &Transaction) -> Result<String> {
         "id": 1
     });
     let resp: serde_json::Value = client.post(rpc_url).json(&req).send().await?.json().await?;
-    let result = resp.get("result").and_then(|v| v.as_str())
+    let result = resp
+        .get("result")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("invalid tx submit response"))?;
     Ok(result.to_string())
 }

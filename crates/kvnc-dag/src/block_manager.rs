@@ -15,8 +15,8 @@ use kvnc_types::{
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::watch;
 use thiserror::Error;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// bincode is used for transaction hash verification
