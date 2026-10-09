@@ -12,9 +12,6 @@ use axum::{
     response::Response,
 };
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::num::NonZeroU32;
-use tokio::sync::RwLock as TokioRwLock;
 
 /// Rate limiter configuration
 ///
@@ -120,6 +117,7 @@ use parking_lot::Mutex;
 pub struct RateLimiterState {
     limiters: RwLock<HashMap<SocketAddr, IpRateLimiter>>,
     config: RateLimitConfig,
+    #[allow(dead_code)]
     cleanup_interval: Duration,
     last_cleanup: Mutex<Instant>,
 }
@@ -203,6 +201,7 @@ impl Default for AuthConfig {
 }
 
 /// Rate limiting middleware
+#[allow(dead_code)]
 pub async fn rate_limit_middleware(
     Extension(rate_limiter): Extension<Arc<RateLimiterState>>,
     request: Request,
@@ -219,10 +218,9 @@ pub async fn rate_limit_middleware(
         let mut response = Response::new("Rate limit exceeded".into());
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("Retry-After", seconds.to_string().parse().unwrap());
         }
         return response;
     }
@@ -231,36 +229,37 @@ pub async fn rate_limit_middleware(
 }
 
 /// Authentication middleware
+#[allow(dead_code)]
 pub async fn auth_middleware(
     Extension(auth_config): Extension<Arc<AuthConfig>>,
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Response {
-    let addr = request
-        .extensions()
-        .get::<SocketAddr>()
-        .copied()
-        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
+    let method = request
+        .uri()
+        .path()
+        .strip_prefix("/rpc")
+        .unwrap_or(request.uri().path());
 
     // Check if this is a write method
     let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
 
     if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
+        let auth_header = headers
+            .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
         let token = match auth_header {
             Some(t) => t,
             None => {
-                let mut response = Response::new("Authentication required for write operations".into());
+                let mut response =
+                    Response::new("Authentication required for write operations".into());
                 *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
+                response
+                    .headers_mut()
+                    .insert("WWW-Authenticate", "Bearer".parse().unwrap());
                 return response;
             }
         };
@@ -294,32 +293,36 @@ pub async fn combined_middleware(
         let mut response = Response::new("Rate limit exceeded".into());
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("Retry-After", seconds.to_string().parse().unwrap());
         }
         return response;
     }
 
     // Authentication for write methods
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
+    let method = request
+        .uri()
+        .path()
+        .strip_prefix("/rpc")
+        .unwrap_or(request.uri().path());
     let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
 
     if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
+        let auth_header = headers
+            .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
 
         let token = match auth_header {
             Some(t) => t,
             None => {
-                let mut response = Response::new("Authentication required for write operations".into());
+                let mut response =
+                    Response::new("Authentication required for write operations".into());
                 *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
+                response
+                    .headers_mut()
+                    .insert("WWW-Authenticate", "Bearer".parse().unwrap());
                 return response;
             }
         };

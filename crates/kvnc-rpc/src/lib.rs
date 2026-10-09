@@ -11,15 +11,13 @@ use std::sync::{
 };
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, ConnectInfo, Extension, Json},
+    extract::{ws::WebSocketUpgrade, Extension, Json},
     http::StatusCode,
-    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use kvnc_consensus::{metrics::metrics_text, CommitteeInfo};
-use kvnc_dag::DagStore;
 use kvnc_mempool::Mempool;
 use kvnc_staking::StakingState;
 use kvnc_storage::Storage;
@@ -33,13 +31,13 @@ use tracing::{info, warn};
 
 mod chain_methods;
 mod openapi;
-mod rpc_middleware;
 mod rpc_methods;
+mod rpc_middleware;
 mod subscriptions;
 pub use chain_methods::*;
 pub use openapi::{generate_openapi_spec, write_openapi_json, write_openapi_yaml};
-pub use rpc_middleware::{AuthConfig, RateLimitConfig, RateLimiterState, combined_middleware};
 pub use rpc_methods::*;
+pub use rpc_middleware::{combined_middleware, AuthConfig, RateLimitConfig, RateLimiterState};
 pub use subscriptions::{EventBus, SubscriptionKind};
 
 #[derive(Error, Debug)]

@@ -219,7 +219,12 @@ impl Mempool {
         }
 
         // 4. Reject zero-fee transactions except stake/delegate (fee-free by design).
-        if tx.fee == 0 && !matches!(tx.kind, TransactionKind::Stake { .. } | TransactionKind::Delegate { .. }) {
+        if tx.fee == 0
+            && !matches!(
+                tx.kind,
+                TransactionKind::Stake { .. } | TransactionKind::Delegate { .. }
+            )
+        {
             return Err(MempoolError::ZeroFee);
         }
 

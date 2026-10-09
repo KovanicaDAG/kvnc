@@ -14,8 +14,8 @@ mod behaviour;
 mod block_sync;
 mod error;
 mod service;
-mod sync;
 mod state_sync;
+mod sync;
 pub mod topics;
 
 pub use block_sync::{
@@ -24,10 +24,8 @@ pub use block_sync::{
 };
 pub use error::NetworkError;
 pub use service::NetworkService;
+pub use state_sync::{StateSyncCodec, StateSyncRequest, StateSyncResponse, STATE_SYNC_PROTOCOL};
 pub use sync::SyncRequest;
-pub use state_sync::{
-    StateSyncRequest, StateSyncResponse, StateSyncCodec, STATE_SYNC_PROTOCOL,
-};
 
 use kvnc_types::{block::StatementBlock, transaction::Transaction, Round, Vote};
 use std::time::Duration;
@@ -137,7 +135,8 @@ mod tests {
         assert_eq!(config.bootstrap_nodes.len(), 3);
         for node in &config.bootstrap_nodes {
             assert!(
-                node.to_string().contains("/dns4/seed") && node.to_string().contains("/tcp/8000/p2p/"),
+                node.to_string().contains("/dns4/seed")
+                    && node.to_string().contains("/tcp/8000/p2p/"),
                 "unexpected default bootstrap: {}",
                 node
             );

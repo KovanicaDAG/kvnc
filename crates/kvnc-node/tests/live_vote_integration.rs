@@ -4,12 +4,10 @@
 //! has them connect via P2P, and verifies the full consensus pipeline:
 //! block proposal → vote → commit → execution.
 
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bincode;
 use ed25519_dalek::SigningKey;
 use reqwest::Client;
 use serde_json::json;
@@ -19,12 +17,12 @@ use tokio::time::sleep;
 use tracing::info;
 
 use kvnc_crypto::{generate_keypair, sign as crypto_sign};
+use kvnc_staking::{MIN_VALIDATOR_STAKE, ONE_KVNC};
 use kvnc_types::{
     hash::Hash,
     transaction::{Transaction, TransactionKind},
     Address, PublicKey, Signature,
 };
-use kvnc_staking::{MIN_VALIDATOR_STAKE, ONE_KVNC};
 
 /// Test configuration
 const ROUND_DURATION_MS: u64 = 1000;
@@ -35,6 +33,10 @@ const NODE1_P2P: u16 = 19000;
 const NODE2_P2P: u16 = 19001;
 
 /// Node process handle with cleanup
+///
+/// Some fields are only held so they live as long as the process (e.g. the
+/// temp dir is removed on drop).
+#[allow(dead_code)]
 struct NodeProcess {
     temp_dir: TempDir,
     child: tokio::process::Child,
@@ -64,15 +66,20 @@ impl NodeProcess {
 
         // Create genesis validators file with both validators
         let genesis_validators_path = temp_dir.path().join("genesis_validators.toml");
-        let genesis_content = format!(r#"
+        let genesis_content = format!(
+            r#"
 validators = [
   {{ address = "{}", stake = {}, public_key = "{}" }},
   {{ address = "{}", stake = {}, public_key = "{}" }}
 ]
 "#,
-        hex::encode(validator_address.0), MIN_VALIDATOR_STAKE, hex::encode(public_key.0),
-        hex::encode(Address([0xaa; 32]).0), MIN_VALIDATOR_STAKE, hex::encode(PublicKey([0xaa; 32]).0)
-    );
+            hex::encode(validator_address.0),
+            MIN_VALIDATOR_STAKE,
+            hex::encode(public_key.0),
+            hex::encode(Address([0xaa; 32]).0),
+            MIN_VALIDATOR_STAKE,
+            hex::encode(PublicKey([0xaa; 32]).0)
+        );
         std::fs::write(&genesis_validators_path, genesis_content)?;
 
         // Write validator key file
@@ -94,7 +101,10 @@ validators = [
             .env("KVNC_RPC_ADDR", "0.0.0.0")
             .env("KVNC_RPC_PORT", rpc_port.to_string())
             .env("KVNC_LISTEN_ADDR", format!("0.0.0.0:{}", p2p_port))
-            .env("KVNC_DATA_DIR", temp_dir.path().to_string_lossy().to_string())
+            .env(
+                "KVNC_DATA_DIR",
+                temp_dir.path().to_string_lossy().to_string(),
+            )
             .env("KVNC_MAX_PEERS", "8")
             .env("KVNC_ROUND_DURATION_MS", ROUND_DURATION_MS.to_string())
             .env("KVNC_RUN_VALIDATOR", "true")
@@ -155,10 +165,14 @@ validators = [
     /// Get current block height
     async fn get_block_height(&self) -> Result<u64> {
         let resp = self.rpc_call("kvnc_blockNumber", json!([])).await?;
-        let hex = resp.get("result")
+        let hex = resp
+            .get("result")
             .and_then(|v| v.as_str())
             .context("Invalid blockNumber response")?;
-        Ok(u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16)?)
+        Ok(u64::from_str_radix(
+            hex.strip_prefix("0x").unwrap_or(hex),
+            16,
+        )?)
     }
 
     /// Get peer count via health endpoint
@@ -170,7 +184,8 @@ validators = [
             .await?
             .json::<serde_json::Value>()
             .await?;
-        let count = resp.get("peer_count")
+        let count = resp
+            .get("peer_count")
             .and_then(|v| v.as_u64())
             .context("Invalid health response")?;
         Ok(count)
@@ -179,8 +194,11 @@ validators = [
     /// Submit a transaction
     async fn send_transaction(&self, tx: Transaction) -> Result<String> {
         let raw = bincode::serialize(&tx)?;
-        let resp = self.rpc_call("kvnc_sendRawTransaction", json!([hex::encode(raw)])).await?;
-        let hash = resp.get("result")
+        let resp = self
+            .rpc_call("kvnc_sendRawTransaction", json!([hex::encode(raw)]))
+            .await?;
+        let hash = resp
+            .get("result")
             .and_then(|v| v.as_str())
             .context("Invalid sendRawTransaction response")?;
         Ok(hash.to_string())
@@ -226,9 +244,7 @@ fn create_transfer_tx(
 #[tokio::test]
 #[ignore]
 async fn live_two_node_vote_commit_execute() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // Create temp directories
     let dir1 = TempDir::new()?;
@@ -244,34 +260,59 @@ async fn live_two_node_vote_commit_execute() -> Result<()> {
     let treasury = addr1;
 
     // Genesis validators
-    let genesis_content = format!(r#"
+    let genesis_content = format!(
+        r#"
 validators = [
   {{ address = "{}", stake = {}, public_key = "{}" }},
   {{ address = "{}", stake = {}, public_key = "{}" }}
 ]
 "#,
-        hex::encode(addr1.0), MIN_VALIDATOR_STAKE, hex::encode(pk1.0),
-        hex::encode(addr2.0), MIN_VALIDATOR_STAKE, hex::encode(pk2.0)
+        hex::encode(addr1.0),
+        MIN_VALIDATOR_STAKE,
+        hex::encode(pk1.0),
+        hex::encode(addr2.0),
+        MIN_VALIDATOR_STAKE,
+        hex::encode(pk2.0)
     );
 
-    std::fs::write(dir1.path().join("genesis_validators.toml"), &genesis_content)?;
-    std::fs::write(dir2.path().join("genesis_validators.toml"), &genesis_content)?;
-    std::fs::write(dir1.path().join("validator.pem"), hex::encode(sk1.to_bytes()))?;
-    std::fs::write(dir2.path().join("validator.pem"), hex::encode(sk2.to_bytes()))?;
+    std::fs::write(
+        dir1.path().join("genesis_validators.toml"),
+        &genesis_content,
+    )?;
+    std::fs::write(
+        dir2.path().join("genesis_validators.toml"),
+        &genesis_content,
+    )?;
+    std::fs::write(
+        dir1.path().join("validator.pem"),
+        hex::encode(sk1.to_bytes()),
+    )?;
+    std::fs::write(
+        dir2.path().join("validator.pem"),
+        hex::encode(sk2.to_bytes()),
+    )?;
 
     // Start node 1
     let node1 = NodeProcess::start(
-        dir1, NODE1_RPC, NODE1_P2P,
+        dir1,
+        NODE1_RPC,
+        NODE1_P2P,
         vec![format!("127.0.0.1:{}", NODE2_P2P)],
-        Some(sk1), treasury,
-    ).await?;
+        Some(sk1),
+        treasury,
+    )
+    .await?;
 
     // Start node 2
     let node2 = NodeProcess::start(
-        dir2, NODE2_RPC, NODE2_P2P,
+        dir2,
+        NODE2_RPC,
+        NODE2_P2P,
         vec![format!("127.0.0.1:{}", NODE1_P2P)],
-        Some(sk2), treasury,
-    ).await?;
+        Some(sk2),
+        treasury,
+    )
+    .await?;
 
     // Wait for both nodes to be ready
     node1.wait_ready(TIMEOUT_SECS).await?;
@@ -316,7 +357,10 @@ validators = [
         sleep(Duration::from_millis(500)).await
     }
 
-    assert!(committed, "Nodes should commit identical blocks within timeout");
+    assert!(
+        committed,
+        "Nodes should commit identical blocks within timeout"
+    );
 
     // Final height check
     let h1_final = node1.get_block_height().await?;
@@ -338,9 +382,7 @@ validators = [
 #[tokio::test]
 #[ignore]
 async fn live_transaction_commit() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let dir1 = TempDir::new()?;
     let dir2 = TempDir::new()?;
@@ -351,32 +393,57 @@ async fn live_transaction_commit() -> Result<()> {
     let addr2 = Address::from_public_key(&pk2);
     let treasury = addr1;
 
-    let genesis_content = format!(r#"
+    let genesis_content = format!(
+        r#"
 validators = [
   {{ address = "{}", stake = {}, public_key = "{}" }},
   {{ address = "{}", stake = {}, public_key = "{}" }}
 ]
 "#,
-        hex::encode(addr1.0), MIN_VALIDATOR_STAKE, hex::encode(pk1.0),
-        hex::encode(addr2.0), MIN_VALIDATOR_STAKE, hex::encode(pk2.0)
+        hex::encode(addr1.0),
+        MIN_VALIDATOR_STAKE,
+        hex::encode(pk1.0),
+        hex::encode(addr2.0),
+        MIN_VALIDATOR_STAKE,
+        hex::encode(pk2.0)
     );
 
-    std::fs::write(dir1.path().join("genesis_validators.toml"), &genesis_content)?;
-    std::fs::write(dir2.path().join("genesis_validators.toml"), &genesis_content)?;
-    std::fs::write(dir1.path().join("validator.pem"), hex::encode(sk1.to_bytes()))?;
-    std::fs::write(dir2.path().join("validator.pem"), hex::encode(sk2.to_bytes()))?;
+    std::fs::write(
+        dir1.path().join("genesis_validators.toml"),
+        &genesis_content,
+    )?;
+    std::fs::write(
+        dir2.path().join("genesis_validators.toml"),
+        &genesis_content,
+    )?;
+    std::fs::write(
+        dir1.path().join("validator.pem"),
+        hex::encode(sk1.to_bytes()),
+    )?;
+    std::fs::write(
+        dir2.path().join("validator.pem"),
+        hex::encode(sk2.to_bytes()),
+    )?;
 
     let node1 = NodeProcess::start(
-        dir1, NODE1_RPC, NODE1_P2P,
+        dir1,
+        NODE1_RPC,
+        NODE1_P2P,
         vec![format!("127.0.0.1:{}", NODE2_P2P)],
-        Some(sk1.clone()), treasury,
-    ).await?;
+        Some(sk1.clone()),
+        treasury,
+    )
+    .await?;
 
     let node2 = NodeProcess::start(
-        dir2, NODE2_RPC, NODE2_P2P,
+        dir2,
+        NODE2_RPC,
+        NODE2_P2P,
         vec![format!("127.0.0.1:{}", NODE1_P2P)],
-        Some(sk2), treasury,
-    ).await?;
+        Some(sk2),
+        treasury,
+    )
+    .await?;
 
     node1.wait_ready(TIMEOUT_SECS).await?;
     node2.wait_ready(TIMEOUT_SECS).await?;
