@@ -22,6 +22,7 @@ kvnc-dag = { path = "../kvnc-dag" }
 axum = { workspace = true, features = ["ws"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 tokio = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }

@@ -32,10 +32,12 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 mod chain_methods;
+mod openapi;
 mod rpc_middleware;
 mod rpc_methods;
 mod subscriptions;
 pub use chain_methods::*;
+pub use openapi::{generate_openapi_spec, write_openapi_json, write_openapi_yaml};
 pub use rpc_middleware::{AuthConfig, RateLimitConfig, RateLimiterState, combined_middleware};
 pub use rpc_methods::*;
 pub use subscriptions::{EventBus, SubscriptionKind};

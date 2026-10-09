@@ -343,7 +343,7 @@
 ## PHASE 22: SDKs & Integrations
 
 - [x] TypeScript API client — `packages/api-client/src/index.ts:1-94` — `KvncRpcClient` with 9 methods.
-- [ ] OpenAPI/JSON schema — no `openapi.json` or schema file found.
+- [x] OpenAPI/JSON schema — `openapi.rs` generates OpenAPI 3.1 spec with oneOf discriminator for all 22 RPC methods; `write_openapi_json`/`write_openapi_yaml` helpers (`rpc/src/openapi.rs`).
 - [ ] Contract SDK (Rust+TS) — no contract SDK crate or TS package.
 - [x] Dev faucet CLI — `faucet/src/main.rs:1-335` — rate-limited (3/hr), dispenses 10 KVNC.
 - [ ] Indexer service skeleton — no indexer crate or service.
