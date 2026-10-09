@@ -336,7 +336,7 @@
 - [x] Prometheus metrics (/metrics on 4 nodes) — `consensus/src/metrics.rs`; `docker-compose.yml` exposes RPC ports.
 - [x] Grafana dashboards (`ops/grafana/kvnc-overview.json` 11 panels) — **11 panels confirmed** (`grafana/kvnc-overview.json:1-395`).
 - [x] alerting (`ops/prometheus/alerts.yml` 11 rules) — **11 rules confirmed** (`prometheus/alerts.yml:1-110`).
-- [ ] structured logging + trace_id per round — standard `tracing` only; no `trace_id` in logging.
+- [x] structured logging + trace_id per round — JSON structured logging with `tracing_subscriber` json layer; `round_trace` module provides `trace_id` per round/block/vote/tx/execution spans (`node/src/main.rs:283-340`).
 
 ---
 

@@ -263,10 +263,92 @@ struct GenesisValidatorInput {
 
 /// Install the tracing subscriber, honouring `RUST_LOG` when set.
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let json_layer = fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(json_layer)
+        .init();
+}
+
+/// Round tracing utilities for structured logging with trace_id per round.
+pub mod round_trace {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::{span, Level};
+
+    /// Global counter for generating unique trace IDs.
+    static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Generate a new trace ID for a round.
+    pub fn new_trace_id(round: u64) -> String {
+        let counter = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("round-{:010}-{:06}", round, counter)
+    }
+
+    /// Create a tracing span for a round with trace_id.
+    pub fn round_span(round: u64) -> tracing::Span {
+        let trace_id = new_trace_id(round);
+        span!(Level::INFO, "round", round = round, trace_id = %trace_id)
+    }
+
+    /// Create a tracing span for block processing with trace_id.
+    pub fn block_span(round: u64, block_hash: &str, author: &str) -> tracing::Span {
+        let trace_id = new_trace_id(round);
+        span!(
+            Level::INFO,
+            "block",
+            round = round,
+            trace_id = %trace_id,
+            block_hash = %block_hash,
+            author = %author
+        )
+    }
+
+    /// Create a tracing span for vote processing with trace_id.
+    pub fn vote_span(round: u64, leader_round: u64, voter: &str) -> tracing::Span {
+        let trace_id = new_trace_id(round);
+        span!(
+            Level::INFO,
+            "vote",
+            round = round,
+            trace_id = %trace_id,
+            leader_round = leader_round,
+            voter = %voter
+        )
+    }
+
+    /// Create a tracing span for transaction processing with trace_id.
+    pub fn tx_span(round: u64, tx_hash: &str) -> tracing::Span {
+        let trace_id = new_trace_id(round);
+        span!(
+            Level::INFO,
+            "transaction",
+            round = round,
+            trace_id = %trace_id,
+            tx_hash = %tx_hash
+        )
+    }
+
+    /// Create a tracing span for execution with trace_id.
+    pub fn execution_span(round: u64, tx_count: usize) -> tracing::Span {
+        let trace_id = new_trace_id(round);
+        span!(
+            Level::INFO,
+            "execution",
+            round = round,
+            trace_id = %trace_id,
+            tx_count = tx_count
+        )
+    }
 }
 
 /// A future that resolves when the process receives SIGINT or SIGTERM.
