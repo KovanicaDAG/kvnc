@@ -186,6 +186,23 @@ impl ExecutionContext {
         storage: &Storage,
         commit: impl FnOnce(WriteTransaction) -> Result<(), ExecutionError>,
     ) -> Result<ExecutionResult, ExecutionError> {
+        // Transactions mutate `self.staking` in place. If anything fails
+        // before the storage transaction commits, the in-memory staking state
+        // must return to exactly what is persisted, so snapshot it here.
+        let pre_subdag_staking = snapshot_staking(&self.staking);
+        let result = self.execute_committed_subdag_inner(subdag, storage, commit);
+        if result.is_err() {
+            self.staking = pre_subdag_staking;
+        }
+        result
+    }
+
+    fn execute_committed_subdag_inner(
+        &mut self,
+        subdag: &CommittedSubDag,
+        storage: &Storage,
+        commit: impl FnOnce(WriteTransaction) -> Result<(), ExecutionError>,
+    ) -> Result<ExecutionResult, ExecutionError> {
         // 1. Check idempotency first (before any execution)
         let mut txn = storage.begin_write()?;
         {
@@ -222,15 +239,7 @@ impl ExecutionContext {
         // 3. Pay the mining reward to the leader of this sub-DAG.
         // Perform the transition on a candidate state. The live in-memory state
         // is published only after all related storage writes commit successfully.
-        let mut candidate_staking = StakingState {
-            validators: self.staking.validators.clone(),
-            delegations: self.staking.delegations.clone(),
-            total_staked: self.staking.total_staked,
-            committed_leader_height: self.staking.committed_leader_height,
-            total_mining_issued: self.staking.total_mining_issued,
-            treasury: self.staking.treasury.clone(),
-            unbonding_queue: self.staking.unbonding_queue.clone(),
-        };
+        let mut candidate_staking = snapshot_staking(&self.staking);
         let reward = candidate_staking.on_leader_committed(subdag.leader_author)?;
         storage
             .state()
@@ -358,6 +367,18 @@ impl ExecutionContext {
             table.insert(sender_key, sender_account.to_bytes()?)?;
         }
 
+        // ---- Per-transaction savepoint -------------------------------------
+        //
+        // Fee and nonce are CHARGED even if the body fails (they were written
+        // above): this pays for inclusion and prevents replaying the same
+        // signed transaction. Everything the body does is rolled back on
+        // failure: the staking state is restored from a snapshot and every
+        // storage row the body may write is restored from its pre-image.
+        // (redb cannot take a savepoint inside a dirty write transaction, so
+        // the savepoint is an explicit undo journal.)
+        let staking_savepoint = snapshot_staking(&self.staking);
+        let undo = AccountUndo::capture(txn, &touched_accounts(tx))?;
+
         // Execute based on transaction kind
         let result = match &tx.kind {
             TransactionKind::Transfer { to, amount } => {
@@ -397,7 +418,11 @@ impl ExecutionContext {
 
         let (success, gas_used, error, events) = match result {
             Ok(events) => (true, 0, None, events),
-            Err(e) => (false, 0, Some(e.to_string()), Vec::new()),
+            Err(e) => {
+                self.staking = staking_savepoint;
+                undo.restore(txn)?;
+                (false, 0, Some(e.to_string()), Vec::new())
+            }
         };
 
         // For successful calls that used gas (WASM), we'd track gas_used here
@@ -609,13 +634,7 @@ impl ExecutionContext {
                 "Insufficient balance for delegate".to_string(),
             ));
         }
-        sender_account.balance = sender_account.balance.saturating_sub(amount);
-        {
-            let mut table = txn.open_table(tables::ACCOUNTS)?;
-            table.insert(from_key, sender_account.to_bytes()?)?;
-        }
-
-        // Verify validator exists and is active
+        // Verify validator exists and is active BEFORE any write.
         let v_idx = self
             .staking
             .validators
@@ -624,6 +643,12 @@ impl ExecutionContext {
             .ok_or(ExecutionError::Validation(
                 "Validator not found or inactive".to_string(),
             ))?;
+
+        sender_account.balance = sender_account.balance.saturating_sub(amount);
+        {
+            let mut table = txn.open_table(tables::ACCOUNTS)?;
+            table.insert(from_key, sender_account.to_bytes()?)?;
+        }
 
         // Update validator stake
         self.staking.validators[v_idx].stake =
@@ -650,13 +675,13 @@ impl ExecutionContext {
     /// Execute a claim-rewards transaction (claim delegation rewards).
     fn execute_claim_rewards(
         &mut self,
-        txn: &mut WriteTransaction,
+        _txn: &mut WriteTransaction,
         _storage: &Storage,
         from: &Address,
         validator: Option<Address>,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
         // Collect rewards for the delegator
-        let mut total_claimed = 0u64;
+        let total_claimed = 0u64;
         let mut events = Vec::new();
 
         if let Some(validator_addr) = validator {
@@ -825,6 +850,69 @@ impl ExecutionContext {
         );
 
         Ok(claimed)
+    }
+}
+
+/// Field-by-field copy of the staking state (it does not derive `Clone`).
+fn snapshot_staking(s: &StakingState) -> StakingState {
+    StakingState {
+        validators: s.validators.clone(),
+        delegations: s.delegations.clone(),
+        total_staked: s.total_staked,
+        committed_leader_height: s.committed_leader_height,
+        total_mining_issued: s.total_mining_issued,
+        treasury: s.treasury.clone(),
+        unbonding_queue: s.unbonding_queue.clone(),
+    }
+}
+
+/// Every `ACCOUNTS` row a transaction body can write (sender, plus the
+/// transfer recipient / deployed contract address).
+fn touched_accounts(tx: &Transaction) -> Vec<[u8; 32]> {
+    let mut keys = vec![address_to_bytes(&tx.sender)];
+    match &tx.kind {
+        TransactionKind::Transfer { to, .. } => keys.push(address_to_bytes(to)),
+        TransactionKind::Deploy { .. } => {
+            // Contract address derivation mirrors `execute_deploy`; the nonce
+            // has already been incremented when the body runs.
+            let mut b = Vec::with_capacity(40);
+            b.extend_from_slice(&tx.sender.0);
+            b.extend_from_slice(&tx.nonce.saturating_add(1).to_le_bytes());
+            keys.push(address_to_bytes(&Address(kvnc_common::hash(&b))));
+        }
+        _ => {}
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// Pre-images of account rows, restored when a transaction body fails.
+struct AccountUndo(Vec<([u8; 32], Option<Vec<u8>>)>);
+
+impl AccountUndo {
+    fn capture(txn: &WriteTransaction, keys: &[[u8; 32]]) -> Result<Self, ExecutionError> {
+        let table = txn.open_table(tables::ACCOUNTS)?;
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            rows.push((*key, table.get(*key)?.map(|v| v.value())));
+        }
+        Ok(Self(rows))
+    }
+
+    fn restore(self, txn: &WriteTransaction) -> Result<(), ExecutionError> {
+        let mut table = txn.open_table(tables::ACCOUNTS)?;
+        for (key, pre) in self.0 {
+            match pre {
+                Some(bytes) => {
+                    table.insert(key, bytes)?;
+                }
+                None => {
+                    table.remove(key)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1650,5 +1738,156 @@ mod tests {
         assert_eq!(read_balance(&storage, &sender), initial - amount - fee);
         assert_eq!(read_balance(&storage, &recipient), amount);
         assert_eq!(read_nonce(&storage, &sender), 1);
+    }
+
+    fn delegate_tx(key: &SigningKey, validator: Address, amount: u64, nonce: u64) -> Transaction {
+        signed_tx(
+            key,
+            TransactionKind::Delegate { validator, amount },
+            nonce,
+            1000,
+        )
+    }
+
+    // Rollback: delegating to a nonexistent validator charges only fee+nonce,
+    // leaves staking untouched and yields an honest failed receipt.
+    #[test]
+    fn failed_delegate_rolls_back_except_fee_and_nonce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let fee = 1000;
+        let mut ctx = setup_funded_sender(&storage, &sender, initial);
+        let staked_before = ctx.staking.total_staked;
+        let delegations_before = ctx.staking.delegations.len();
+
+        let tx = delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KVNC, 0);
+        let result = execute_single_tx(&mut ctx, &storage, tx);
+        let receipt = &result.receipts[0];
+        assert!(!receipt.success, "receipt must report failure");
+        assert!(receipt
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Validator not found"));
+        assert!(receipt.events.is_empty());
+        assert_eq!(
+            read_balance(&storage, &sender),
+            initial - fee,
+            "only the fee"
+        );
+        assert_eq!(read_nonce(&storage, &sender), 1, "nonce consumed");
+        assert_eq!(ctx.staking.total_staked, staked_before);
+        assert_eq!(ctx.staking.delegations.len(), delegations_before);
+    }
+
+    // A failed tx in the middle of a sub-DAG does not affect its neighbours.
+    #[test]
+    fn failed_tx_mid_subdag_does_not_affect_neighbours() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let recipient = Address([2u8; 32]);
+        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let amount = 10 * kvnc_staking::ONE_KVNC;
+        let fee = 1000;
+        let mut ctx = setup_funded_sender(&storage, &sender, initial);
+
+        let txs = vec![
+            create_transfer_tx(&key, &recipient, amount, 0, fee),
+            delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KVNC, 1),
+            create_transfer_tx(&key, &recipient, amount, 2, fee),
+        ];
+        let subdag = CommittedSubDag {
+            leader: sample_block(0),
+            blocks: vec![sample_block_with_txs(0, txs)],
+            leader_round: 1,
+            leader_author: 0,
+        };
+        let result = ctx
+            .execute_committed_subdag(&subdag, &storage)
+            .expect("execute");
+        let ok: Vec<bool> = result.receipts.iter().map(|r| r.success).collect();
+        assert_eq!(ok, vec![true, false, true]);
+        assert_eq!(read_balance(&storage, &recipient), 2 * amount);
+        assert_eq!(
+            read_balance(&storage, &sender),
+            initial - 2 * amount - 3 * fee
+        );
+        assert_eq!(read_nonce(&storage, &sender), 3);
+    }
+
+    // Tx-level staking writes must not leak into memory when the sub-DAG's
+    // storage commit fails.
+    #[test]
+    fn failed_subdag_commit_rolls_back_tx_staking_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let mut ctx = setup_funded_sender(&storage, &sender, 1000 * kvnc_staking::ONE_KVNC);
+        let before = staking_state_bytes(&ctx.staking);
+        let tx = signed_tx(
+            &key,
+            TransactionKind::Stake {
+                amount: 5 * kvnc_staking::ONE_KVNC,
+            },
+            0,
+            1000,
+        );
+        let subdag = CommittedSubDag {
+            leader: sample_block(0),
+            blocks: vec![sample_block_with_txs(0, vec![tx])],
+            leader_round: 1,
+            leader_author: 0,
+        };
+        ctx.execute_committed_subdag_with_commit(&subdag, &storage, |_| {
+            Err(ExecutionError::Other("injected commit failure".into()))
+        })
+        .expect_err("injected failure");
+        assert_eq!(staking_state_bytes(&ctx.staking), before);
+    }
+
+    // Deterministic replay with successful and failed txs interleaved.
+    #[test]
+    fn replay_with_failed_txs_is_deterministic() {
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let recipient = Address([2u8; 32]);
+        let run = || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("r.redb")).expect("storage");
+            let mut ctx = setup_funded_sender(&storage, &sender, 1000 * kvnc_staking::ONE_KVNC);
+            let txs = vec![
+                create_transfer_tx(&key, &recipient, kvnc_staking::ONE_KVNC, 0, 1000),
+                delegate_tx(&key, Address([0xEE; 32]), kvnc_staking::ONE_KVNC, 1),
+                delegate_tx(&key, Address([3u8; 32]), kvnc_staking::ONE_KVNC, 2),
+                create_transfer_tx(&key, &recipient, u64::MAX / 2, 3, 1000),
+            ];
+            let subdag = CommittedSubDag {
+                leader: sample_block(0),
+                blocks: vec![sample_block_with_txs(0, txs)],
+                leader_round: 1,
+                leader_author: 0,
+            };
+            let r = ctx
+                .execute_committed_subdag(&subdag, &storage)
+                .expect("execute");
+            (
+                bincode::serialize(&r.receipts).expect("receipts"),
+                staking_state_bytes(&ctx.staking),
+                read_balance(&storage, &sender),
+                read_balance(&storage, &recipient),
+                read_nonce(&storage, &sender),
+                r.receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+            )
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a.5, vec![true, false, true, false]);
+        assert_eq!(a, b);
     }
 }
