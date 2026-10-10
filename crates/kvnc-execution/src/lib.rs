@@ -105,9 +105,11 @@ pub struct StartupSyncState {
 }
 
 impl StartupSyncState {
-    /// Execute only if `!network_ahead && (!store_was_empty || is_genesis_subdag)`.
+    /// Execute only if `is_genesis_subdag || (!network_ahead && !store_was_empty)`.
+    /// A genesis sub-DAG is always allowed (even with `network_ahead`); on a
+    /// store that already executed it, restart replay makes it a no-op.
     pub fn allows(&self, is_genesis_subdag: bool) -> bool {
-        !self.network_ahead && (!self.store_was_empty || is_genesis_subdag)
+        is_genesis_subdag || (!self.network_ahead && !self.store_was_empty)
     }
 }
 
@@ -3022,7 +3024,7 @@ mod tests {
             for store_was_empty in [false, true] {
                 for network_ahead in [false, true] {
                     for is_genesis in [false, true] {
-                        let expected = !network_ahead && (!store_was_empty || is_genesis);
+                        let expected = is_genesis || (!network_ahead && !store_was_empty);
                         let startup = StartupSyncState {
                             store_was_empty,
                             network_ahead,
@@ -3055,6 +3057,33 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[test]
+        fn genesis_subdag_on_populated_store_is_idempotent_noop() {
+            let (_d, storage, mut ctx) = genesis_storage();
+            let fresh = StartupSyncState {
+                store_was_empty: true,
+                network_ahead: false,
+            };
+            ctx.execute_committed_subdag_gated(&subdag(1), &storage, &fresh, true)
+                .expect("genesis");
+            let balance = read_balance(&storage, &PAYOUT);
+            let staking = persisted_staking(&storage);
+            for network_ahead in [false, true] {
+                let populated = StartupSyncState {
+                    store_was_empty: false,
+                    network_ahead,
+                };
+                let r = ctx
+                    .execute_committed_subdag_gated(&subdag(1), &storage, &populated, true)
+                    .expect("genesis always allowed");
+                assert!(r.reward.is_none() && r.receipts.is_empty(), "no-op");
+            }
+            assert_eq!(read_balance(&storage, &PAYOUT), balance);
+            assert_eq!(persisted_staking(&storage), staking);
+            assert_eq!(count(&storage, EXECUTED_SUBDAGS), 1);
+            assert_eq!(count(&storage, TX_RECEIPTS), 1);
         }
 
         #[test]
