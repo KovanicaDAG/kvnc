@@ -41,6 +41,15 @@ pub fn non_blue_refs(
         .collect();
     refs.sort_by_key(|r| (r.round, r.digest.0));
     refs.dedup_by(|a, b| a.digest == b.digest);
+    // The canonical genesis block is never red: it is an ancestor of every
+    // block, so GHOSTDAG always colours it blue. State sync relies on it being
+    // in `CommittedSubDag::blocks` (see `is_genesis_subdag`).
+    debug_assert!(
+        !refs
+            .iter()
+            .any(|r| crate::genesis::is_canonical_genesis(r.round, &r.digest)),
+        "canonical genesis block must never be in non_blue"
+    );
     refs
 }
 

@@ -92,10 +92,21 @@ fn subdag_with(blocks: Vec<StatementBlock>, non_blue: Vec<BlockReference>) -> Co
 }
 
 #[test]
-fn genesis_only_in_non_blue_counts() {
+fn genesis_only_in_non_blue_does_not_count() {
+    // Execution only executes `blocks`; non_blue is ignored.
     let g = canonical_genesis();
     let s = subdag_with(vec![make_block(1, 1, vec![], "b1")], vec![block_ref(&g)]);
-    assert!(is_genesis_subdag(&s));
+    assert!(!is_genesis_subdag(&s));
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "canonical genesis block must never be in non_blue")]
+fn non_blue_refs_debug_asserts_genesis_is_never_red() {
+    // Constructed case: genesis handed in as not blue.
+    let g = canonical_genesis();
+    let leader = make_block(3, 3, vec![block_ref(&g)], "leader");
+    let _ = kvnc_consensus::non_blue_refs(&[g, leader.clone()], &[leader.digest], &leader.digest);
 }
 
 #[test]

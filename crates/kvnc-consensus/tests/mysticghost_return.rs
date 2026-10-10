@@ -334,3 +334,39 @@ fn no_redelivery_after_mysticghost_commit_and_round_pruning() {
         "round pruning ran during the test"
     );
 }
+
+#[test]
+fn real_mysticghost_commit_puts_canonical_genesis_in_blocks() {
+    // Wide wave under the canonical genesis: some round-1 blocks are red,
+    // genesis is blue (executed) and the sub-DAG is the genesis sub-DAG.
+    let dir = tempfile::tempdir().unwrap();
+    let dag = store(&dir);
+    let g = StatementBlock {
+        merkle_root: Default::default(),
+        author: 0,
+        round: 0,
+        parents: Vec::new(),
+        transactions: Vec::new(),
+        statements: Vec::new(),
+        signature: Signature([0; 64]),
+        digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+    };
+    dag.put_block(&g).unwrap();
+    let mut wide = Vec::new();
+    for i in 0..6u16 {
+        let b = make_block(i % 4, 1, vec![block_ref(&g)], &format!("gw{i}"));
+        dag.put_block(&b).unwrap();
+        wide.push(block_ref(&b));
+    }
+    let leader = make_block(3, 3, wide, "g-leader-3");
+    dag.put_block(&leader).unwrap();
+    let c = UniversalCommitter::new(committee(4), true, 100);
+    let s = commit(&c, &dag, 3, &leader);
+    assert!(!s.non_blue.is_empty(), "wide wave has red blocks");
+    assert!(
+        s.blocks.iter().any(|b| b.digest == g.digest),
+        "canonical genesis is executed (in blocks)"
+    );
+    assert!(s.non_blue.iter().all(|r| r.digest != g.digest));
+    assert!(kvnc_consensus::is_genesis_subdag(&s));
+}
