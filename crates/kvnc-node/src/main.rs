@@ -485,6 +485,8 @@ where
     // loop so broadcast commands never re-enter `start` or rebuild listeners.
     // Votes and blocks are authenticated against the committee at the network
     // edge before they are forwarded or handed to consensus.
+    // Vote signatures are checked through the injected VoteVerifier.
+    network.set_vote_verifier(Arc::new(kvnc_network::Ed25519VoteVerifier));
     network.set_authority_keys(
         committee
             .authorities()
