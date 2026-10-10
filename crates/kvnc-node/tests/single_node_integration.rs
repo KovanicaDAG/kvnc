@@ -38,6 +38,7 @@ fn engine_config(use_mysticghost: bool) -> ConsensusConfig {
         use_mysticghost,
         prune_window_waves: 100,
         leader_timeout_ms: 3000,
+        late_vote_window_rounds: kvnc_types::WAVE_LENGTH,
     }
 }
 
