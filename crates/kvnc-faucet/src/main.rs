@@ -38,6 +38,9 @@ struct FaucetConfig {
     keystore_path: String,
     /// Faucet keystore passphrase
     passphrase: String,
+    /// Network signing context (signature format v1): every dispensed
+    /// transaction commits to this `chain_id`.
+    signing_ctx: kvnc_types::SigningContext,
 }
 
 /// Rate limiter state
@@ -106,6 +109,10 @@ struct Cli {
     /// Max requests per window per IP
     #[arg(long, default_value = "3")]
     max_requests: usize,
+    /// Network chain_id committed to by every transaction signature
+    /// (1 mainnet, 2 testnet, 3 devnet, 1337 local). No default on purpose.
+    #[arg(long)]
+    chain_id: u64,
     /// Node RPC URL
     #[arg(long, default_value = "http://127.0.0.1:8545")]
     rpc_url: String,
@@ -121,6 +128,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if !kvnc_types::signing::chain_id::is_registered(cli.chain_id) {
+        anyhow::bail!(
+            "unknown chain id {}: expected 1 (mainnet), 2 (testnet), 3 (devnet) or 1337 (local)",
+            cli.chain_id
+        );
+    }
 
     // Load faucet keystore
     let keystore = wallet::load(std::path::Path::new(&cli.keystore))
@@ -144,6 +157,7 @@ async fn main() -> Result<()> {
         rpc_url: cli.rpc_url.clone(),
         keystore_path: cli.keystore,
         passphrase: cli.passphrase,
+        signing_ctx: kvnc_types::SigningContext::new(cli.chain_id),
     };
 
     let state = Arc::new(FaucetState {
@@ -258,7 +272,7 @@ async fn faucet_handler(
     };
 
     // Sign transaction
-    let signed_tx = match sign_transaction(tx, &state.signer) {
+    let signed_tx = match sign_transaction(tx, &state.signer, &state.config.signing_ctx) {
         Ok(tx) => tx,
         Err(e) => {
             warn!("Failed to sign transaction: {}", e);
@@ -337,11 +351,15 @@ async fn get_nonce(rpc_url: &str, address: &Address) -> Result<u64> {
     Ok(nonce)
 }
 
-fn sign_transaction(mut tx: Transaction, signer: &SigningKey) -> Result<Transaction> {
-    let msg = tx.signing_hash();
+fn sign_transaction(
+    mut tx: Transaction,
+    signer: &SigningKey,
+    ctx: &kvnc_types::SigningContext,
+) -> Result<Transaction> {
+    let msg = tx.signing_hash(ctx);
     let sig = signer.sign(&msg.0);
     tx.signature = Signature(sig.to_bytes());
-    tx.hash = msg; // signing_hash already computes the domain-separated hash
+    tx.hash = msg; // signing_hash(ctx) is the v1 domain- and chain-separated hash
     Ok(tx)
 }
 

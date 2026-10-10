@@ -7,6 +7,7 @@ use ed25519_dalek::{verify_batch as dalek_verify_batch, Signature as DalekSignat
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use kvnc_types::crypto::{PublicKey, Signature};
 use kvnc_types::hash::Hash;
+use kvnc_types::SigningContext;
 use rand::rngs::OsRng;
 use thiserror::Error;
 
@@ -90,25 +91,29 @@ pub enum SigError {
     VerificationFailed,
 }
 
-/// Verify a consensus vote signature.
+/// Verify a consensus vote signature (signature format **v1**).
 ///
-/// API contract (owned by Exec-Foundation):
-/// - The message is exactly [`Vote::signature_data`](kvnc_types::Vote::signature_data),
-///   the canonical vote encoding (`leader_round` u64 LE || `leader_hash`,
-///   40 bytes). The same bytes must be passed to [`sign`] by the producer.
+/// API contract (owned by Exec-Foundation, spec `docs/SIGNATURE_FORMAT.md` §1):
+/// - The message is exactly [`Vote::signature_data(ctx)`](kvnc_types::Vote::signature_data):
+///   the 74-byte v1 encoding with domain tag `KUNA/vote/v1`, `chain_id`,
+///   `epoch`, `voter`, `leader_round` and `leader_hash`. The producer passes the
+///   same bytes to [`sign`].
+/// - `ctx` MUST be built by the verifier from its **own** configured
+///   `chain_id` and its current committee epoch, never from a network message.
+/// - `pubkey` MUST be `committee[epoch][vote.voter]`; the caller maps the
+///   index to the key. `voter` is covered by the signature, so a signature
+///   cannot be moved to another committee slot.
 /// - `vote.signature` is checked with Ed25519 **strict** verification
 ///   (`VerifyingKey::verify_strict`): rejects non-canonical `S`, and weak /
 ///   small-order public keys. Signatures produced by [`sign`] always pass.
-/// - The caller is responsible for mapping `vote.voter` to the right
-///   committee `pubkey`; `voter` is *not* covered by the signature in the
-///   current (provisional) format.
-///
-/// The vote byte format is **provisional** pending the format agreement led
-/// by Main; this function will follow `Vote::signature_data` if that changes.
-pub fn verify_vote_signature(vote: &kvnc_types::Vote, pubkey: &PublicKey) -> Result<(), SigError> {
+pub fn verify_vote_signature(
+    ctx: &SigningContext,
+    vote: &kvnc_types::Vote,
+    pubkey: &PublicKey,
+) -> Result<(), SigError> {
     let vk = VerifyingKey::from_bytes(&pubkey.0).map_err(|_| SigError::InvalidPublicKey)?;
     let sig = DalekSignature::from_bytes(&vote.signature.0);
-    vk.verify_strict(&vote.signature_data(), &sig)
+    vk.verify_strict(&vote.signature_data(ctx), &sig)
         .map_err(|_| SigError::VerificationFailed)
 }
 
@@ -205,6 +210,11 @@ mod vote_sig_tests {
     use kvnc_types::hash::Hash;
     use kvnc_types::Vote;
 
+    const CTX: SigningContext = SigningContext {
+        chain_id: 2,
+        epoch: 7,
+    };
+
     fn signed_vote(sk: &SigningKey) -> Vote {
         let mut vote = Vote {
             leader_round: 42,
@@ -212,7 +222,7 @@ mod vote_sig_tests {
             voter: 3,
             signature: Signature([0u8; 64]),
         };
-        vote.signature = sign(sk, &vote.signature_data());
+        vote.signature = sign(sk, &vote.signature_data(&CTX));
         vote
     }
 
@@ -220,7 +230,7 @@ mod vote_sig_tests {
     fn valid_vote_signature_ok() {
         let (sk, pk) = generate_keypair();
         let vote = signed_vote(&sk);
-        assert_eq!(verify_vote_signature(&vote, &pk), Ok(()));
+        assert_eq!(verify_vote_signature(&CTX, &vote, &pk), Ok(()));
     }
 
     #[test]
@@ -229,7 +239,7 @@ mod vote_sig_tests {
         let mut vote = signed_vote(&sk);
         vote.leader_round += 1;
         assert_eq!(
-            verify_vote_signature(&vote, &pk),
+            verify_vote_signature(&CTX, &vote, &pk),
             Err(SigError::VerificationFailed)
         );
     }
@@ -240,7 +250,7 @@ mod vote_sig_tests {
         let mut vote = signed_vote(&sk);
         vote.leader_hash.0[0] ^= 0x01;
         assert_eq!(
-            verify_vote_signature(&vote, &pk),
+            verify_vote_signature(&CTX, &vote, &pk),
             Err(SigError::VerificationFailed)
         );
     }
@@ -251,7 +261,7 @@ mod vote_sig_tests {
         let mut vote = signed_vote(&sk);
         vote.signature.0[10] ^= 0x01;
         assert_eq!(
-            verify_vote_signature(&vote, &pk),
+            verify_vote_signature(&CTX, &vote, &pk),
             Err(SigError::VerificationFailed)
         );
     }
@@ -262,7 +272,7 @@ mod vote_sig_tests {
         let (_other_sk, other_pk) = generate_keypair();
         let vote = signed_vote(&sk);
         assert_eq!(
-            verify_vote_signature(&vote, &other_pk),
+            verify_vote_signature(&CTX, &vote, &other_pk),
             Err(SigError::VerificationFailed)
         );
     }
@@ -274,7 +284,7 @@ mod vote_sig_tests {
         // y = 2 does not decompress to a curve point.
         let mut bad = [0u8; 32];
         bad[0] = 2;
-        let res = verify_vote_signature(&vote, &PublicKey(bad));
+        let res = verify_vote_signature(&CTX, &vote, &PublicKey(bad));
         assert!(
             matches!(
                 res,
@@ -295,6 +305,71 @@ mod vote_sig_tests {
             voter: 0,
             signature: Signature([0u8; 64]),
         };
-        assert!(verify_vote_signature(&vote, &PublicKey(identity)).is_err());
+        assert!(verify_vote_signature(&CTX, &vote, &PublicKey(identity)).is_err());
+    }
+
+    #[test]
+    fn wrong_chain_id_fails() {
+        let (sk, pk) = generate_keypair();
+        let vote = signed_vote(&sk);
+        let other = SigningContext { chain_id: 1, ..CTX };
+        assert_eq!(
+            verify_vote_signature(&other, &vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn wrong_epoch_fails() {
+        let (sk, pk) = generate_keypair();
+        let vote = signed_vote(&sk);
+        let other = CTX.with_epoch(8);
+        assert_eq!(
+            verify_vote_signature(&other, &vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn reassigned_voter_index_fails() {
+        let (sk, pk) = generate_keypair();
+        let mut vote = signed_vote(&sk);
+        vote.voter = 4;
+        assert_eq!(
+            verify_vote_signature(&CTX, &vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    /// Golden vector V1 from `docs/SIGNATURE_FORMAT.md` §4 (deterministic
+    /// Ed25519 signature by the spec key, seed `07` x 32).
+    #[test]
+    fn spec_vector_v1_verifies_and_reproduces() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk = PublicKey(sk.verifying_key().to_bytes());
+        let mut vote = Vote {
+            leader_round: 42,
+            leader_hash: Hash([0x11; 32]),
+            voter: 3,
+            signature: Signature([0u8; 64]),
+        };
+        vote.signature = sign(&sk, &vote.signature_data(&CTX));
+        assert_eq!(
+            hex::encode(vote.signature.0),
+            "04edabde7c75345b9c4e12a793b2a4f05948c6edb5cbd197056fd68ef87d2a4c5311ff5df6eb6322c8fc229097079410873af37dceb4b43af66722005415a70b"
+        );
+        assert_eq!(verify_vote_signature(&CTX, &vote, &pk), Ok(()));
+    }
+
+    /// A transaction signature must never verify as a vote signature (and the
+    /// vote tag differs from the tx tag, so the reverse also holds).
+    #[test]
+    fn vote_sig_over_other_domain_fails() {
+        let (sk, pk) = generate_keypair();
+        let mut vote = signed_vote(&sk);
+        let mut tx_like = kvnc_types::signing::TX_DOMAIN_TAG.to_vec();
+        tx_like.extend_from_slice(&vote.signature_data(&CTX)[16..]);
+        vote.signature = sign(&sk, &tx_like);
+        assert!(verify_vote_signature(&CTX, &vote, &pk).is_err());
     }
 }
