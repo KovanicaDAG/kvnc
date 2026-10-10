@@ -683,6 +683,25 @@ impl StakingState {
     }
 }
 
+// ============================================================
+// Staking lifecycle skeleton (AGENTS.md B — bond/unbond/commission)
+// ============================================================
+/// Bond stake to become / remain an active validator (skeleton — needs storage integration).
+pub fn bond_validator(_address: Address, _amount: u64) -> Result<(), &'static str> {
+    // TODO: verify >= MIN_VALIDATOR_STAKE, update StakingState, emit event
+    Ok(())
+}
+/// Unbond after UNBONDING_ROUNDS (skeleton — needs storage + time mapping).
+pub fn unbond_validator(_address: Address) -> Result<(), &'static str> {
+    // TODO: enforce unbonding period, release to account
+    Ok(())
+}
+/// Commission rate (0-100%) for validator rewards (skeleton).
+pub fn set_commission(_address: Address, _percent: u8) -> Result<(), &'static str> {
+    // TODO: validate percent <= 100, save to staking state
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,23 +1147,4 @@ mod tests {
         );
         assert_eq!(state.total_mining_issued, decoded.total_mining_issued);
     }
-}
-
-// ============================================================
-// Staking lifecycle skeleton (AGENTS.md B — bond/unbond/commission)
-// ============================================================
-/// Bond stake to become / remain an active validator (skeleton — needs storage integration).
-pub fn bond_validator(address: Address, amount: u64) -> Result<(), &'static str> {
-    // TODO: verify >= MIN_VALIDATOR_STAKE, update StakingState, emit event
-    Ok(())
-}
-/// Unbond after UNBONDING_ROUNDS (skeleton — needs storage + time mapping).
-pub fn unbond_validator(address: Address) -> Result<(), &'static str> {
-    // TODO: enforce unbonding period, release to account
-    Ok(())
-}
-/// Commission rate (0-100%) for validator rewards (skeleton).
-pub fn set_commission(address: Address, percent: u8) -> Result<(), &'static str> {
-    // TODO: validate percent <= 100, save to staking state
-    Ok(())
 }
