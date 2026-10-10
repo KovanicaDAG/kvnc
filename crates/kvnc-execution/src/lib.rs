@@ -24,7 +24,8 @@ use kvnc_consensus::CommittedSubDag;
 use kvnc_runtime::ExecutionConfig;
 use kvnc_staking::{RewardOutcome, StakingError, StakingState};
 use kvnc_storage::{
-    address_to_bytes, state_store::Account, tables, BincodeSerialize, Storage, StorageError,
+    address_to_bytes, state_store::Account, tables, BincodeSerialize, StateStoreError, Storage,
+    StorageError,
 };
 use kvnc_types::signing::{chain_id, SigningContext};
 use kvnc_types::{Address, Transaction, TransactionKind};
@@ -602,7 +603,7 @@ impl ExecutionContext {
             self.staking
                 .join_validator(*from, amount, 0, None, Some(pk))?;
         }
-        debit(storage, txn, from, amount)?;
+        sub_balance_mapped(storage, txn, from, amount)?;
         Ok(vec![ContractEvent {
             topic: b"stake".to_vec(),
             data: bincode::serialize(&(from, amount))
@@ -686,7 +687,7 @@ impl ExecutionContext {
             .map_err(|_| {
                 ExecutionError::Validation("Validator not found or inactive".to_string())
             })?;
-        debit(storage, txn, from, amount)?;
+        sub_balance_mapped(storage, txn, from, amount)?;
         Ok(vec![ContractEvent {
             topic: b"delegate".to_vec(),
             data: bincode::serialize(&(from, &validator, amount))
@@ -942,24 +943,37 @@ impl ExecutionContext {
     }
 }
 
-/// Debit `amount` from `address` (balance checked by the caller).
-/// (`StateStore::sub_balance` keeps the ACCOUNTS table open while writing,
-/// which redb rejects inside one write transaction.)
-fn debit(
+/// Debit `amount` from `address` through `StateStore::sub_balance`
+/// (balance checked by the caller).
+///
+/// Error mapping keeps the pre-#41 local-helper behaviour byte-for-byte:
+/// - `InsufficientBalance` -> `Validation("Insufficient balance")`;
+/// - `NotFound` (missing account == zero balance): an overdraft for any
+///   `amount > 0`, and for `amount == 0` a default account is written, as the
+///   old read-or-default/write helper did;
+/// - any other storage error propagates as `ExecutionError::StateStore`.
+fn sub_balance_mapped(
     storage: &Storage,
     txn: &WriteTransaction,
     address: &Address,
     amount: u64,
 ) -> Result<(), ExecutionError> {
-    let mut account = storage.state().get_account_or_default_write(txn, address)?;
-    account.balance = account
-        .balance
-        .checked_sub(amount)
-        .ok_or(ExecutionError::Validation(
-            "Insufficient balance".to_string(),
-        ))?;
-    storage.state().set_account(txn, address, &account)?;
-    Ok(())
+    match storage.state().sub_balance(txn, address, amount) {
+        Ok(_) => Ok(()),
+        Err(StateStoreError::InsufficientBalance { .. }) => Err(insufficient_balance()),
+        Err(StateStoreError::NotFound(_)) if amount > 0 => Err(insufficient_balance()),
+        Err(StateStoreError::NotFound(_)) => {
+            storage
+                .state()
+                .set_account(txn, address, &Default::default())?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn insufficient_balance() -> ExecutionError {
+    ExecutionError::Validation("Insufficient balance".to_string())
 }
 
 /// Field-by-field copy of the staking state (it does not derive `Clone`).
@@ -2340,6 +2354,141 @@ mod tests {
                 .unwrap_or(0),
             Err(_) => 0,
         }
+    }
+
+    // --- sub_balance_mapped pins the old local `debit` helper's semantics ---
+
+    fn debit_once(storage: &Storage, addr: &Address, amount: u64) -> Result<(), ExecutionError> {
+        let txn = storage.begin_write().expect("write txn");
+        let r = sub_balance_mapped(storage, &txn, addr, amount);
+        if r.is_ok() {
+            // Another ACCOUNTS op in the same write txn, then commit.
+            let other = Address([0x77; 32]);
+            let mut acc = storage
+                .state()
+                .get_account_or_default_write(&txn, &other)
+                .expect("other");
+            acc.balance += 1;
+            storage
+                .state()
+                .set_account(&txn, &other, &acc)
+                .expect("set");
+            txn.commit().expect("commit");
+        } else {
+            txn.abort().expect("abort");
+        }
+        r
+    }
+
+    fn fund(storage: &Storage, addr: &Address, balance: u64) {
+        let txn = storage.begin_write().expect("write txn");
+        let acc = Account {
+            balance,
+            ..Default::default()
+        };
+        storage.state().set_account(&txn, addr, &acc).expect("set");
+        txn.commit().expect("commit");
+    }
+
+    fn account_exists(storage: &Storage, addr: &Address) -> bool {
+        let txn = storage.begin_read().expect("read txn");
+        storage.state().get_account(&txn, addr).is_ok()
+    }
+
+    #[test]
+    fn sub_balance_mapped_debits_and_allows_more_ops_in_txn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let a = Address([0x11; 32]);
+        fund(&storage, &a, 100);
+        debit_once(&storage, &a, 40).expect("debit");
+        assert_eq!(read_balance(&storage, &a), 60);
+        debit_once(&storage, &a, 60).expect("exact debit to zero");
+        assert_eq!(read_balance(&storage, &a), 0);
+        assert_eq!(read_balance(&storage, &Address([0x77; 32])), 2);
+    }
+
+    #[test]
+    fn sub_balance_mapped_overdraft_is_old_validation_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let a = Address([0x12; 32]);
+        fund(&storage, &a, 10);
+        let err = debit_once(&storage, &a, 11).expect_err("overdraft");
+        assert!(
+            matches!(&err, ExecutionError::Validation(m) if m == "Insufficient balance"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Transaction validation failed: Insufficient balance"
+        );
+        assert_eq!(read_balance(&storage, &a), 10, "balance untouched");
+    }
+
+    #[test]
+    fn sub_balance_mapped_missing_account_is_zero_balance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let a = Address([0x13; 32]);
+        let err = debit_once(&storage, &a, 1).expect_err("missing overdraft");
+        assert!(
+            matches!(&err, ExecutionError::Validation(m) if m == "Insufficient balance"),
+            "{err:?}"
+        );
+        assert!(
+            !account_exists(&storage, &a),
+            "no account created on failure"
+        );
+        // amount == 0: old helper wrote a default account; keep that.
+        debit_once(&storage, &a, 0).expect("zero debit of missing account");
+        assert!(account_exists(&storage, &a));
+        assert_eq!(read_balance(&storage, &a), 0);
+    }
+
+    #[test]
+    fn stake_and_delegate_overdraft_receipts_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let me = address_of(&key);
+        let initial = 1000 * K;
+        let mut ctx = setup_funded_sender(&storage, &me, initial);
+        let staked_before = ctx.staking.total_staked;
+        let r = run(
+            &mut ctx,
+            &storage,
+            1,
+            vec![
+                signed_tx(
+                    &key,
+                    TransactionKind::Stake {
+                        amount: 2 * initial,
+                    },
+                    0,
+                    1000,
+                ),
+                delegate_tx(&key, Address([0xEE; 32]), 2 * initial, 1),
+            ],
+        );
+        assert!(!r[0].success && !r[1].success, "{r:?}");
+        assert!(r[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Insufficient balance for stake"));
+        assert!(r[1]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Insufficient balance for delegate"));
+        assert!(r[0].events.is_empty() && r[1].events.is_empty());
+        assert_eq!(read_balance(&storage, &me), initial - 2000, "only fees");
+        assert_eq!(read_nonce(&storage, &me), 2);
+        assert_eq!(
+            ctx.staking.total_staked, staked_before,
+            "staking rolled back"
+        );
     }
 
     #[test]
