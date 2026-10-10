@@ -9,7 +9,7 @@ x-node: &node
   init: true
   environment: &node-env
     KVNC_RPC_ADDR: "0.0.0.0"
-    KVNC_LISTEN_ADDR: "0.0.0.0:9000"
+    KVNC_LISTEN_ADDR: "0.0.0.0:8000"
     KVNC_DATA_DIR: "/var/lib/kvnc"
     KVNC_MAX_PEERS: "8"
     KVNC_ROUND_DURATION_MS: "1000"
@@ -35,7 +35,7 @@ services:
     environment:
       <<: *node-env
       KVNC_RPC_PORT: "8545"
-      KVNC_BOOTNODES: "node2:9000,node3:9000,node4:9000"
+      KVNC_BOOTNODES: "node2:8000,node3:8000,node4:8000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     ports:
       - "127.0.0.1:8545:8545"
@@ -56,7 +56,7 @@ services:
     environment:
       <<: *node-env
       KVNC_RPC_PORT: "8546"
-      KVNC_BOOTNODES: "node1:9000,node3:9000,node4:9000"
+      KVNC_BOOTNODES: "node1:8000,node3:8000,node4:8000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     ports:
       - "127.0.0.1:8546:8546"
@@ -77,7 +77,7 @@ services:
     environment:
       <<: *node-env
       KVNC_RPC_PORT: "8547"
-      KVNC_BOOTNODES: "node1:9000,node2:9000,node4:9000"
+      KVNC_BOOTNODES: "node1:8000,node2:8000,node4:8000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     ports:
       - "127.0.0.1:8547:8547"
@@ -98,7 +98,7 @@ services:
     environment:
       <<: *node-env
       KVNC_RPC_PORT: "8548"
-      KVNC_BOOTNODES: "node1:9000,node2:9000,node3:9000"
+      KVNC_BOOTNODES: "node1:8000,node2:8000,node3:8000"
       KVNC_VALIDATOR_KEY: "/var/lib/kvnc/validator.pem"
     ports:
       - "127.0.0.1:8548:8548"

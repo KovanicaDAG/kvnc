@@ -4,14 +4,18 @@
 
 **kvnc** is a clean, from-scratch Rust Layer-1 blockchain.
 
+**Naming (zaključano):** chain = **Kovanica**, native coin ticker = **KUNA** (9 decimals),
+codebase/binary/env prefiks = **kvnc** (`kvnc-*` crate-ovi, `kvnc-node`, `KVNC_*`). Adresa je
+`kvnc<hex>dag`. Nikad ne koristi `KVNC` kao naziv valute.
+
 | Layer              | Choice                                      |
 |--------------------|---------------------------------------------|
 | Consensus          | Mysticeti-style uncertified DAG (wave = 3)  |
 | Execution          | Wasmi (deterministic WASM)                  |
 | Account model      | Account-based + staked validators           |
-| Validators         | 15–21 active, min stake 50 000 KVNC         |
+| Validators         | 15–21 active, min stake 50 000 KUNA         |
 | Resource target    | Comfortable on 2–4 GB RAM VPS               |
-| Native token       | KVNC (9 decimals)                           |
+| Native token       | KUNA (9 decimals)                           |
 
 ## HARD RULES (NEKRŠIVA)
 
@@ -25,16 +29,16 @@
 
 | Parameter                  | Value                                          |
 |---------------------------|------------------------------------------------|
-| Total supply              | **90 200 000 KVNC**                            |
+| Total supply              | **90 200 000 KUNA**                            |
 | Decimals                  | 9                                              |
-| Founder premine           | 200 000 KVNC                                   |
-| Treasury                  | 8 000 000 KVNC (1 M/year × 8 years, linear)    |
-| Mining subsidy budget     | ≈ 82 000 000 KVNC                              |
-| Initial block reward      | **10 KVNC** (paid to committed leader author)  |
+| Founder premine           | 200 000 KUNA                                   |
+| Treasury                  | 8 000 000 KUNA (1 M/year × 8 years, linear)    |
+| Mining subsidy budget     | ≈ 82 000 000 KUNA                              |
+| Initial block reward      | **10 KUNA** (paid to committed leader author)  |
 | Subsidy era length        | **2 050 000** committed leader blocks          |
 | Decay                     | **× 3/4** each era                             |
 | Active validators         | 15–21                                          |
-| Min validator stake       | 50 000 KVNC                                    |
+| Min validator stake       | 50 000 KUNA                                    |
 
 Reward se mint-a **samo** na committed leader (CommittedSubDag → StakingState::on_leader_committed).
 

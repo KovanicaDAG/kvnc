@@ -8,7 +8,7 @@ docker build -t kvnc-node:local .
 
 The image contains only the `kvnc-node` binary and a minimal `debian:bookworm-slim`
 runtime. It runs as the unprivileged `kvnc` user (uid/gid 10001), stores chain data
-under `/var/lib/kvnc` (declared `VOLUME`), and exposes P2P `9000` / JSON-RPC `8545`.
+under `/var/lib/kvnc` (declared `VOLUME`), and exposes P2P `8000` / JSON-RPC `8545`.
 A plain `docker run kvnc-node:local` prints `--help`; it never boots a node by
 default.
 
@@ -70,7 +70,7 @@ True multi-validator finality is a follow-up (RFC-006-era consensus work).
 1. Add a `nodeN` service to `docker-compose.yml` copied from `node2`, with a new
    `KVNC_RPC_PORT`, its own `<nodeN>-data` volume, a distinct healthcheck URL, and
    `KVNC_BOOTNODES` listing the existing nodes.
-2. Add the new node's `host:9000` to the other nodes' `KVNC_BOOTNODES` and `<nodeN>-data`
+2. Add the new node's `host:8000` to the other nodes' `KVNC_BOOTNODES` and `<nodeN>-data`
    to the `volumes:` section.
 3. `docker compose up -d`; scale down with `docker compose rm -sf nodeN` followed by
    removing its service and volume.

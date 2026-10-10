@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use tracing::info;
 
 use kvnc_crypto::{generate_keypair, sign as crypto_sign};
-use kvnc_staking::{MIN_VALIDATOR_STAKE, ONE_KVNC};
+use kvnc_staking::{MIN_VALIDATOR_STAKE, ONE_KUNA};
 use kvnc_types::{
     hash::Hash,
     transaction::{Transaction, TransactionKind},
@@ -455,7 +455,7 @@ validators = [
 
     // Create a transfer from node1 to node2
     let to_addr = Address([0xbb; 32]); // dummy recipient
-    let tx = create_transfer_tx(addr1, to_addr, 100 * ONE_KVNC, 1_000_000, 0, &sk1);
+    let tx = create_transfer_tx(addr1, to_addr, 100 * ONE_KUNA, 1_000_000, 0, &sk1);
 
     // Submit transaction
     let tx_hash = node1.send_transaction(tx).await?;

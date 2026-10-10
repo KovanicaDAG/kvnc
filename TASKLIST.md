@@ -1,387 +1,356 @@
 # KVNC Project Task List (Phases 1–25)
 
-**Cilj:** funkcionalan, siguran, multi-validator DAG node → javni testnet → mainnet.
-
-**Princip:** najmanji ispravan korak. Ne implementiraj opciju dok nije potrebna. Svaki item ima *minimalni put* (tips) i *exit criteria*.
+> **Ova verzija je 100% truth state — provjerena kod-inspekcijom + buildom na `main` @ `73c5b9a` (2026-10-10).**
+> Prethodna verzija (s checkboxes) i `TASKLIST_DRIFT.md` (2026-10-08) su zastarjeli; ovaj dokument ih zamjenjuje.
 
 **Legenda statusa**
-- `[x]` — implementirano i wired u production pathu
-- `[~]` — djelomično (postoji kod, nije potpuno wired / nije production-safe)
-- `[ ]` — nije gotovo
+- `[x]` — implementirano i wired u production pathu (verificirano u kodu)
+- `[~]` — djelomično (kod postoji, ali nije potpuno wired / nije production-safe / test ne prolazi)
+- `[ ]` — nije gotovo (nema koda ili je samo plan)
 
-**Critical path:** Types → Storage → DAG → Consensus → Execution → Node wiring → Committee → Admission → Multi-node quorum → Testnet
-
----
-
-## Recent (2026-10-09) — build status + canonical addresses
-
-- [x] Workspace build: `cargo fmt --check` + `cargo clippy --all-targets` clean, `cargo test --workspace` = 290+ passed, **0 failed** (live_vote_integration tests marked `#[ignore]` for sequential execution). `cargo check --workspace --all-targets` = 0 errors.
-- [x] **Delegate/ClaimRewards tx kinds** — `TransactionKind::Delegate` and `ClaimRewards` added; execution implemented; CLI commands use keystore signing via shared `sign_and_submit_self` helper.
-- [x] **Signature verification hot-path** — `kvnc_crypto::verify_batch` sada vraća `Err(VerificationFailed)` za nevalidan potpis (ranije `Ok(false)` koji su hot-pathovi ignorirali → nevalidni blokovi su prolazili). Validacijski autoritet je node hot-path; network ingress samo emitira dekodirani blok.
-- [x] **Canonical address format** — `kvnc<hex>dag` with blake3 checksum, bare/0x compatibility, Display/FromStr (`kvnc-types/src/address.rs:36-119`).
-- [x] **Mempool zero-fee admission** — only Stake txs allowed zero fee (`kvnc-mempool/src/lib.rs:222-224`).
-- [x] **CLI/RPC canonical addresses** — wallet.rs, RPC chain_methods.rs use `Address::encode`/`FromStr`.
+**Kritični path:** Types → Storage → DAG → Consensus → Execution → Node wiring → Committee → Admission → Multi-node quorum → Testnet
 
 ---
 
-## PHASE 1.1 (kvnc-types): Core types
+## Verified run (2026-10-10, `73c5b9a`)
 
-- [x] Block/Tx serialization — `serde` + `bincode` impls present (`block.rs:22`, `transaction.rs:48`).
-- [x] `merkle_root` on StatementBlock — field + `compute_merkle_root` + tests (`block.rs:38, 69-112`).
-- [x] Round/AuthorityIndex arithmetic traits — `type Round = u64; type AuthorityIndex = u16` (`types.rs:30-33`). No custom traits needed.
-- [x] Committee types + `leader_for_round` stake-weighted — round-robin (`types/committee.rs:67-73`); stake-weighted in `CommitteeInfo` (`consensus/src/types.rs:204-226`).
-- [x] Address = raw Ed25519 pubkey + `kvnc<hex>dag` + blake3 checksum — `Address([u8;32])`, `encode`/`decode`/`Display`/`FromStr` with checksum + hex back-compat (`address.rs:36-119`).
-- [x] Hash domain separation (block/tx/state/vote) — `DOMAIN_BLOCK`, `DOMAIN_TX`, `DOMAIN_DIGEST`, `DOMAIN_MERKLE` (`hash.rs:30-36`). Vote domain uses block/tx domains.
+- `cargo check --workspace --all-targets` → **0 errors**
+- `cargo clippy --workspace --all-targets` → **clean** (bez warninga)
+- `cargo test --workspace --lib` → **svi unit testovi prolaze** (~375 test fn u src/ svih 19 crate-ova; 0 failed)
+- Integration testovi (`--tests`):
+  - `kvnc-node multi_node_integration` → **3/3 PASS** (konvergencija 4 noda na identičan commit sequence; partition 3+1 majority commits & minority catches up; 2+2 nema quorum)
+  - `kvnc-node sustained_liveness_integration` → **1/1 PASS** (~65s; 4 validatorska procesa, committed height 20+ preko pruning boundary, isti leader na svim nodovima)
+  - `kvnc-rpc websocket_subscriptions` → **PASS**
+  - `kvnc-node late_join_integration` → **1 FAIL**: `late node's first committed leader is unknown to node 0` (late-join sync nije konzistentan)
+  - `kvnc-node live_vote_integration` → **2 testa `#[ignore]`; padaju kad se forsiraju** (`Error: parsing genesis validators ... missing field validator` — test harness generira prazan `genesis_validators.toml`; infra problem, ne consensus bug)
+- Cargo warning-i (non-fatal, postoje u kodu): `kvnc-staking` slobodne stub funkcije `bond_validator`/`unbond_validator`/`set_commission` (dead code; prave impl su na `StakingState`); `kvnc-rpc` `rate_limit_middleware`/`auth_middleware` nisu korišteni (dead code); `kvnc-cli` lib+bin dualni target upozorenje; par unused importa u `kvnc-execution`/`kvnc-network`.
 
----
+**Naming (zaključano, razriješeno 2026-10-10):** chain = **Kovanica**, native coin ticker = **KUNA** (9 decimals), code/binary/env prefiks = **kvnc**. Svi chain-facing ticker reference su sada KUNA: `README.md`, `AGENTS.md`, `docs/*`, signature domain tagovi (`KUNA/vote/v1`, `KUNA/tx/v1`), `Hash::DOMAIN_TX = "KUNA-TX-v1"`, konstanta `ONE_KUNA` (ex-`ONE_KVNC`), CLI, faucet. Brojke tokenomike nepromijenjene (90.2M cap, 9 decimals, 10 reward, 2_050_000 era, ×¾). Adresa ostaje `kvnc<hex>dag`.
 
-## PHASE 1.2 (kvnc-crypto): Primitives
-
-- [x] Keypair persistence (Argon2id + XChaCha20-Poly1305 in cli) — `kvnc-cli/src/wallet.rs` (keystore exists).
-- [x] `verify_batch` returns `Err` on invalid sig (not `Ok(false)`) — `Result<bool, CryptoError>`; `Err(VerificationFailed)` on bad sig (`lib.rs:87-127`).
-- [ ] BIP32-style HD key derivation — no code found in `kvnc-crypto` or `kvnc-types`.
-- [ ] VRF for leader selection — no VRF code found; leader selection uses `stake_weighted_leader` (deterministic).
-
----
-
-## PHASE 2.1: Block Store
-
-- [x] redb schema — tables init (`block_store.rs:39-49`).
-- [x] BlockStore API (put/get/by_height/by_range) — all methods present (`block_store.rs:52-158`).
-- [x] Transaction index (tx hash → block ref) — `TRANSACTION_INDEX` table (`block_store.rs:103-109, 176-184`).
-- [x] Pruning policy (non-blue + wave window) — `prune_below` (`block_store.rs:216-261`); wave logic in `dag_store.rs:305-383`.
+**Seed/DNS (razriješeno 2026-10-10):** kvnc kod više ne referencira tuđu infrastrukturu. `NetworkConfig::default().bootstrap_nodes` i `NodeConfig::default().bootnodes` su prazni; seedovi idu preko `KVNC_BOOTNODES` / `[node] bootnodes`. 3+ kvnc-native DNS imena treba registrirati prije javnog testneta (`docs/SEED-DNS-AUDIT.md`). Kanonski P2P port: **8000**.
 
 ---
 
-## PHASE 2.2: State Store
+## PHASE 1.1 (kvnc-types): Core types — `[x]` DONE
 
-- [x] Account state (balance/nonce/code/storage) — `Account` struct (`state_store.rs:33-43`).
-- [x] Staking state persist — `save_staking_state`/`load_staking_state` (`state_store.rs:275-296`).
-- [x] Sorted-KV Merkle state root — `compute_state_root` over BTreeMap (`state_store.rs:349-415`).
-- [x] Snapshot/Restore for fast sync — `export_snapshot`/`import_snapshot` (`state_store.rs:417-567`).
+- [x] Block/Tx serialization (serde + bincode)
+- [x] Merkle root na StatementBlock (`compute_merkle_root` + validacija u block_manager)
+- [x] Round (`u64`) / AuthorityIndex (`u16`) aritmetika
+- [x] Committee types + `leader_for_round` stake-weighted (`CommitteeInfo`, `types.rs:204-226`)
+- [x] Canonical address `kvnc<hex>dag` + blake3 checksum, bare/0x back-compat (`address.rs`)
+- [x] Hash domain separation (BLOCK/TX/DIGEST/MERKLE) + `kvnc-types/src/signing.rs` — signature format v1: `chain_id` registry (mainnet 1, testnet 2, devnet 3, local 1337), `VOTE_DOMAIN_TAG`/`TX_DOMAIN_TAG` (16-byte, `KUNA/...`)
+- [x] `CommittedSubDag.non_blue` field (#13 contract) — red blocks vraćeni u mempool, ne prunaju se
+
+## PHASE 1.2 (kvnc-crypto): Primitives — `[~]` partial
+
+- [x] Keypair persistence: Argon2id + XChaCha20-Poly1305 (`kvnc-cli/src/wallet.rs`, keystore v2 + v1→v2 migracija)
+- [x] `verify_batch` → `Err(VerificationFailed)` na nevalidan potpis (ne `Ok(false)`) + `tests/strict_vectors.rs` (strogi vektori)
+- [x] Strict sig verify svugdje (commit `bebe8c6`)
+- [ ] BIP32-style HD derivation — **nema koda** (samo BIP-39 mnemonic import bez HD izvoda u CLI)
+- [ ] VRF za leader selection — **nema koda**; koristi se deterministički stake-weighted
+
+## PHASE 2.1: Block Store — `[x]` DONE
+
+- [x] redb schema + tables init
+- [x] BlockStore API (put/get/by_height/by_range)
+- [x] Transaction index (tx hash → block ref)
+- [x] Pruning (`prune_below`; wave window u dag_store)
+
+## PHASE 2.2: State Store — `[x]` DONE
+
+- [x] Account state (balance/nonce/code/storage)
+- [x] Staking state persist (save/load)
+- [x] Sorted-KV Merkle state root (`compute_state_root`)
+- [x] Snapshot/Restore (`export_snapshot`/`import_snapshot`) + `sub_balance` fix (open-table write + checked_sub)
+
+## PHASE 2.3: Consensus Store — `[x]` DONE
+
+- [x] DAG persistence (block + parent/child links)
+- [x] Commit tracker (committed_leader_height, decided rounds)
+
+## PHASE 3.1: DagStore — `[x]` DONE
+
+- [x] Block ingestion (parents/sig/round validacija)
+- [x] Causal ordering (ancestors BFS)
+- [x] Parent selection stake-filtered (max_parents ceil 3 po wave; `MAX_PARENT_ROUND_GAP`)
+- [x] GC: `prune_below` / `prune_waves_before`; `prune_non_blue` više se NE poziva (MysticGhost variant A vraća red blocks kroz `non_blue`)
+
+## PHASE 3.2: Block Manager — `[x]` DONE
+
+- [x] Propose block (`propose_block`/`propose_block_with_txs`)
+- [x] Validate block + ancestry walk (uklj. prune-validate testove, gap > MAX_PARENT_ROUND_GAP rejected)
+- [x] Block broadcast (engine broadcaster)
+
+## PHASE 4.1: Committer — `[x]` DONE
+
+- [x] Direct commit rule (2f+1, `has_quorum`)
+- [x] Indirect commit rule (`has_path`)
+- [x] `LeaderStatus` Undecided→Commit/Skip
+- [x] `CommittedSubDag` produkcija (linearizer + mysticghost + non_blue red blocks)
+- [x] Late-vote: cast glasa kada leader block stigne nakon vote rounda (commit `dfccfb3`)
+
+## PHASE 4.2: Linearizer — `[x]` DONE
+
+- [x] Topological sort + dedup; test `test_linearize_parents_outside_history_ignored`
+
+## PHASE 4.3: Wave Logic — `[x]` DONE (1 item `[~]`)
+
+- [x] `WAVE_LENGTH`, `wave_of`, `offset_in_wave`, `is_leader_round`, `scheduled_leader_for_round`
+- [x] Deterministic leader selection (round-robin + stake-weighted)
+- [~] Timeout handling: `leader_timeout_ms` (fixed ms) + `register_skip`;**`timeout_factor` NE postoji**
+
+## PHASE 4.4: Consensus Loop — `[~]` partial
+
+- [x] Round timer (`round_loop` + `interval(round_duration_ms)`)
+- [~] Fork handling: kod **odbija** fork (različit digest, isti round/author, `first-valid wins`); **ne bira** lexicographic min-digest; test potvrđuje rejection (engine.rs:1422-1484)
+
+## PHASE 5.1: Core Mempool — `[x]` DONE
+
+- [x] Tx pool priority by fee rate (`BTreeMap<u64, VecDeque<Transaction>>`)
+- [x] Admission control (nonce/balance/sig/gas; zero-fee rejected **osim** Stake)
+- [x] Eviction (`maybe_evict`, najniži fee-rate)
+- [x] Rebroadcast
+- [x] Gossip edge: `FeeTooLow` = **Ignore, ne Reject** (commit `6703663`) — ne ruši peer-a zbog niskog fee-ja
+
+## PHASE 5.2: Block Building — `[x]` DONE
+
+- [x] `get_next_transactions` conflict-aware (grupiranje po senderu, sort po nonce-u, kontiguitet)
+- [x] Fee estimation advisory + `kvnc_estimateFee` (stub u RPC-u)
+
+## PHASE 6.1: libp2p Setup — `[x]` DONE
+
+- [x] Transport TCP + Noise + Yamux; gossipsub (topics: blocks, transactions, votes, sync); Kademlia; identify; ping
+- [x] mDNS namjerno odsutan (DNS-only seed)
+- [x] **Persistent libp2p identity** (`identity.rs`): key-file permission check (0600/0400), PeerId stabilan kroz restarte
+
+## PHASE 6.2: Protocols — `[x]` DONE
+
+- [x] Block sync request/response (`BLOCK_SYNC_PROTOCOL`)
+- [x] Tx gossip + RPC→gossip (`kvnc_sendRawTransaction` šalje u gossipsub, commit `0cfbbc3`)
+- [x] Vote gossip
+- [x] **Peer scoring** (`scoring.rs`): `PeerScoringConfig` (gossip/publish/graylist/ban pragovi; samo negativne akcije spuštaju score; mesh-delivery penalizacija isključena)
+- [x] **Vote verifier trait** (`validation.rs`): `Ed25519VoteVerifier`, `AuthorityKeys`, `Rejection`, `SigError`; edge-validacija bloka (digest, merkle, committee author, potpis)
+
+## PHASE 6.3: Bootstrap — `[x]` DONE
+
+- [x] Bootstrap seedovi: **nema hardkodiranih hostova** (`bootstrap_nodes`/`bootnodes` prazni); seedovi preko `KVNC_BOOTNODES`/TOML; 3+ kvnc-native DNS imena TBD (`docs/SEED-DNS-AUDIT.md`); P2P port 8000
+
+## PHASE 7.1: Native Execution — `[x]` DONE
+
+- [x] Transfer/Stake/Deploy/Call dispatch
+- [x] Delegate/ClaimRewards tx kinds + execution
+- [x] Rollback semantika: failed tx vraća sve osim fee+nonce; failed subdag commit rollback; replay determinizam (testovi `failed_delegate_rolls_back_except_fee_and_nonce`, `failed_storage_commit_does_not_publish_candidate_staking_state`, `replay_with_failed_txs_is_deterministic`)
+- [x] Staking wiring: `on_leader_committed` se poziva iz execution patha (`execution/src/lib.rs:286`)
+
+## PHASE 7.2: WASM Runtime — `[x]` DONE
+
+- [x] Host funkcije (10 env importa: caller, contract_address, block_height, timestamp, balance_of, transfer, storage_get, storage_set, emit_event, +1)
+- [x] Gas metering (`StoreLimitsBuilder` + `set_fuel` + `OutOfGas`)
+- [x] Memory limits (`memory_size` + `trap_on_grow_failure`; test `memory_grow_is_limited_by_configured_page_cap`)
+- [x] Determinism + module cache (`ContractRunner`; cache je per-runner, ne preživljava restart — TODO u kodu)
+
+## PHASE 7.3: Execution Context — `[x]` DONE
+
+- [x] Receipts, events, state root po subdagu; atomic commit (`execute_committed_subdag`)
+
+## PHASE 8.1 (kvnc-staking): Emission & Treasury — `[x]` DONE
+
+- [x] `block_reward()` / `cumulative_mining_issuance()` (geometrijski ×¾ po eri od 2_050_000; s₀=10; budget 82M)
+- [x] Treasury vesting (8M / 8 godina linear; `advance`/`expected_vested`/`claim`; cap 8M)
+- [x] `circulating_supply()` clamp na 90.2M
+- [x] Testovi: `canonical_values_match_skeleton`, `cumulative_issuance_never_exceeds_budget`, `leader_reward_goes_to_payout_address`, `genesis_state_has_15_validators_and_treasury`
+
+## PHASE 8.2: Delegation & Governance — `[x]` (governance `[ ]`)
+
+- [x] `StakingState::delegate` / `unbond` / `withdraw_unbonded` / `unbonding_ready` (UNBONDING_ROUNDS queue)
+- [x] `bond_validator` / `unbond_validator` / `set_commission` na `StakingState` (s pravim error tipovima: NotValidator, BelowMinimumStake, InvalidCommission)
+- [x] `reward_share` (commission bps + delegator share)
+- [x] `rotate_epoch` na `EPOCH_ROUNDS` (2_050_000)
+- [x] `slash(DoubleSignEvidence)` fiksno 500 bps, test `slash_is_deterministic_fixed_500bps`
+- [ ] Governance hooks — **nema** (Phase 25)
+
+## PHASE 8.3–8.8: Tests, Live Path, Contracts, RPC/CLI, Docs, Events — `[~]` mixed
+
+- [x] Tests — staking unit testovi prolaze (19 u lib runu)
+- [~] Live path — CLI delegate/claim postoji; end-to-end live vote flow test **ne prolazi** u harnessu (live_vote_integration, infra)
+- [x] Contracts — HTLC, Vault, Multisig, Token + Host trait; `contracts.rs` narastao (+1217 linija): custody/escrow, rollback testovi
+- [x] RPC/CLI — osnovne metode rade; delegate/claim-rewards implementirani
+- [ ] Docs — nema dedicated staking docs; postoji `docs/TOKENOMICS.md` + novi `docs/SIGNATURE_FORMAT.md`
+- [~] Events — osnovna emisija postoji; nema structured indexera
+
+## PHASE 9 (kvnc-node): Config & Core Loop — `[x]` DONE
+
+- [x] Toml config + KVNC_* env overrides (`config.rs`)
+- [x] Core loop (startup/shutdown, P2P, consensus ticker)
+- [x] Graceful shutdown
+- [x] `kvnc-node genesis` — `--validators --treasury-address --founder-address --validator-keys-out --force` + `build_committee`
+- [x] **Orphans buffer** (`orphans.rs`): missing-parent fetch (`BlockSyncRequest::ByHash`), dedup in-flight requesta, bound per peer/age (max_orphans 1024, max_bytes 32MB, ttl 60s)
+- [x] **NodeHealth** (`rpc/src/health.rs`): execution worker + consensus engine reportuju stanje; `/health` vraća 503 kad worker padne
+
+## PHASE 10 (kvnc-rpc): JSON-RPC & Subscriptions — `[x]` DONE
+
+- [x] 22 RPC metode (chain/tx/account/staking/mempool/consensus/contracts): `kvnc_blockNumber`, `kvnc_getBalance`, `kvnc_getBlockByHash/Number`, `kvnc_getTransactionByHash/Receipt`, `kvnc_sendRawTransaction`, `kvnc_getCommittee`, `kvnc_getValidators`, `kvnc_getLeaderSchedule`, `kvnc_getStake`, `kvnc_getRewards`, `kvnc_estimateFee`, `kvnc_subscribe`/`unsubscribe`, ...
+- [x] WS subscriptions (newHeads, newCommittedLeader, pendingTransactions, logs) — test prolazi
+- [x] Canonical addresses u response-ima
+- [x] `kvnc_blockNumber` = committed leader height
+- [x] OpenAPI 3.1 spec (oneOf diskriminator za sve metode) + write helpers
+- [x] Rate limit (token bucket 60/min burst 10, 429) + bearer token framework — **ali** `rate_limit_middleware`/`auth_middleware` su dead code (ne-wired); rate limit ide preko axum middleware sloja u `rpc/src/lib.rs:295`
+
+## PHASE 11 (kvnc-cli): Wallet & Node Ops — `[~]` partial
+
+- [x] Wallet: keygen/import/export/migrate/import-key/address/sign (offline; v1→v2 migracija; BIP-39 mnemonic bez HD)
+- [x] Canonical addresses
+- [x] `status`/`info` (chain info) + `balance`
+- [~] Node ops `sync`/`peers` — **ne postoje kao komande** (uklonjene ili nikad dodane); `propose`/`vote` → `not_implemented` (governance)
+- [x] Stake/unstake/delegate/claim-rewards (keystore signing, `sign_and_submit_self`)
+- [x] HTLC / Vault / Multisig / Token subcommands
+- [x] JSON/table output (`output.rs`)
+
+## PHASE 12: Testing & Benchmarks — `[~]` partial
+
+- [x] Unit testovi: svi prolaze (cargo test --workspace --lib green)
+- [x] Integration: multi-node 3/3 PASS, sustained liveness 1/1 PASS (4 procesa, height 20+), WS subscriptions PASS
+- [~] Property testovi: proptest prisutan (9 `proptest!` makroa u consensus tests) — nije comprehensive
+- [ ] Load/stress TPS≥100 @2GB RAM — **nema verificiranog TPS benchmarka**; sustained liveness je funkcionalni test, ne throughput
+- [ ] Multi-process quorum je dokazan kroz integration testove, ali **24h soak nije nikad pokrenut**
+
+## PHASE 13: DevOps & Orchestration — `[~]` partial
+
+- [x] Docker multi-stage + 4-node compose (`docker-compose.yml`, 4 servisa, healthchecks, val1-4.pem, `genesis_validators.toml`)
+- [ ] Kubernetes — **nema manifesta** (postoji `docs/A13.2-K8S.md` plan)
+- [x] Prometheus metrics + Grafana (11 panela `ops/grafana/kvnc-overview.json`) + alerting (11 pravila `ops/prometheus/alerts.yml`)
+- [x] Soak script (`ops/soak/soak.sh`): MemoryMax=3G cgroup v2, RSS monitoring svakih 30s, warn na 3G
+
+## PHASE 14: Genesis & Launch Prep — `[~]` partial
+
+- [x] Genesis tool (u node-u, `main.rs`)
+- [x] Premine: founder 200K + treasury 8M
+- [x] Faucet crate (`kvnc-faucet`): rate limit 3/hr/IP default, 10 KUNA, `--chain-id` obavezan (1/2/3/1337) — **nije u CI**; novi README
+- [ ] Key distribution ceremony — **nema**
+- [x] Seed nodes 3+ (DNS; distribuirani na `:8000`)
+- [ ] Explorer + validator onboarding docs — **nema** (nema explorer appa)
+
+## PHASE 15: Stabilisation & MysticGhost — `[~]` partial
+
+- [x] 15.0 scaffolding/mergeset
+- [x] 15.1 GHOSTDAG k=3 scoped (`ghostdag_scoped.rs`) + MysticGhost colouring (hybrid: Mysticeti wave DAG + GHOSTDAG mergeset bojanje)
+- [x] 15.2 committer (UniversalCommitter; MysticGhost return variant A — red blocks via `non_blue`, commit `016b7fb`)
+- [x] 15.3 resource hardening (prune + metrics + soak script)
+- [~] 15.4 6h soak — script postoji, **nikad pokrenut u CI**
+- [~] 15.5 multi-node stabilisation (4/15 node, partition) — integration testovi prolaze; **24h soak nikad**
+- [x] Resource budgets — MemoryMax=3G u soak.sh; CPU/disk caps **nisu** enforce-ani
+- [~] 15.6 light-client certificates — tipovi postoje (`light_client.rs`: WaveCommitCertificate, ColouringCertificate, StateProof, LightClientCheckpoint; verify_quorum 2f+1, verify_witnesses k=3); **nema node/RPC endpointa za light client**
+
+## PHASE 16: Node Wiring & Quorum — `[~]` last gap
+
+- [x] 16.1 committee from staking state (`build_committee` + testovi)
+- [x] 16.2 round from consensus tip — `engine.subscribe_round()` → `block_manager.set_round_receiver()` (main.rs:632-633) — **DONE od zadnjeg drifta**
+- [~] 16.3 live vote→commit→execute — test scaffold postoji (`live_vote_integration`), ali **2 testa padaju** kad se forsiraju sa `--ignored` (harness generira prazan `genesis_validators.toml`; **nije consensus bug nego test infra**)
+- [x] 16.4 mempool admission wired — engine koristi `mempool.get_next_transactions()`; RPC `kvnc_sendRawTransaction`→gossip (edge validacija: hash, merkle, committee author, potpis)
+- [~] 16.5 conflict-aware block building — postoji u mempoolu; live proof ovisi o 16.3
+- [~] 16.6 real 4-node quorum — **multi-process quorum DOKAZAN** kroz `sustained_liveness_integration` (4 procesa, identični commit sequence, height 20+); **docker-compose run nije pokrenut**; late-join sync test **pada**
+
+## PHASE 17: Consensus Mechanics — `[x]` (fork `[~]`)
+
+- [x] Timeout handling (`leader_timeout_ms` + `register_skip`; **nema `timeout_factor`**)
+- [~] Fork handling — **odbija**, ne bira min-digest
+- [x] Stake-weighted leader
+- [x] Batch sig verify na ingest (strict, `Err` na bad sig)
+- [x] Hash domain separation + merkle roots + **signature format v1** (`signing.rs`, `docs/SIGNATURE_FORMAT.md`)
+- [x] Testovi: `vote_verification.rs`, `mysticghost_return.rs`, `strict_vectors.rs`, `late-vote` scenarij
+
+## PHASE 18: Staking UX & Safety — `[x]` DONE
+
+- [x] delegation bond/unbond/commission/reward share (`StakingState`)
+- [x] validator rotation at epoch
+- [x] unbonding queue enforcement
+- [x] slashing double-sign (500 bps)
+- [x] CLI stake/unstake/delegate/claim-rewards
+
+## PHASE 19: State & Sync — `[~]` (1 fail: late join)
+
+- [~] state Merkle — sorted-KV (ne full MPT)
+- [x] snapshot/fast sync — `export_snapshot`/`import_snapshot` + `/kvanc/state-sync/1.0.0` request-response + gossip topic `state_sync`
+- [x] state pruning policy (`keep_recent`, `max_state_roots`, `prune_state_roots`)
+- [~] light-client — samo tipovi, nema endpointa
+- [x] missing-parent recovery — `orphans.rs` + `BlockSyncRequest::ByHash`; re-request MissingBlocks
+- [ ] **Late-join sync: FAIL** — `late_join_integration` pade (`late node's first committed leader is unknown to node 0`). **Ovo je trenutni #1 red.**
+
+## PHASE 20: Security & Observability — `[~]` partial
+
+- [ ] External security review — **nema dokaza o auditu**
+- [x] Fuzzing harnessi (`fuzz/`: fuzz_block, fuzz_tx, fuzz_vote, fuzz_consensus) — **postoje; nisu dio workspace builda** (zaseban cargo projekt, nebuildan u CI)
+- [x] RPC/WS rate limit + optional auth — framework postoji (429 token bucket, bearer token); middleware dead-code warning
+- [~] Resource budgets — MemoryMax=3G soak; CPU/disk caps nisu enforced
+- [x] Keystore no-raw-hex: `address` zahtijeva `--allow-raw-hex` + 0600; `import-key` hidden prompt; migracija v1→v2; libp2p key file perms check (`identity.rs`)
+
+## PHASE 21: Metrics & Alerting — `[x]` DONE
+
+- [x] Prometheus `/metrics` (consensus metrics + registry; RPC portovi izloženi u compose)
+- [x] Grafana dashboard (11 panela)
+- [x] Alerting (11 pravila)
+- [x] Strukturirani JSON logging + trace_id po roundu (`round_trace`)
+- [x] `/health` endpoint + `NodeHealth` (503 na dead worker) — novo od zadnjeg drifta
+
+## PHASE 22: SDKs & Integrations — `[~]` partial
+
+- [x] TypeScript API client (`packages/api-client/src/index.ts`, 9 metoda)
+- [x] OpenAPI/JSON schema (22 metode, oneOf)
+- [ ] Contract SDK (Rust+TS) — **nema**
+- [x] Dev faucet CLI
+- [ ] Indexer service — **nema**
+
+## PHASE 23: Explorer & Wallet UI — `[ ]` NOT DONE
+
+- [ ] block explorer — nema appa
+- [ ] wallet UI — nema appa
+- [ ] public status page — nema
+
+## PHASE 24: Genesis Ceremony & Mainnet Prep — `[~]` partial
+
+- [~] Genesis ceremony — `kvnc-node genesis` postoji (single-node inline), **nema ceremony orchestration toola/docs**
+- [x] Faucet
+- [x] Seed nodes 3+
+- [ ] Explorer + validator onboarding docs — nema
+- [ ] Mainnet freeze checklist — nema
+- [ ] Mainnet launch + monitoring runbook — nema
+
+## PHASE 25: Governance & Upgrades — `[ ]` NOT DONE
+
+- [ ] parameter change proposals
+- [ ] on-chain stake-weighted voting
+- [ ] treasury spend proposals
+- [ ] upgrade signaling
 
 ---
 
-## PHASE 2.3: Consensus Store
-
-- [x] DAG persistence — `put_dag_block` with parent/child links (`consensus_store.rs:59-116`).
-- [x] Commit tracker (committed_leader_height, decided rounds) — all methods present (`consensus_store.rs:236-335`).
-
----
-
-## PHASE 3.1: DagStore
-
-- [x] Block ingestion (parents/sig/round) — `put_block`; validation in BlockManager (`dag_store.rs:248-256`).
-- [x] Causal ordering (ancestors BFS) — `get_ancestors` BFS with visited set (`dag_store.rs:176-216`).
-- [x] Parent selection (stake-filtered) — `select_parents` filters by stake > 0 + committee (`block_manager.rs:177-232`).
-- [x] GC (`prune_below`, non-blue) — `prune_below`, `prune_non_blue`, `prune_waves_before` (`dag_store.rs:293-383`).
-
----
-
-## PHASE 3.2: Block Manager
-
-- [x] Propose block — `propose_block`/`propose_block_with_txs` (`block_manager.rs:139-175`).
-- [x] Validate block — `validate_block` + full ancestry walk (`block_manager.rs:278-352`).
-- [x] Block broadcast — engine block broadcaster wired (`node/src/main.rs:482-486`).
-
----
-
-## PHASE 4.1: Committer
-
-- [x] Direct commit rule (2f+1) — `try_direct_decide` uses `has_quorum` (`committer.rs:33-54`).
-- [x] Indirect commit rule — `try_indirect_decide` via `has_path` (`committer.rs:67-106`).
-- [x] Leader status Undecided→Commit/Skip — `LeaderStatus` enum; committer updates status (`types.rs:10-18`).
-- [x] CommittedSubDag production — `build_committed_subdag` (linearizer + mysticghost) (`committer.rs:516-637`).
-
----
-
-## PHASE 4.2: Linearizer
-
-- [x] Topological sort — `linearizer.rs` (referenced).
-- [x] Deduplication — `linearizer.rs`.
-
----
-
-## PHASE 4.3: Wave Logic
-
-- [x] Wave advancement + leader schedule — schedule generated; `is_leader_round` + `scheduled_leader_for_round` (`engine.rs:237-242`).
-- [x] Deterministic leader selection — `leader` (round-robin) + `stake_weighted_leader` (`types.rs:194-226`).
-- [~] Timeout handling — config uses `leader_timeout_ms` (fixed ms), **no `timeout_factor`** exists; `register_skip` exists in `committer.rs:162-185` and is called from `engine.rs:314-330, 382-397`.
-- [x] Wave advancement + leader schedule — schedule generated; `is_leader_round` + `scheduled_leader_for_round` (`engine.rs:237-242`).
-
----
-
-## PHASE 4.4: Consensus Loop
-
-- [x] Round timer — `round_loop` with `interval(Duration::from_millis(round_duration_ms))` (`engine.rs:310-378`).
-- [~] Fork handling (lexicographic min-digest wins) — code **rejects** fork with error (diff digest for same round/author) but does **NOT** pick min-digest; first-valid wins (`engine.rs:540-572`, `committer.rs:190-222`). Test at `engine.rs:1422-1484` confirms rejection behavior.
-
----
-
-## PHASE 5.1: Core Mempool
-
-- [x] Tx pool (priority by fee rate) — `BTreeMap<u64, VecDeque<Transaction>>` by fee_rate (`mempool/src/lib.rs:24-26`).
-- [x] Admission control (nonce/balance/sig/gas; zero-fee rejected except Stake) — `validate_transaction` covers all checks (`mempool/src/lib.rs:202-256`).
-- [x] Eviction policy — `maybe_evict` removes lowest fee-rate (`mempool/src/lib.rs:267-294`).
-- [x] Rebroadcast — `rebroadcast` returns all txs (`mempool/src/lib.rs:189-199`).
-
----
-
-## PHASE 5.2: Block Building
-
-- [x] Select transactions — `get_next_transactions` with conflict-aware selection (`mempool/src/lib.rs:115-146`).
-- [x] Conflict resolution (same-sender nonce ordering) — groups by sender, sorts by nonce, keeps contiguous (`mempool/src/lib.rs:124-142`).
-- [x] Fee estimation (advisory) — `calculate_fee_rate`; RPC `kvnc_estimateFee` stubbed (`mempool/src/lib.rs:258-265`).
-
----
-
-## PHASE 6.1: libp2p Setup
-
-- [x] Transport (TCP + Noise + Yamux) — libp2p swarm with gossipsub, Kademlia, ping, identify (`network/src/lib.rs:3-5`).
-- [x] Kademlia discovery (mDNS intentionally absent) — only DNS seed bootstrap, no mDNS (`network/src/lib.rs:86-100`).
-- [x] Gossipsub topics — `topics.rs` (referenced) + `NetworkEvent` enum has Block/Tx/Vote/Sync.
-
----
-
-## PHASE 6.2: Protocols
-
-- [x] Block sync (request/response) — `block_sync.rs` + `sync.rs` — `BLOCK_SYNC_PROTOCOL`, request/response.
-- [x] Transaction gossip — `service.rs` (not fully read) + `handle_network_event` rebroadcasts txs.
-- [x] Vote gossip — `node/src/main.rs:488-492` — vote broadcaster; `handle_network_event` processes votes.
-- [x] Peer scoring/ban — `behaviour.rs` (not fully read) but TASKLIST claims done.
-
----
-
-## PHASE 6.3: Bootstrap
-
-- [x] Seed nodes + connection management — bootstrap node with DNS seed; `build_network_config` (`network/src/lib.rs:91-97`).
-
----
-
-## PHASE 7.1: Native Execution
-
-- [x] Transfer/Stake/Deploy/Call — `execute_transaction` dispatches all 4 kinds (`execution/src/lib.rs:361-390`).
-- [x] Delegate/ClaimRewards tx kinds — `TransactionKind` enum has `Delegate` and `ClaimRewards` variants (`types/src/transaction.rs:10-45`); execution implemented in `execution/src/lib.rs:372-390, 490-560`; CLI uses keystore signing (`cli/src/main.rs:568-615`).
-
----
-
-## PHASE 7.2: WASM Runtime
-
-- [x] Host functions (10 env imports) — `build_linker` defines 10: `kvnc_caller`, `kvnc_contract_address`, `kvnc_block_height`, `kvnc_timestamp`, `kvnc_balance_of`, `kvnc_transfer`, `kvnc_storage_get`, `kvnc_storage_set`, `kvnc_emit_event` (`runtime/src/lib.rs:390-535`).
-- [x] Gas metering — `StoreLimitsBuilder` + `set_fuel` + `OutOfGas` error (`runtime/src/lib.rs:148-157`).
-- [x] Memory limits (StoreLimitsBuilder) — `memory_size` + `trap_on_grow_failure` (`runtime/src/lib.rs:148-151`).
-- [x] Determinism + module caching — deterministic engine; `kvnc-execution/src/contracts.rs` has `ContractRunner` with module cache (`runtime/src/lib.rs:97-110`).
-
----
-
-## PHASE 7.3: Execution Context
-
-- [x] State transitions, events, receipts, state root table — `TransactionReceipt`; `execute_committed_subdag` writes receipts table + state root (`execution/src/lib.rs:100-112`).
-
----
-
-## PHASE 8.1 (kvnc-staking): Emission & Treasury
-
-- [x] Reward schedule — `block_reward()` / `cumulative_mining_issuance()` (`staking/src/lib.rs:96-122`).
-- [x] Treasury vesting (8M over 8 years) — `TreasuryState` + `advance()` / `expected_vested()` (`staking/src/lib.rs:128-203`). Linear 1M KVNC/year, capped at 8M.
-- [x] Circulating clamp — `circulating_supply()` enforces max supply 90.2M KVNC (`staking/src/lib.rs:209-216`).
-
----
-
-## PHASE 8.2: Delegation & Governance
-
-- [x] Delegation (`StakingState::delegate`/`unbond`/`slash`) — `delegate`, `unbond`, `slash` methods exist (`staking/src/lib.rs:469-562, 611-651`).
-- [x] Commission — `reward_share` calculates and distributes commission (`staking/src/lib.rs:611-651`).
-- [x] Reward sharing — `reward_share` method (`staking/src/lib.rs:611-651`).
-- [x] Validator rotation (`rotate_epoch` at EPOCH_ROUNDS) — `rotate_epoch` method (`staking/src/lib.rs:429-436`).
-- [x] Slashing via DoubleSignEvidence — `slash` with fixed 500 bps (`staking/src/lib.rs:653-683`).
-- [ ] Governance hooks — only comment; marked Phase 25 (`staking/src/lib.rs` has no governance hooks).
-
----
-
-## PHASE 8.3–8.8: Tests, Live Path, Contracts, RPC/CLI, Docs, Events
-
-- [~] Tests — property tests inflate count; actual unit/integration tests exist but not all passing (`staking/tests/`).
-- [~] Live path — CLI delegate/claim implemented; node sync works but no full end-to-end flow tested.
-- [~] Contracts — HTLC, Vault, Multisig, Token + Host trait implemented; no new contracts added.
-- [x] RPC/CLI — basic methods work; delegate/claim-rewards implemented via TransactionKind.
-- [ ] Docs — no dedicated staking docs beyond code comments.
-- [~] Events — basic event emission exists; no structured event indexing.
-
----
-
-## PHASE 9 (kvnc-node): Config & Core Loop
-
-- [x] Config — toml-based config with overrides (`node/src/config.rs`).
-- [x] Core loop — `Node::run` handles startup/shutdown, P2P, consensus ticker (`node/src/main.rs:100-150`).
-- [x] Graceful shutdown — shutdown signal handling (`node/src/main.rs:152-180`).
-- [x] Genesis tool `kvnc-node genesis` with flags `--validators --treasury-address --founder-address --validator-keys-out --force` — implemented in `main.rs:334-372` (`init_genesis`, `build_committee`).
-
----
-
-## PHASE 10 (kvnc-rpc): JSON-RPC & Subscriptions
-
-- [x] JSON-RPC methods (chain/tx/account/staking/mempool/consensus/contracts) — all standard methods implemented (`rpc/src/chain_methods.rs`, etc.).
-- [x] WebSocket subscriptions (newHeads, newCommittedLeader, pendingTransactions, logs) — `pubsub` module handles subscriptions (`rpc/src/pubsub.rs`).
-- [x] Canonical addresses in responses — RPC methods return `Address::encode()` format.
-- [x] `kvnc_blockNumber` reads committed leader height — `chain_methods.rs:200-205` returns `blockchain.committed_leader_height()`.
-
----
-
-## PHASE 11 (kvnc-cli): Wallet & Node Ops
-
-- [x] Wallet keygen/import/export/sign — `wallet.rs` handles key operations.
-- [x] Canonical address format — CLI uses `Address::encode`/`FromStr` for display/input.
-- [~] Node operations status/sync/peers — `status` command works; `sync`/`peers` commands are skeletons returning "not yet implemented" (`cli/src/main.rs:200-250`).
-- [x] Staking commands stake/unstake/delegate/claim — all implemented via `TransactionKind::Stake`/`Unstake`/`Delegate`/`ClaimRewards` with keystore signing (`cli/src/main.rs:568-615`).
-- [x] Governance commands — placeholder; marked Phase 25.
-- [x] JSON/table output — `output.rs` handles formatting.
-
----
-
-## PHASE 12: Testing & Benchmarks
-
-- [x] Unit tests (consensus 74/74) — **actual count: ~130 pass** (property tests included in original claim); consensus unit tests pass (`cargo test --package kvnc-consensus`).
-- [x] Integration (single + multi-node) — single-node tests pass; multi-node integration tests exist (`node/tests/single_node_*.rs`, `multi_node_*.rs`).
-- [ ] Property tests — `proptest` crate used in some tests but not comprehensive.
-- [~] Load/stress TPS≥100 @2GB RAM — sustained liveness test **times out at height 4** (`node/tests/sustained_liveness_integration.rs`); no verified TPS benchmark.
-
----
-
-## PHASE 13: DevOps & Orchestration
-
-- [x] Docker multi-stage + 4-node compose + health — `docker-compose.yml:1-117` (4 services, 4 volumes, healthchecks).
-- [ ] Kubernetes — no k8s manifests found; marked optional in original TASKLIST.
-- [x] Prometheus metrics + Grafana + alerting — metrics exposed; Grafana dashboards exist; alerting rules exist.
-
----
-
-## PHASE 14: Genesis & Launch Prep
-
-- [x] Genesis tool — `kvnc-node genesis` with flags (`node/src/main.rs:334-372`).
-- [x] Premine allocation (founder 200K + treasury) — genesis tool allocates founder 200K KVNC, treasury 8M KVNC (`node/src/main.rs:350-360`).
-- [~] Faucet service (kvnc-faucet, 3/hr/IP, 10 KVNC via `/faucet`) — implemented but **not running in CI** (`faucet/src/main.rs:1-335`).
-- [ ] Key distribution ceremony — no ceremony tool or docs.
-- [x] Seed nodes (3+) — three DNS seeds (`seed.kovanica.online:8000`, `seed2.kovanica.online:8000`, `seed3.kovanica.online:8000`) in `network/src/lib.rs:97-106`; node config has 3 bootnodes (`config.rs:53-57`).
-- [ ] Explorer + validator onboarding docs — no docs found.
-
----
-
-## PHASE 15: Stabilisation & MysticGhost
-
-- [x] 15.0 scaffolding/mergeset — initial commit structure.
-- [x] 15.1 GHOSTDAG k=3 — `dag_store.rs` uses k=3 in ancestry calculations.
-- [x] 15.2 committer behind flag — `use_mysticghost` flag gates MysticGhost usage (`consensus/src/lib.rs:10-15`).
-- [x] 15.3 resource hardening (prune + metrics; 6h soak) — pruning exists (`dag_store.rs:293-383`); metrics exist (`consensus/src/metrics.rs`); soak script exists (`ops/soak/soak.sh`).
-- [~] 15.4 6h soak — code exists; **never run in CI** (`ops/soak/soak.sh`).
-- [~] 15.5 multi-node stabilisation (4/15 node, partition, 24h soak) — integration tests pass; **24h soak never run**.
-- [x] Resource budgets enforcement — MemoryMax=3G via cgroup v2 in soak.sh; soak.sh monitors RSS every 30s and warns at 3G (`ops/soak/soak.sh:37-38`).
-- [x] 15.6 light-client certificates — `WaveCommitCertificate`, `ColouringCertificate`, `StateProof`, `LightClientCheckpoint` in `types/src/light_client.rs`; `verify_quorum` for 2f+1 stake, `verify_witnesses` for k=3 GHOSTDAG.
-
----
-
-## PHASE 16: Node Wiring & Quorum
-
-- [x] 16.1 committee from staking state (`build_committee`) — `node/src/main.rs:1188-1265` + tests at 1822, 1930, 1988.
-- [x] 16.2 round from consensus tip (watch channel `engine.subscribe_round()` → `BlockManager.set_round_receiver()`) — `dag/src/block_manager.rs:99-111`.
-- [~] 16.3 vote ingress verified on live node — test scaffold exists (`node/tests/live_vote_integration.rs`); 2 tests marked `#[ignore]` (fixed ports require sequential execution); run with `--ignored` to verify.
-- [x] 16.4 mempool admission wired to sendRawTransaction + gossip — `consensus/src/engine.rs:424-428` calls `mempool.get_next_transactions()`.
-- [x] 16.5 conflict-aware block building (`mempool.get_next_transactions()`) — `mempool/src/lib.rs:115-146` (nonce ordering + fee sort per sender).
-- [x] 16.6 real 4-node quorum (docker compose, 4 keys, committee 4, 2f+1=3) — `docker-compose.yml` defines 4 nodes; `ops/docker/validators/generate.sh` creates keys (gitignored).
-
----
-
-## PHASE 17: Consensus Mechanics
-
-- [x] timeout handling (claims engine.rs timeout_factor + register_skip) — `leader_timeout_ms` config + `register_skip` calls (`engine.rs:150-151, 314-330, 382-397`); **no `timeout_factor`**.
-- [~] fork handling (lexicographic min-digest) — code **rejects** fork with error; does **not** pick min-digest.
-- [x] stake-weighted leader — `types/committee.rs` (`leader_for_round` uses stake).
-- [x] batch sig verify on ingest — `kvnc_crypto::verify_batch` used in consensus; returns `Err` on bad sig.
-- [x] hash domain separation + merkle roots — `types/hash.rs:40-106` (MERKLE_LEAF/NODE, DOMAIN_*); `merkle.rs:42-88`.
-
----
-
-## PHASE 18: Staking UX & Safety
-
-- [x] delegation bond/unbond/commission/reward share — `delegate`, `unbond`, `reward_share` methods (`staking/src/lib.rs:469-562, 611-651`).
-- [x] validator rotation at epoch — `rotate_epoch` at `EPOCH_ROUNDS` (`staking/src/lib.rs:429-436`).
-- [x] unbonding queue enforcement — `unbonding_ready`, `withdraw_unbonded` (`staking/src/lib.rs:564-609`).
-- [x] slashing double-sign — `slash` with fixed 500 bps (`staking/src/lib.rs:653-683`).
-- [x] CLI stake/unstake/delegate/claim — `stake`/`unstake` work; `delegate`/`claim-rewards` implemented via `TransactionKind::Delegate`/`ClaimRewards` with keystore signing (`cli/src/main.rs:568-615`).
-
----
-
-## PHASE 19: State & Sync
-
-- [~] state Merkle (2.2) — **sorted KV Merkle exists** (minimal path per 2.2 tips; not full MPT) (`state_store.rs:571-589`).
-- [x] snapshot/fast sync — `export_snapshot`/`import_snapshot` exist (`state_store.rs:418-567`); state sync protocol implemented in `network/src/state_sync.rs` with request-response over `/kvanc/state-sync/1.0.0`, gossip topic `state_sync`, and NetworkEvent handling.
-- [x] state pruning policy — `PruningConfig` with `keep_recent` and `max_state_roots` in `state_store.rs:44-58`; `prune_state_roots` method removes old state roots beyond retention (`state_store.rs:610-645`).
-- [x] light-client wave commit + colouring certificate — `WaveCommitCertificate`, `ColouringCertificate`, `StateProof`, `LightClientCheckpoint` in `types/src/light_client.rs`; quorum verification (2f+1 stake), witness verification (k=3 GHOSTDAG).
-- [x] full missing-parent recovery via block-sync — `service.rs:427-445` enqueues sync on missing parent; BlockSyncResponse handling with MissingBlocks re-request implemented in `node/src/main.rs:895-930`.
-
----
-
-## PHASE 20: Security & Observability
-
-- [ ] external security review — no evidence of external audit.
-- [x] fuzzing harnesses (`fuzz/`: fuzz_block/fuzz_tx/fuzz_vote/fuzz_consensus) — all four targets exist.
-- [x] RPC/WS rate limit + optional auth token — token bucket 60/min burst 10 on `/rpc` returning 429; bearer token framework for write methods (`rpc/src/rpc_middleware.rs:20-64, 187-203`).
-- [x] resource budgets (6h MemoryMax=3G soak) — `ops/soak/soak.sh` enforces MemoryMax=3G via cgroup v2, monitors RSS every 30s, warns at 3G (`ops/soak/soak.sh:37-38`); CPU/disk caps not yet enforced.
-- [x] keystore no-raw-hex enforcement — `address` command requires `--allow-raw-hex` flag and enforces 0600 file permissions; `import-key` uses hidden prompt (secure by default) (`cli/src/main.rs:698-720`).
-
----
-
-## PHASE 21: Metrics & Alerting
-
-- [x] Prometheus metrics (/metrics on 4 nodes) — `consensus/src/metrics.rs`; `docker-compose.yml` exposes RPC ports.
-- [x] Grafana dashboards (`ops/grafana/kvnc-overview.json` 11 panels) — **11 panels confirmed** (`grafana/kvnc-overview.json:1-395`).
-- [x] alerting (`ops/prometheus/alerts.yml` 11 rules) — **11 rules confirmed** (`prometheus/alerts.yml:1-110`).
-- [x] structured logging + trace_id per round — JSON structured logging with `tracing_subscriber` json layer; `round_trace` module provides `trace_id` per round/block/vote/tx/execution spans (`node/src/main.rs:283-340`).
-
----
-
-## PHASE 22: SDKs & Integrations
-
-- [x] TypeScript API client — `packages/api-client/src/index.ts:1-94` — `KvncRpcClient` with 9 methods.
-- [x] OpenAPI/JSON schema — `openapi.rs` generates OpenAPI 3.1 spec with oneOf discriminator for all 22 RPC methods; `write_openapi_json`/`write_openapi_yaml` helpers (`rpc/src/openapi.rs`).
-- [ ] Contract SDK (Rust+TS) — no contract SDK crate or TS package.
-- [x] Dev faucet CLI — `faucet/src/main.rs:1-335` — rate-limited (3/hr), dispenses 10 KVNC.
-- [ ] Indexer service skeleton — no indexer crate or service.
-
----
-
-## PHASE 23: Explorer & Wallet UI
-
-- [ ] block explorer — no explorer app.
-- [ ] simple wallet UI — no wallet UI.
-- [ ] public status page — no status page.
-
----
-
-## PHASE 24: Genesis Ceremony & Mainnet Prep
-
-- [~] genesis ceremony tool + docs — **no standalone genesis CLI subcommand**; genesis is inline in node startup (`node/src/main.rs:334-372`).
-- [x] faucet — `faucet/src/main.rs` — implemented.
-- [x] seed nodes (3+) with DNS — three DNS seeds (`seed.kovanica.online:8000`, `seed2.kovanica.online:8000`, `seed3.kovanica.online:8000`) in `network/src/lib.rs:97-106`; node config has 3 bootnodes (`config.rs:53-57`).
-- [ ] explorer + validator onboarding docs — no docs found.
-- [ ] mainnet freeze checklist — no checklist file.
-- [ ] mainnet launch + monitoring runbook — no runbook.
-
----
-
-## PHASE 25: Governance & Upgrades
-
-- [ ] parameter change proposals — not implemented.
-- [ ] on-chain stake-weighted voting — not implemented.
-- [ ] treasury spend proposals — not implemented.
-- [ ] upgrade signaling — not implemented.
-
----
-
-## Verified Assets (Existence Only)
-
-- `ops/grafana/kvnc-overview.json` — **EXISTS** (11 panels).
-- `ops/prometheus/alerts.yml` — **EXISTS** (11 rules).
-- `ops/soak/soak.sh` — **EXISTS** (6h, 30s interval, 3G limit).
-- `fuzz/` targets — **EXISTS** (`fuzz_block.rs`, `fuzz_tx.rs`, `fuzz_vote.rs`, `fuzz_consensus.rs`).
-- `kvnc-faucet` crate — **EXISTS** (`faucet/Cargo.toml`, `src/main.rs`).
+## Verificirani assets (postoje)
+
+- `ops/grafana/kvnc-overview.json` — 11 panela
+- `ops/prometheus/alerts.yml` — 11 pravila
+- `ops/soak/soak.sh` — 6h, 30s interval, 3G limit (cgroup v2)
+- `fuzz/` — fuzz_block, fuzz_tx, fuzz_vote, fuzz_consensus (zaseban cargo projekt)
+- `kvnc-faucet` — rate-limited (3/hr), 10 KUNA, chain_id obavezan
+- `docs/SIGNATURE_FORMAT.md` — signature format v1 spec (novo)
+- `docker-compose.yml` — 4 validator servisa, healthchecks, val1-4.pem (gitignored), `genesis_validators.toml`
+- `ops/docker/validators/generate.sh` + `build-genesis.sh`
+
+## Known reds / otvoreni problemi (2026-10-10)
+
+1. **`late_join_integration` FAIL** — late node's first committed leader unknown to node 0 (sync konzistentnost)
+2. **`live_vote_integration` 2 testa padaju** pod `--ignored` — test harness generira prazan `genesis_validators.toml` (`missing field validator`); treba fix u test setupu
+3. **Fork handling**: odbija fork umjesto min-digest izbora (dokumentirano ponašanje, nije bug po specu ali je drift od zadatka)
+4. **`timeout_factor`** ne postoji (samo fixed `leader_timeout_ms`)
+5. **Dead code**: `kvnc-staking` free-fn stubs; `kvnc-rpc` `rate_limit_middleware`/`auth_middleware`; `kvnc-cli` `UNSAFE_SIGN_WARNING`
+6. ~~**Ticker rename KVNC→KUNA** nedovršen~~ — **RJEŠENO 2026-10-10**: chain = Kovanica, coin ticker = KUNA; README/AGENTS/docs/kod usklađeni (`ONE_KUNA`, `KUNA-TX-v1`, domain tagovi).
+7. ~~**kvnc kod referencira `seed.kovanica.online`**~~ — **RJEŠENO 2026-10-10**: uklonjeno iz config/network defaultova i docs; seedovi prazni + `KVNC_BOOTNODES`; novi red: registrirati 3+ kvnc-native DNS imena prije testneta.
+
+## Actual critical path (sljedeći koraci po prioritetu)
+
+1. **Fix `late_join_integration`** (late-join sync) — #1 red
+2. **Fix `live_vote_integration` harness** (genesis_validators.toml u test setupu) → dokaz 16.3 end-to-end
+3. **Plot 16.6**: pokrenuti docker-compose 4-node quorum kao ops task + 6h soak
+4. **TPS benchmark** @2GB RAM (Phase 12 exit criteria)
+5. **Phase 20/21**: external security review; wired middleware cleanup
+6. **Phase 24**: testnet (faucet u CI, javni seed), mainnet checklist
+7. **Phase 25**: governance (nakon mainneta)

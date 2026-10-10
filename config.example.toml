@@ -29,9 +29,11 @@ listen_addr = "0.0.0.0:9000"
 rpc_addr = "127.0.0.1"
 rpc_port = 8545
 
-# Bootstrap peers. A DNS seed name is preferred; never point these at a
-# Cloudflare-proxied (orange-cloud) hostname for TCP.
-bootnodes = ["seed.kovanica.online:9000"]
+# Bootstrap peers. DNS seed name(s) for the kvnc network; never point these at
+# a Cloudflare-proxied (orange-cloud) hostname for TCP. No hosts are hard-coded
+# in the node — supply 3+ kvnc-native seeds here or via KVNC_BOOTNODES.
+# Example (placeholder — replace before connecting to a real network):
+bootnodes = []
 
 # Path to a validator signing key file containing a 32-byte hex seed.
 # When omitted, the node generates an ephemeral key (not suitable for

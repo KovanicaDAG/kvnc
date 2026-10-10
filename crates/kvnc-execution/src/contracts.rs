@@ -1266,7 +1266,7 @@ mod tests {
         assert_eq!(token.balances.get(&recipient.0), Some(&400));
     }
 
-    const PREIMAGE: &[u8] = b"kovanica-preimage";
+    const PREIMAGE: &[u8] = b"kvnc-preimage";
 
     fn htlc_create_args(claimer: &Address, amount: u128, expiry: u64) -> Vec<u8> {
         bincode::serialize(&(claimer.0, amount, kvnc_common::hash(PREIMAGE), expiry))

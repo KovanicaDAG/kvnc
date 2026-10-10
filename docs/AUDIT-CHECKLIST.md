@@ -2,12 +2,12 @@
 
 Based on `docs/SEED-DNS-AUDIT.md` (port 8000 vs 9000 gap) and HARD RULES.
 
-## 1. Seed / DNS audit (must complete before mainnet)
-- [ ] Confirm live `/api/bootstrap` P2P port (documented: 8000; docs reference 9000) — reconcile
-- [ ] Document 3+ DNS seeds (min redundancy); current: `seed.kovanica.online:9000` only
-- [ ] Verify seed resolves to origin IP (not orange-cloud / Cloudflare proxy)
-- [ ] Confirm TLS / plaintext TCP policy: port 9000 (or confirmed live port) plaintext only, no libp2p
-- [ ] Check `KOVANICA_PEERS` env defaults do not include explorer hostnames for TCP 9000
+## 1. Seed / DNS audit (must complete before testnet)
+- [ ] Register 3+ **kvnc-native** DNS seeds (`seed1/2/3.<kvnc-domain>`); none may reuse another project's names
+- [ ] Verify each seed resolves to the origin IP (grey-cloud; no CDN/proxy) for TCP 8000
+- [ ] Publish each seed's libp2p PeerId and confirm `/p2p/` in the multiaddr matches
+- [ ] Confirm `KVNC_BOOTNODES` defaults stay empty in code; seeds only via env/TOML
+- [ ] Confirm P2P does not point at explorer/API hostnames
 
 ## 2. External audit scope (not completed — recommend before mainnet)
 - [ ] Consensus (Mysticeti DAG, wave=3, k=3): verify uncertified commit rule, no certificate dependency
@@ -18,11 +18,11 @@ Based on `docs/SEED-DNS-AUDIT.md` (port 8000 vs 9000 gap) and HARD RULES.
 - [ ] P2P: eclipse / Sybil resistance, peer discovery, gossip limits
 - [ ] Node / RPC: `KVNC_RPC_AUTH=disable` documented for test only; production must enforce auth; no key/seed passed to node
 
-## 3. Live /api/bootstrap verification (repeat before release)
-- [ ] Run `curl -s https://explorer.kovanica.online/api/bootstrap | jq`
+## 3. Live node verification (repeat before release)
+- [ ] Run `curl -s http://<kvnc-node>/api/bootstrap | jq` against a **kvnc** node (local or own testnet)
 - [ ] Compare `listen` and `peers` fields against docs / env defaults
 - [ ] Confirm `MINE=0`, `FAUCET=0`, `OPERATOR=0` on participant nodes
-- [ ] Verify `KOVANICA_DATA` preserved after genesis; no reset (`ALLOW_RESET=0`)
+- [ ] Verify `KVNC_DATA` preserved after genesis; no reset (`KVNC_ALLOW_RESET=0`)
 
 ## 4. CLI / wallet audit (related gaps from tasklist)
 - [ ] Delegate / claim skeleton: HTLC claim verified (`A8.2-DELEGATION-SKELETON.md`); delegation deferred Phase 18

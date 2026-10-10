@@ -195,22 +195,22 @@ mod tests {
 
     #[test]
     fn message_id_is_deterministic() {
-        let first = message_id(b"kovanica-block");
-        let second = message_id(b"kovanica-block");
-        let other = message_id(b"kovanica-transaction");
+        let first = message_id(b"kvnc-block");
+        let second = message_id(b"kvnc-block");
+        let other = message_id(b"kvnc-transaction");
         assert_eq!(first, second);
         assert_ne!(first, other);
     }
 
     #[test]
     fn split_peer_suffix_handles_bootstrap_addresses() {
-        let addr: Multiaddr = "/dns4/seed.kovanica.online/tcp/9000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        let addr: Multiaddr = "/dns4/seed1.kvnc.invalid/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
             .parse()
             .expect("valid multiaddr");
         let (peer, base) = split_peer_suffix(&addr)
             .expect("parses")
             .expect("has a peer id suffix");
-        assert_eq!(base.to_string(), "/dns4/seed.kovanica.online/tcp/9000");
+        assert_eq!(base.to_string(), "/dns4/seed1.kvnc.invalid/tcp/8000");
         assert_eq!(addr.to_string(), format!("{base}/p2p/{peer}"));
     }
 

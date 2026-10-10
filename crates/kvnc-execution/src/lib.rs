@@ -356,7 +356,7 @@ impl ExecutionContext {
             "Committed leader round={} author={} reward={} {} (height={}) paid to {:?}",
             subdag.leader_round,
             subdag.leader_author,
-            reward.amount / kvnc_staking::ONE_KVNC,
+            reward.amount / kvnc_staking::ONE_KUNA,
             kvnc_staking::TICKER,
             reward.height,
             reward.recipient,
@@ -933,7 +933,7 @@ impl ExecutionContext {
         info!(
             target: "kvnc-execution",
             "Treasury claim: {} {} credited to {:?}",
-            claimed / kvnc_staking::ONE_KVNC,
+            claimed / kvnc_staking::ONE_KUNA,
             kvnc_staking::TICKER,
             treasury_address
         );
@@ -1593,7 +1593,7 @@ mod tests {
                 &txn,
                 &sender,
                 &Account {
-                    balance: 1000 * kvnc_staking::ONE_KVNC,
+                    balance: 1000 * kvnc_staking::ONE_KUNA,
                     nonce: 0,
                     code_hash: [0u8; 32],
                     code: Vec::new(),
@@ -1617,7 +1617,7 @@ mod tests {
         let tx = create_transfer_tx(
             &sender_key,
             &recipient,
-            100 * kvnc_staking::ONE_KVNC,
+            100 * kvnc_staking::ONE_KUNA,
             0,
             1000,
         );
@@ -1664,7 +1664,7 @@ mod tests {
                 &txn,
                 &sender,
                 &Account {
-                    balance: 1000 * kvnc_staking::ONE_KVNC,
+                    balance: 1000 * kvnc_staking::ONE_KUNA,
                     nonce: 0,
                     code_hash: [0u8; 32],
                     code: Vec::new(),
@@ -1688,7 +1688,7 @@ mod tests {
         let tx = create_transfer_tx(
             &sender_key,
             &recipient,
-            100 * kvnc_staking::ONE_KVNC,
+            100 * kvnc_staking::ONE_KUNA,
             0,
             1000,
         );
@@ -1782,7 +1782,7 @@ mod tests {
         // Victim account the attacker does NOT hold the key for.
         let victim = address_of(&test_keypair(1));
         let attacker = Address([0xAA; 32]);
-        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let initial = 1000 * kvnc_staking::ONE_KUNA;
         let mut ctx = setup_funded_sender(&storage, &victim, initial);
 
         let mut forged = Transaction {
@@ -1790,7 +1790,7 @@ mod tests {
             nonce: 0,
             kind: TransactionKind::Transfer {
                 to: attacker,
-                amount: 500 * kvnc_staking::ONE_KVNC,
+                amount: 500 * kvnc_staking::ONE_KUNA,
             },
             fee: 1000,
             signature: Signature([1u8; 64]),
@@ -1816,7 +1816,7 @@ mod tests {
 
         let victim = address_of(&test_keypair(1));
         let attacker_key = test_keypair(2);
-        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let initial = 1000 * kvnc_staking::ONE_KUNA;
         let mut ctx = setup_funded_sender(&storage, &victim, initial);
 
         // Attacker signs a valid tx for its own address, then swaps in the
@@ -1824,7 +1824,7 @@ mod tests {
         let mut tx = create_transfer_tx(
             &attacker_key,
             &address_of(&attacker_key),
-            500 * kvnc_staking::ONE_KVNC,
+            500 * kvnc_staking::ONE_KUNA,
             0,
             1000,
         );
@@ -1850,8 +1850,8 @@ mod tests {
         let key = test_keypair(1);
         let sender = address_of(&key);
         let recipient = Address([2u8; 32]);
-        let initial = 1000 * kvnc_staking::ONE_KVNC;
-        let amount = 100 * kvnc_staking::ONE_KVNC;
+        let initial = 1000 * kvnc_staking::ONE_KUNA;
+        let amount = 100 * kvnc_staking::ONE_KUNA;
         let fee = 1000;
         let mut ctx = setup_funded_sender(&storage, &sender, initial);
 
@@ -1880,13 +1880,13 @@ mod tests {
         let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
         let key = test_keypair(1);
         let sender = address_of(&key);
-        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let initial = 1000 * kvnc_staking::ONE_KUNA;
         let fee = 1000;
         let mut ctx = setup_funded_sender(&storage, &sender, initial);
         let staked_before = ctx.staking.total_staked;
         let delegations_before = ctx.staking.delegations.len();
 
-        let tx = delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KVNC, 0);
+        let tx = delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KUNA, 0);
         let result = execute_single_tx(&mut ctx, &storage, tx);
         let receipt = &result.receipts[0];
         assert!(!receipt.success, "receipt must report failure");
@@ -1914,14 +1914,14 @@ mod tests {
         let key = test_keypair(1);
         let sender = address_of(&key);
         let recipient = Address([2u8; 32]);
-        let initial = 1000 * kvnc_staking::ONE_KVNC;
-        let amount = 10 * kvnc_staking::ONE_KVNC;
+        let initial = 1000 * kvnc_staking::ONE_KUNA;
+        let amount = 10 * kvnc_staking::ONE_KUNA;
         let fee = 1000;
         let mut ctx = setup_funded_sender(&storage, &sender, initial);
 
         let txs = vec![
             create_transfer_tx(&key, &recipient, amount, 0, fee),
-            delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KVNC, 1),
+            delegate_tx(&key, Address([0xEE; 32]), 100 * kvnc_staking::ONE_KUNA, 1),
             create_transfer_tx(&key, &recipient, amount, 2, fee),
         ];
         let subdag = CommittedSubDag {
@@ -1952,7 +1952,7 @@ mod tests {
         let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
         let key = test_keypair(1);
         let sender = address_of(&key);
-        let mut ctx = setup_funded_sender(&storage, &sender, 100_000 * kvnc_staking::ONE_KVNC);
+        let mut ctx = setup_funded_sender(&storage, &sender, 100_000 * kvnc_staking::ONE_KUNA);
         let before = staking_state_bytes(&ctx.staking);
         let tx = signed_tx(
             &key,
@@ -1985,11 +1985,11 @@ mod tests {
         let run = || {
             let dir = tempfile::tempdir().expect("tempdir");
             let storage = Storage::new(dir.path().join("r.redb")).expect("storage");
-            let mut ctx = setup_funded_sender(&storage, &sender, 1000 * kvnc_staking::ONE_KVNC);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1000 * kvnc_staking::ONE_KUNA);
             let txs = vec![
-                create_transfer_tx(&key, &recipient, kvnc_staking::ONE_KVNC, 0, 1000),
-                delegate_tx(&key, Address([0xEE; 32]), kvnc_staking::ONE_KVNC, 1),
-                delegate_tx(&key, Address([3u8; 32]), kvnc_staking::ONE_KVNC, 2),
+                create_transfer_tx(&key, &recipient, kvnc_staking::ONE_KUNA, 0, 1000),
+                delegate_tx(&key, Address([0xEE; 32]), kvnc_staking::ONE_KUNA, 1),
+                delegate_tx(&key, Address([3u8; 32]), kvnc_staking::ONE_KUNA, 2),
                 create_transfer_tx(&key, &recipient, u64::MAX / 2, 3, 1000),
             ];
             let subdag = CommittedSubDag {
@@ -2304,7 +2304,7 @@ mod tests {
     }
     // ---- staking wiring -------------------------------------------------
 
-    const K: u64 = kvnc_staking::ONE_KVNC;
+    const K: u64 = kvnc_staking::ONE_KUNA;
 
     fn subdag_at(round: u64, txs: Vec<Transaction>) -> CommittedSubDag {
         let leader = sample_block_at(0, round);
