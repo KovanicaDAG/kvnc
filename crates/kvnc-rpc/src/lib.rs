@@ -138,7 +138,14 @@ pub struct RpcState {
     pub rate_limiter: Arc<RateLimiterState>,
     /// Authentication config
     pub auth_config: Arc<AuthConfig>,
+    /// Outbound gossip for transactions accepted via `kvnc_sendRawTransaction`.
+    /// `None` disables publishing (tests, RPC-only setups).
+    pub tx_gossip: Option<TxGossipSender>,
 }
+
+/// Channel the node drains to publish RPC-submitted transactions on gossip,
+/// through the same path as re-gossip of accepted transactions.
+pub type TxGossipSender = tokio::sync::mpsc::UnboundedSender<kvnc_types::Transaction>;
 
 #[derive(Clone)]
 pub struct RpcServer {
@@ -517,6 +524,7 @@ mod tests {
             events: EventBus::new(),
             rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
             auth_config: Arc::new(AuthConfig::default()),
+            tx_gossip: None,
         };
         (dir, state)
     }
@@ -606,6 +614,7 @@ mod tests {
             rate_limiter: Arc::new(RateLimiterState::new(rate.clone())),
             auth_config: Arc::new(auth.clone()),
             health: NodeHealth::new(),
+            tx_gossip: None,
         }
     }
 
@@ -788,6 +797,7 @@ mod tests {
                 rate_limiter: _,
                 auth_config: _,
                 health: _,
+                tx_gossip: _,
             } = s;
         };
     }
