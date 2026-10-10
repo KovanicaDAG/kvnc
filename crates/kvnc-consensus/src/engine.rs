@@ -86,6 +86,16 @@ pub trait DagStoreTrait: Send + Sync {
         round: kvnc_types::Round,
         leader_hash: &Hash,
     ) -> Result<(), kvnc_dag::DagStoreError>;
+    /// Atomically mark `round` decided for `leader_hash` AND advance the
+    /// committed leader height / last committed leader. Implementations
+    /// backed by durable storage must apply both or neither (one write
+    /// transaction), so a crash can never leave a decided round without the
+    /// matching committed-leader record or vice versa.
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: kvnc_types::Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, kvnc_dag::DagStoreError>;
     /// Get the mergeset for a leader block (blocks reachable from leader not in previous sub-DAGs).
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     /// Get multiple blocks by their hashes.
@@ -605,30 +615,48 @@ where
         Ok(())
     }
 
-    /// Record a vote for a leader block in local consensus bookkeeping.
+    /// Ingest a vote for a leader block. This is the authentication boundary
+    /// for votes: every vote, including ones received over gossip, must enter
+    /// consensus through this method.
     ///
-    /// This API carries no authentication proof and is not a wire-vote
-    /// ingestion boundary. Unknown authorities, leader rounds, and hashes are
-    /// ignored rather than counted.
-    pub fn process_vote(
-        &self,
-        leader_round: Round,
-        voter: kvnc_types::AuthorityIndex,
-        vote_hash: Hash,
-    ) -> Result<(), ConsensusError> {
-        if self.committee.get_by_index(voter).is_none() {
-            debug!("Dropping vote from unknown authority {voter}");
-            return Ok(());
-        }
-        let Some(leader) = self.committer.get_leader(leader_round) else {
-            debug!("Dropping vote for unknown leader round {leader_round}");
-            return Ok(());
+    /// A vote is counted only if all of the following hold, checked in order:
+    ///
+    /// 1. `vote.voter` is a member of the current [`CommitteeInfo`];
+    /// 2. `vote.signature` is a valid signature over
+    ///    [`kvnc_types::Vote::signature_data`] under that member's public key
+    ///    from the committee (a signature made with any other key, including
+    ///    another validator's, is rejected);
+    /// 3. `vote.leader_round` is a leader round and a leader block is
+    ///    registered for it;
+    /// 4. `vote.leader_hash` matches the registered leader block;
+    /// 5. the voter has not already voted for this leader round. A duplicate
+    ///    is rejected and contributes its stake at most once.
+    ///
+    /// Rejected votes return [`ConsensusError::VoteRejected`] and never change
+    /// consensus state. Accepted votes may trigger a commit.
+    pub fn process_vote(&self, vote: &kvnc_types::Vote) -> Result<(), ConsensusError> {
+        let leader_round = vote.leader_round;
+        let voter = vote.voter;
+
+        let Some(authority) = self.committee.get_by_index(voter) else {
+            return Err(VoteRejection::UnknownVoter(voter).into());
         };
-        if leader.block_hash != Some(vote_hash) {
-            debug!("Dropping vote with mismatched hash for leader round {leader_round}");
-            return Ok(());
+        if kvnc_crypto::verify(
+            &authority.public_key,
+            &vote.signature_data(),
+            &vote.signature,
+        )
+        .is_err()
+        {
+            return Err(VoteRejection::BadSignature(voter).into());
         }
-        let has_quorum = self.committer.add_vote(leader_round, voter, vote_hash);
+        if !is_leader_round(leader_round) {
+            return Err(VoteRejection::NotLeaderRound(leader_round).into());
+        }
+
+        let has_quorum = self
+            .committer
+            .add_verified_vote(leader_round, voter, vote.leader_hash)?;
         if has_quorum {
             info!("Leader round {} now has quorum", leader_round);
             self.try_commit_and_deliver()?;
@@ -717,6 +745,34 @@ pub enum ConsensusError {
     Storage(#[from] kvnc_storage::StorageError),
     #[error("Invalid consensus vote: {0}")]
     InvalidVote(String),
+    #[error("Vote rejected: {0}")]
+    VoteRejected(#[from] VoteRejection),
+}
+
+/// Why [`ConsensusEngine::process_vote`] refused to count a vote.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VoteRejection {
+    /// The voter index is not a member of the committee.
+    #[error("voter {0} is not a committee member")]
+    UnknownVoter(kvnc_types::AuthorityIndex),
+    /// The signature does not verify under the voter's committee key.
+    #[error("invalid signature for voter {0}")]
+    BadSignature(kvnc_types::AuthorityIndex),
+    /// The vote targets a round that is not a leader round.
+    #[error("round {0} is not a leader round")]
+    NotLeaderRound(Round),
+    /// No leader block is registered for the voted round.
+    #[error("no leader block registered for round {0}")]
+    UnknownLeaderRound(Round),
+    /// The voted hash differs from the registered leader block.
+    #[error("vote hash does not match the leader block for round {0}")]
+    LeaderHashMismatch(Round),
+    /// The voter already has a vote recorded for this leader round.
+    #[error("duplicate vote from voter {voter} for round {round}")]
+    Duplicate {
+        round: Round,
+        voter: kvnc_types::AuthorityIndex,
+    },
 }
 
 #[cfg(test)]
@@ -828,6 +884,15 @@ mod tests {
 
         fn commit_leader(&self, _leader_hash: &Hash) -> Result<u64, kvnc_dag::DagStoreError> {
             Ok(self.decisions.lock().len() as u64 + 1)
+        }
+
+        fn mark_decided_and_commit_leader(
+            &self,
+            round: Round,
+            leader_hash: &Hash,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            self.mark_round_decided(round, leader_hash)?;
+            self.commit_leader(leader_hash)
         }
 
         fn mark_round_decided(
@@ -997,6 +1062,22 @@ mod tests {
         (engine, dag, key)
     }
 
+    fn signed_vote(
+        key: &kvnc_types::SigningKey,
+        leader_round: Round,
+        voter: AuthorityIndex,
+        leader_hash: Hash,
+    ) -> kvnc_types::Vote {
+        let mut vote = kvnc_types::Vote {
+            leader_round,
+            leader_hash,
+            voter,
+            signature: kvnc_types::Signature([0; 64]),
+        };
+        vote.signature = kvnc_crypto::sign(key, &vote.signature_data());
+        vote
+    }
+
     #[tokio::test]
     async fn start_preserves_the_node_signing_identity() {
         let (engine, dag, key) = test_engine(10);
@@ -1044,10 +1125,17 @@ mod tests {
             merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
-        engine.process_vote(3, 0, digest).unwrap();
+        let vote = signed_vote(&key, 3, 0, digest);
+        engine.process_vote(&vote).unwrap();
         assert_eq!(receiver.try_recv().unwrap().leader.digest, digest);
-        // The same explicit vote after a committed round cannot redeliver it.
-        engine.process_vote(3, 0, digest).unwrap();
+        // The same vote after a committed round is a rejected duplicate and
+        // cannot redeliver the commit.
+        assert!(matches!(
+            engine.process_vote(&vote),
+            Err(ConsensusError::VoteRejected(
+                VoteRejection::Duplicate { .. }
+            ))
+        ));
         assert!(receiver.try_recv().is_err());
         assert_eq!(dag.decisions.lock().as_slice(), &[(3, digest)]);
     }
@@ -1095,7 +1183,7 @@ mod tests {
 
         dag.fail_next_decision_mark.store(true, Ordering::SeqCst);
         assert!(matches!(
-            engine.process_vote(3, 0, digest),
+            engine.process_vote(&signed_vote(&key, 3, 0, digest)),
             Err(ConsensusError::DagStore(_))
         ));
         assert_eq!(engine.committer.last_decided_round(), 0);
@@ -1107,10 +1195,14 @@ mod tests {
 
         // Even with a later quorum available, the earlier failed decision is
         // retried and delivered first; the later one follows it.
-        engine.process_vote(6, 0, later_digest).unwrap();
+        engine
+            .process_vote(&signed_vote(&key, 6, 0, later_digest))
+            .unwrap();
         assert_eq!(receiver.try_recv().unwrap().leader_round, 3);
         assert!(receiver.try_recv().is_err());
-        engine.process_vote(6, 0, later_digest).unwrap();
+        // A repeated vote is now rejected as a duplicate, so drive the next
+        // commit attempt directly.
+        engine.try_commit_and_deliver().unwrap();
         assert_eq!(receiver.try_recv().unwrap().leader_round, 6);
         assert_eq!(
             dag.decisions.lock().as_slice(),

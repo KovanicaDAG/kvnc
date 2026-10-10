@@ -6,14 +6,17 @@ use crate::{
     error::NetworkError,
     state_sync::{StateSyncRequest, StateSyncResponse},
     sync::SyncRequest,
-    topics, NetworkConfig, NetworkEvent,
+    topics,
+    validation::{AuthorityKeys, GossipValidator, Rejection, VoteVerifier},
+    NetworkConfig, NetworkEvent,
 };
 use futures::StreamExt;
 use kvnc_dag::DagStore;
 use kvnc_mempool::{Mempool, MempoolError};
 use kvnc_types::{StatementBlock, Transaction, Vote};
 use libp2p::{
-    gossipsub, identify, kad, request_response,
+    gossipsub::{self, MessageAcceptance},
+    identify, kad, request_response,
     swarm::{dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
@@ -35,8 +38,13 @@ type BehaviourEvent = <Behaviour as NetworkBehaviour>::ToSwarm;
 /// and evicted from the Kademlia routing table.
 const PING_FAILURE_LIMIT: u32 = 3;
 
-/// Maximum consecutive invalid block failures before a peer is banned.
+/// Maximum invalid messages (blocks, votes, transactions, sync traffic) a
+/// peer may relay before it is banned.
 const INVALID_BLOCK_FAILURE_LIMIT: u32 = 5;
+
+/// Upper bound on outstanding block sync requests we remember. Responses to
+/// requests we no longer track are dropped.
+const MAX_PENDING_BLOCK_REQUESTS: usize = 1024;
 
 /// Keep bootstrap retries bounded and separated so stale seeds do not trigger
 /// a burst of simultaneous dials.
@@ -72,6 +80,11 @@ pub struct NetworkService {
     sync_requests: Mutex<HashMap<PeerId, Instant>>,
     /// Bootstrap transport attempts survive cancellation/re-entry of `start`.
     bootstrap: Mutex<BootstrapMaintenance>,
+    /// Committee keys for the edge checks on votes and blocks.
+    validator: GossipValidator,
+    /// Outstanding block sync requests, so a response can be matched to what
+    /// we actually asked for.
+    pending_block_requests: Mutex<HashMap<request_response::OutboundRequestId, BlockSyncRequest>>,
 }
 
 /// State for one distinct, configured bootstrap address.
@@ -207,6 +220,31 @@ impl BootstrapMaintenance {
     }
 }
 
+/// Maximum number of hashes accepted in a `MissingBlocks` sync response.
+const MAX_MISSING_BLOCKS: usize = 64;
+
+/// Outcome of validating one gossip message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    /// Valid: deliver and forward.
+    Accept,
+    /// Not forwarded, no penalty (duplicate, depends on local state, or we
+    /// cannot judge it yet).
+    Ignore,
+    /// Invalid: not forwarded, counted against the relaying peer.
+    Reject(String),
+}
+
+impl Verdict {
+    fn reject(reason: &str) -> Self {
+        Verdict::Reject(reason.to_string())
+    }
+
+    fn rejected(kind: &str, rejection: Rejection) -> Self {
+        Verdict::Reject(format!("{kind}: {rejection}"))
+    }
+}
+
 /// Lock a mutex, recovering from poisoning: a panic while a lock is held must
 /// not take the whole network layer down.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -244,6 +282,8 @@ impl NetworkService {
                 peer_addresses: Mutex::new(HashMap::new()),
                 sync_requests: Mutex::new(HashMap::new()),
                 bootstrap: Mutex::new(bootstrap),
+                validator: GossipValidator::default(),
+                pending_block_requests: Mutex::new(HashMap::new()),
             },
             event_rx,
         ))
@@ -317,6 +357,26 @@ impl NetworkService {
     pub fn broadcast_vote(&self, vote: &Vote) -> Result<(), NetworkError> {
         let payload = bincode::serialize(vote)?;
         self.publish(topics::VOTES, payload)
+    }
+
+    /// Install the committee public keys used to authenticate gossiped votes
+    /// and blocks (and block sync responses) at the network edge.
+    ///
+    /// Until this is called, votes and blocks are dropped without being
+    /// forwarded: nothing can be authenticated without the committee.
+    pub fn set_authority_keys(&self, keys: AuthorityKeys) {
+        info!(
+            authorities = keys.len(),
+            "gossip validator committee keys set"
+        );
+        self.validator.set_keys(keys);
+    }
+
+    /// Inject the vote signature verifier used at the gossip edge.
+    ///
+    /// Defaults to [`crate::Ed25519VoteVerifier`]; the node sets it explicitly.
+    pub fn set_vote_verifier(&self, verifier: Arc<dyn VoteVerifier>) {
+        self.validator.set_vote_verifier(verifier);
     }
 
     /// Get connected peers.
@@ -418,7 +478,15 @@ impl NetworkService {
         let request_id = swarm
             .behaviour_mut()
             .block_sync
-            .send_request(&peer, request);
+            .send_request(&peer, request.clone());
+        drop(swarm);
+        let mut pending = lock(&self.pending_block_requests);
+        if pending.len() >= MAX_PENDING_BLOCK_REQUESTS {
+            // Requests time out after 30 s; anything this old has failed and
+            // its failure event was lost. Start over rather than grow forever.
+            pending.clear();
+        }
+        pending.insert(request_id, request);
         Ok(request_id)
     }
 
@@ -535,16 +603,24 @@ impl NetworkService {
     /// Handle gossipsub traffic: route payloads by topic.
     fn handle_gossipsub_event(&self, event: gossipsub::Event) -> Result<(), NetworkError> {
         match event {
-            gossipsub::Event::Message { message, .. } => match message.topic.as_str() {
-                topics::BLOCKS => self.on_block_message(&message.data),
-                topics::TRANSACTIONS => self.on_transaction_message(&message.data),
-                topics::SYNC => self.on_sync_message(message.source, &message.data),
-                topics::VOTES => self.on_vote_message(message.source, &message.data),
-                other => {
-                    debug!(topic = other, "message on unexpected topic");
-                    Ok(())
-                }
-            },
+            gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            } => {
+                let acceptance = match message.topic.as_str() {
+                    topics::BLOCKS => self.on_block_message(&message.data),
+                    topics::TRANSACTIONS => self.on_transaction_message(&message.data),
+                    topics::SYNC => self.on_sync_message(message.source, &message.data),
+                    topics::VOTES => self.on_vote_message(message.source, &message.data),
+                    other => {
+                        debug!(topic = other, "message on unexpected topic");
+                        Verdict::Ignore
+                    }
+                };
+                self.report_validation(&message_id, propagation_source, acceptance);
+                Ok(())
+            }
             gossipsub::Event::Subscribed { peer_id, topic } => {
                 debug!(%peer_id, topic = topic.as_str(), "peer subscribed");
                 Ok(())
@@ -563,6 +639,32 @@ impl NetworkService {
                 debug!(%peer_id, "gossipsub slow peer");
                 Ok(())
             }
+        }
+    }
+
+    /// Tell gossipsub whether to forward a message, and count rejected
+    /// messages against the peer that relayed them to us.
+    fn report_validation(
+        &self,
+        message_id: &gossipsub::MessageId,
+        propagation_source: PeerId,
+        verdict: Verdict,
+    ) {
+        let acceptance = match &verdict {
+            Verdict::Accept => MessageAcceptance::Accept,
+            Verdict::Ignore => MessageAcceptance::Ignore,
+            Verdict::Reject(_) => MessageAcceptance::Reject,
+        };
+        let known = self
+            .swarm()
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(message_id, &propagation_source, acceptance);
+        if !known {
+            debug!(%propagation_source, "validated message no longer in gossip cache");
+        }
+        if let Verdict::Reject(reason) = verdict {
+            self.record_invalid_block_failure(propagation_source, &reason);
         }
     }
 
@@ -681,12 +783,19 @@ impl NetworkService {
                     request_id,
                     response,
                 } => {
-                    debug!(%peer, ?request_id, ?response, "block sync response received");
-                    self.emit(NetworkEvent::BlockSyncResponse {
-                        peer,
-                        request_id,
-                        response,
-                    });
+                    debug!(%peer, ?request_id, %response, "block sync response received");
+                    let expected = lock(&self.pending_block_requests).remove(&request_id);
+                    match self.check_block_sync_response(expected.as_ref(), &response) {
+                        Ok(()) => self.emit(NetworkEvent::BlockSyncResponse {
+                            peer,
+                            request_id,
+                            response,
+                        }),
+                        Err(reason) => {
+                            warn!(%peer, ?request_id, %reason, "dropping invalid block sync response");
+                            self.record_invalid_block_failure(peer, &reason);
+                        }
+                    }
                 }
             },
             request_response::Event::OutboundFailure {
@@ -695,6 +804,7 @@ impl NetworkService {
                 error,
                 connection_id: _,
             } => {
+                lock(&self.pending_block_requests).remove(&request_id);
                 warn!(%peer, ?request_id, %error, "block sync request failed");
                 self.emit(NetworkEvent::BlockSyncResponse {
                     peer,
@@ -715,6 +825,42 @@ impl NetworkService {
             }
         }
         Ok(())
+    }
+
+    /// Edge checks for a block sync response: it must answer a request we
+    /// actually sent, a returned block must be the one we asked for, and it
+    /// must pass the same stateless checks as a gossiped block.
+    fn check_block_sync_response(
+        &self,
+        expected: Option<&BlockSyncRequest>,
+        response: &BlockSyncResponse,
+    ) -> Result<(), String> {
+        let Some(expected) = expected else {
+            return Err("response to an unknown request".to_string());
+        };
+        match response {
+            BlockSyncResponse::Block(block) => {
+                let matches = match expected {
+                    BlockSyncRequest::ByHash(hash) => block.digest == *hash,
+                    BlockSyncRequest::ByAuthorRound { author, round } => {
+                        block.author == *author && block.round == *round
+                    }
+                };
+                if !matches {
+                    return Err("returned block does not match the request".to_string());
+                }
+                self.validator
+                    .verify_block(block)
+                    .map_err(|rejection| format!("synced block: {rejection}"))
+            }
+            BlockSyncResponse::MissingBlocks(hashes) if hashes.len() > MAX_MISSING_BLOCKS => {
+                Err(format!(
+                    "{} missing blocks listed (max {MAX_MISSING_BLOCKS})",
+                    hashes.len()
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Handle request-response events (state sync / fast sync).
@@ -786,33 +932,48 @@ impl NetworkService {
         Ok(())
     }
 
-    /// Decode a block received over gossip and announce it to the caller.
-    /// Validation and persistence belong to the BlockManager, not the network
-    /// ingress path.
-    fn on_block_message(&self, payload: &[u8]) -> Result<(), NetworkError> {
+    /// Decode a block received over gossip, run the stateless edge checks
+    /// (digest, merkle root, committee author, signature) and announce it.
+    ///
+    /// DAG-level validation (parents, rounds) and persistence still belong to
+    /// the BlockManager; this only keeps forged or tampered blocks from being
+    /// forwarded or handed to consensus.
+    fn on_block_message(&self, payload: &[u8]) -> Verdict {
         let block: StatementBlock = match bincode::deserialize(payload) {
             Ok(block) => block,
             Err(err) => {
                 warn!(%err, "dropping malformed block gossip");
-                return Ok(());
+                return Verdict::reject("malformed block");
             }
         };
-        // Signature validation and persistence belong to the BlockManager / node
-        // hot path, not the network ingress. Announcing the decoded block keeps a
-        // single validation authority (see `on_block_message` doc comment).
+        if !self.validator.is_configured() {
+            debug!("committee keys not set; block gossip dropped unforwarded");
+            return Verdict::Ignore;
+        }
+        if let Err(rejection) = self.validator.verify_block(&block) {
+            warn!(round = block.round, author = block.author, %rejection, "rejected block gossip");
+            return Verdict::rejected("block", rejection);
+        }
         let (round, digest) = (block.round, block.digest);
         info!(round, %digest, "block received over gossip");
         self.emit(NetworkEvent::BlockReceived(block));
-        Ok(())
+        Verdict::Accept
     }
 
     /// Ingest a transaction received over gossip and announce it to the caller.
-    fn on_transaction_message(&self, payload: &[u8]) -> Result<(), NetworkError> {
+    ///
+    /// Only transactions the mempool admits are forwarded. Transactions that
+    /// are invalid on their own (bad signature, zero fee, oversized, ...) are
+    /// (including hash mismatch and fee below the floor) are rejected and
+    /// counted against the relaying peer; ones that fail only
+    /// because of local state (nonce, balance, full pool, duplicate) are
+    /// ignored without penalty.
+    fn on_transaction_message(&self, payload: &[u8]) -> Verdict {
         let tx: Transaction = match bincode::deserialize(payload) {
             Ok(tx) => tx,
             Err(err) => {
                 warn!(%err, "dropping malformed transaction gossip");
-                return Ok(());
+                return Verdict::reject("malformed transaction");
             }
         };
         let hash = tx.hash;
@@ -820,50 +981,76 @@ impl NetworkService {
             Ok(()) => {
                 info!(%hash, "accepted transaction received over gossip");
                 self.emit(NetworkEvent::TransactionReceived(tx));
-                Ok(())
+                Verdict::Accept
             }
             Err(MempoolError::AlreadyExists) => {
                 debug!(%hash, "transaction already in the mempool");
-                Ok(())
+                Verdict::Ignore
+            }
+            Err(
+                err @ (MempoolError::InvalidSignature
+                | MempoolError::ZeroFee
+                | MempoolError::GasLimitTooHigh
+                | MempoolError::TransactionTooLarge(_)
+                | MempoolError::HashMismatch
+                | MempoolError::FeeTooLow { .. }
+                | MempoolError::Crypto(_)
+                | MempoolError::Serialization(_)),
+            ) => {
+                warn!(%hash, %err, "rejected invalid transaction received over gossip");
+                Verdict::Reject(format!("transaction: {err}"))
             }
             Err(err) => {
-                // Peer-supplied data we reject is not our problem.
-                warn!(%hash, %err, "rejected transaction received over gossip");
-                Ok(())
+                debug!(%hash, %err, "transaction not admitted (local state)");
+                Verdict::Ignore
             }
         }
     }
 
-    /// Decode a vote received over gossip and announce it to the caller.
-    fn on_vote_message(&self, source: Option<PeerId>, payload: &[u8]) -> Result<(), NetworkError> {
+    /// Decode a vote received over gossip, authenticate it and announce it.
+    ///
+    /// The voter must be a committee member and the signature must verify
+    /// over [`Vote::signature_data`] under that member's key. Votes failing
+    /// this are neither forwarded nor handed to consensus. Whether a valid
+    /// vote *counts* (leader round, duplicates, ...) is still decided by the
+    /// consensus engine.
+    fn on_vote_message(&self, source: Option<PeerId>, payload: &[u8]) -> Verdict {
         let vote: Vote = match bincode::deserialize(payload) {
             Ok(vote) => vote,
             Err(err) => {
                 warn!(%err, "dropping malformed vote gossip");
-                return Ok(());
+                return Verdict::reject("malformed vote");
             }
         };
         let Some(peer) = source else {
             warn!("dropping vote message without an author");
-            return Ok(());
+            return Verdict::reject("vote without author");
         };
+        if !self.validator.is_configured() {
+            debug!("committee keys not set; vote gossip dropped unforwarded");
+            return Verdict::Ignore;
+        }
+        if let Err(rejection) = self.validator.verify_vote(&vote) {
+            warn!(%peer, voter = vote.voter, leader_round = vote.leader_round, %rejection, "rejected vote gossip");
+            return Verdict::rejected("vote", rejection);
+        }
         debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "vote received over gossip");
         self.emit(NetworkEvent::VoteReceived { peer, vote });
-        Ok(())
+        Verdict::Accept
     }
 
     /// Decode a sync-range request and announce it to the caller.
-    fn on_sync_message(&self, source: Option<PeerId>, payload: &[u8]) -> Result<(), NetworkError> {
+    fn on_sync_message(&self, source: Option<PeerId>, payload: &[u8]) -> Verdict {
         let request = match SyncRequest::decode(payload) {
             Ok(request) => request,
             Err(err) => {
                 warn!(%err, "dropping malformed sync request");
-                return Ok(());
+                return Verdict::reject("malformed sync request");
             }
         };
         let Some(peer) = source else {
             warn!("dropping sync request without an author");
-            return Ok(());
+            return Verdict::reject("sync request without author");
         };
         if !request.is_valid() {
             warn!(
@@ -872,7 +1059,7 @@ impl NetworkService {
                 to = request.to_round,
                 "dropping inverted sync request"
             );
-            return Ok(());
+            return Verdict::reject("inverted sync request");
         }
         debug!(
             %peer,
@@ -885,7 +1072,7 @@ impl NetworkService {
             from_round: request.from_round,
             to_round: request.to_round,
         });
-        Ok(())
+        Verdict::Accept
     }
 
     /// Record a new peer, enforcing [`NetworkConfig::max_peers`].
@@ -980,6 +1167,7 @@ impl NetworkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::test_support;
     use kvnc_mempool::MempoolConfig;
     use kvnc_storage::Storage;
     use kvnc_types::{Hash, Signature};
@@ -1145,26 +1333,238 @@ mod tests {
         assert_eq!(service.peer_count(), 0);
     }
 
-    #[tokio::test]
-    async fn gossip_message_ingestion_is_reversible_on_bad_data() {
-        let (_dir, service) = test_service();
-        // Malformed payloads are dropped, not propagated.
-        service
-            .on_block_message(&[0xff, 0xff])
-            .expect("malformed block is tolerated");
-        service
-            .on_transaction_message(&[0xff, 0xff])
-            .expect("malformed transaction is tolerated");
-        service
-            .on_sync_message(None, &[0xff, 0xff])
-            .expect("anonymous malformed sync request is tolerated");
-        service
-            .on_sync_message(Some(PeerId::random()), &[0xff, 0xff])
-            .expect("malformed sync request is tolerated");
+    fn test_service_with_mempool(config: MempoolConfig) -> (tempfile::TempDir, NetworkService) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
+        let mempool_storage =
+            Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
+        let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
+        let mempool = Arc::new(Mempool::new(config, mempool_storage));
+        let (service, _events) =
+            NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
+        (dir, service)
+    }
+
+    fn signed_transfer(fee: u64) -> Transaction {
+        let signer = kvnc_types::SigningKey::from_bytes(&[9; 32]);
+        let mut tx = Transaction {
+            sender: kvnc_types::Address([1; 32]),
+            nonce: 0,
+            kind: kvnc_types::transaction::TransactionKind::Transfer {
+                to: kvnc_types::Address([7; 32]),
+                amount: 1,
+            },
+            fee,
+            signature: Signature([0; 64]),
+            hash: Hash::zero(),
+        };
+        tx.hash = tx.signing_hash();
+        tx.signature = kvnc_crypto::sign(&signer, tx.hash.as_ref());
+        tx
     }
 
     #[tokio::test]
-    async fn block_gossip_emits_for_validation_without_pre_storing() {
+    async fn hash_mismatch_and_fee_too_low_are_rejected_at_gossip_edge() {
+        // HashMismatch: cached hash is not the signing hash.
+        let (_dir, service) = test_service();
+        let mut tx = signed_transfer(1_000);
+        tx.hash = Hash::new(b"not the signing hash");
+        let payload = bincode::serialize(&tx).expect("serialize");
+        match service.on_transaction_message(&payload) {
+            Verdict::Reject(reason) => assert!(reason.contains("hash"), "{reason}"),
+            other => panic!("HashMismatch must be Reject, got {other:?}"),
+        }
+
+        // FeeTooLow: fee rate below the configured floor.
+        let (_dir, service) = test_service_with_mempool(MempoolConfig {
+            min_fee_rate: 1_000_000,
+            ..MempoolConfig::default()
+        });
+        let payload = bincode::serialize(&signed_transfer(1)).expect("serialize");
+        match service.on_transaction_message(&payload) {
+            Verdict::Reject(reason) => assert!(reason.contains("Fee rate"), "{reason}"),
+            other => panic!("FeeTooLow must be Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_message_ingestion_is_reversible_on_bad_data() {
+        let (_dir, service) = test_service();
+        // Malformed payloads are dropped and rejected, never propagated.
+        assert!(matches!(
+            service.on_block_message(&[0xff, 0xff]),
+            Verdict::Reject(_)
+        ));
+        assert!(matches!(
+            service.on_transaction_message(&[0xff, 0xff]),
+            Verdict::Reject(_)
+        ));
+        assert!(matches!(
+            service.on_sync_message(None, &[0xff, 0xff]),
+            Verdict::Reject(_)
+        ));
+        assert!(matches!(
+            service.on_sync_message(Some(PeerId::random()), &[0xff, 0xff]),
+            Verdict::Reject(_)
+        ));
+        assert!(matches!(
+            service.on_vote_message(Some(PeerId::random()), &[0xff, 0xff]),
+            Verdict::Reject(_)
+        ));
+    }
+
+    /// Service with an event receiver and a 4-member committee installed.
+    fn validating_service() -> (
+        tempfile::TempDir,
+        NetworkService,
+        mpsc::UnboundedReceiver<NetworkEvent>,
+        Vec<kvnc_types::SigningKey>,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
+        let mempool_storage =
+            Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
+        let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
+        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let (service, events) =
+            NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
+        let (signers, keys) = test_support::committee(4);
+        service.set_authority_keys(keys);
+        (dir, service, events, signers)
+    }
+
+    #[tokio::test]
+    async fn valid_vote_is_accepted_and_delivered() {
+        let (_dir, service, mut events, signers) = validating_service();
+        let vote = test_support::signed_vote(&signers[1], 1);
+        let payload = bincode::serialize(&vote).expect("serialize vote");
+        assert_eq!(
+            service.on_vote_message(Some(PeerId::random()), &payload),
+            Verdict::Accept
+        );
+        match events.try_recv().expect("vote event emitted") {
+            NetworkEvent::VoteReceived { vote: got, .. } => assert_eq!(got, vote),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forged_vote_is_rejected_and_not_delivered() {
+        let (_dir, service, mut events, signers) = validating_service();
+        // Signed by validator 0 but claiming to be validator 2.
+        let mut vote = test_support::signed_vote(&signers[0], 2);
+        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data());
+        let payload = bincode::serialize(&vote).expect("serialize vote");
+        assert!(matches!(
+            service.on_vote_message(Some(PeerId::random()), &payload),
+            Verdict::Reject(_)
+        ));
+        // Unsigned vote.
+        vote.signature = Signature([0; 64]);
+        let payload = bincode::serialize(&vote).expect("serialize vote");
+        assert!(matches!(
+            service.on_vote_message(Some(PeerId::random()), &payload),
+            Verdict::Reject(_)
+        ));
+        // Voter outside the committee.
+        let outsider = test_support::signed_vote(&signers[0], 42);
+        let payload = bincode::serialize(&outsider).expect("serialize vote");
+        assert!(matches!(
+            service.on_vote_message(Some(PeerId::random()), &payload),
+            Verdict::Reject(_)
+        ));
+        assert!(events.try_recv().is_err(), "no vote may reach consensus");
+    }
+
+    #[tokio::test]
+    async fn votes_and_blocks_are_not_forwarded_before_committee_is_known() {
+        let (_dir, service) = test_service();
+        let (signers, _) = test_support::committee(1);
+        let vote = bincode::serialize(&test_support::signed_vote(&signers[0], 0)).unwrap();
+        let block = bincode::serialize(&test_support::signed_block(&signers[0], 0)).unwrap();
+        assert_eq!(
+            service.on_vote_message(Some(PeerId::random()), &vote),
+            Verdict::Ignore
+        );
+        assert_eq!(service.on_block_message(&block), Verdict::Ignore);
+    }
+
+    #[tokio::test]
+    async fn signed_block_is_accepted_and_delivered() {
+        let (_dir, service, mut events, signers) = validating_service();
+        let block = test_support::signed_block(&signers[3], 3);
+        let payload = bincode::serialize(&block).expect("serialize block");
+        assert_eq!(service.on_block_message(&payload), Verdict::Accept);
+        match events.try_recv().expect("block event emitted") {
+            NetworkEvent::BlockReceived(got) => assert_eq!(got, block),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_invalid_messages_ban_the_relaying_peer() {
+        let (_dir, service, _events, _signers) = validating_service();
+        let peer = PeerId::random();
+        for _ in 0..INVALID_BLOCK_FAILURE_LIMIT - 1 {
+            service.record_invalid_block_failure(peer, "test");
+        }
+        assert_eq!(
+            lock(&service.invalid_block_failures).get(&peer).copied(),
+            Some(INVALID_BLOCK_FAILURE_LIMIT - 1)
+        );
+        service.record_invalid_block_failure(peer, "test");
+        // Banned: counter cleared.
+        assert!(lock(&service.invalid_block_failures).get(&peer).is_none());
+    }
+
+    #[tokio::test]
+    async fn block_sync_response_must_match_request_and_validate() {
+        let (_dir, service, _events, signers) = validating_service();
+        let block = test_support::signed_block(&signers[1], 1);
+        let response = BlockSyncResponse::Block(block.clone());
+
+        // Unsolicited.
+        assert!(service.check_block_sync_response(None, &response).is_err());
+        // Right block.
+        let by_hash = BlockSyncRequest::ByHash(block.digest);
+        assert!(service
+            .check_block_sync_response(Some(&by_hash), &response)
+            .is_ok());
+        let by_slot = BlockSyncRequest::ByAuthorRound {
+            author: 1,
+            round: 1,
+        };
+        assert!(service
+            .check_block_sync_response(Some(&by_slot), &response)
+            .is_ok());
+        // A different (valid) block than the one requested.
+        let other = BlockSyncRequest::ByHash(Hash::new(b"other"));
+        assert!(service
+            .check_block_sync_response(Some(&other), &response)
+            .is_err());
+        // Requested block with tampered content (signature replayed).
+        let mut tampered = block.clone();
+        tampered.statements = vec![1];
+        tampered.round = 9;
+        let slot9 = BlockSyncRequest::ByAuthorRound {
+            author: 1,
+            round: 9,
+        };
+        assert!(service
+            .check_block_sync_response(Some(&slot9), &BlockSyncResponse::Block(tampered))
+            .is_err());
+        // Oversized missing-blocks list.
+        let flood = BlockSyncResponse::MissingBlocks(vec![Hash::zero(); MAX_MISSING_BLOCKS + 1]);
+        assert!(service
+            .check_block_sync_response(Some(&by_hash), &flood)
+            .is_err());
+        assert!(service
+            .check_block_sync_response(Some(&by_hash), &BlockSyncResponse::NotFound)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_block_gossip_is_rejected_and_never_stored() {
         let dir = tempfile::tempdir().expect("temp dir");
         let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
         let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
@@ -1174,23 +1574,21 @@ mod tests {
         let (service, mut events) =
             NetworkService::new(NetworkConfig::default(), dag_store.clone(), mempool)
                 .expect("service");
+        let (_, keys) = test_support::committee(4);
+        service.set_authority_keys(keys);
 
-        // This payload is structurally decodable but has an invalid digest and
-        // signature. The event remains available for the caller to reject.
+        // Structurally decodable, but invalid digest and signature.
         let block = sample_block();
         let payload = bincode::serialize(&block).expect("serialize block");
-        service
-            .on_block_message(&payload)
-            .expect("decoded gossip is announced");
-
+        assert!(matches!(
+            service.on_block_message(&payload),
+            Verdict::Reject(_)
+        ));
         assert!(!dag_store.has_block(&block.digest).expect("query store"));
-        match events.try_recv().expect("block event emitted") {
-            NetworkEvent::BlockReceived(received) => {
-                assert_eq!(received.digest, block.digest);
-                assert_eq!(received.signature, block.signature);
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        assert!(
+            events.try_recv().is_err(),
+            "invalid block must not be announced"
+        );
     }
 
     #[tokio::test]
@@ -1206,9 +1604,10 @@ mod tests {
 
         let peer = PeerId::random();
         let payload = SyncRequest::new(4, 8).encode().expect("encodes");
-        service
-            .on_sync_message(Some(peer), &payload)
-            .expect("valid request is accepted");
+        assert_eq!(
+            service.on_sync_message(Some(peer), &payload),
+            Verdict::Accept
+        );
 
         match events.try_recv().expect("event emitted") {
             NetworkEvent::SyncRequest {

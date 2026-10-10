@@ -4,7 +4,7 @@
 //! Implements Mysticeti-style committer with direct/indirect commit rules
 //! for wave-based uncertified DAG consensus.
 
-use crate::engine::DagStoreTrait;
+use crate::engine::{DagStoreTrait, VoteRejection};
 use crate::ghostdag_scoped::ColouringResult;
 use crate::metrics::{record_pruned_blocks, record_pruned_waves};
 use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
@@ -145,6 +145,63 @@ impl RangeAfter for HashMap<Round, LeaderInfo> {
     }
 }
 
+/// Causal history of `leader` that has NOT been delivered by an earlier
+/// commit.
+///
+/// "Already committed" is derived only from the durable decided-leader index:
+/// a block is committed iff it is a decided leader of a round strictly below
+/// `leader.round`, or in such a leader's causal history. The result therefore
+/// depends only on the persisted DAG + decided index, so the live committer
+/// and restart recovery (kvnc-node `recover_committed_subdags`) produce the
+/// same batch and no block is delivered twice across commits.
+///
+/// Returned in `get_ancestors` order (the linearizer canonicalises order);
+/// excludes `leader` itself.
+///
+/// Correctness condition (pruning): pruning must be downward-closed by round.
+/// If any block of round `r` is deleted, every block of round `<= r` must be
+/// deleted too (as `prune_waves_before` / `prune_below` do). Then every
+/// still-stored ancestor of an earlier decided leader is reachable from that
+/// leader via stored parent edges, or that leader's whole stored history is
+/// gone. A deletion that leaves a gap (e.g. `prune_non_blue` removing a block
+/// while lower-round blocks of the same history remain) can hide still-stored
+/// committed blocks behind the gap; they would then be re-delivered.
+///
+/// TODO(follow-up): cache the committed set incrementally (e.g. keep an
+/// in-memory / persisted set updated on each durable commit, seeded once from
+/// the decided index on startup) instead of re-walking every earlier
+/// leader's history on each commit, which is O(sum of earlier histories).
+pub fn uncommitted_history<D: DagStoreTrait + ?Sized>(
+    dag_store: &D,
+    leader: &StatementBlock,
+) -> Result<Vec<StatementBlock>, kvnc_dag::DagStoreError> {
+    let mut committed: HashSet<Hash> = HashSet::new();
+    if leader.round > 0 {
+        for round in dag_store.get_decided_rounds(leader.round - 1)? {
+            if round >= leader.round {
+                continue;
+            }
+            for prev in dag_store.get_decided_leaders(round)? {
+                if prev == leader.digest || !committed.insert(prev) {
+                    continue;
+                }
+                // NotFound-tolerant: a pruned previous leader contributes
+                // nothing (its history is pruned too).
+                committed.extend(dag_store.get_ancestors(&prev, 0)?);
+            }
+        }
+    }
+
+    let mut history = Vec::new();
+    for hash in dag_store.get_ancestors(&leader.digest, 0)? {
+        if hash == leader.digest || committed.contains(&hash) {
+            continue;
+        }
+        history.push(dag_store.get_block(&hash)?);
+    }
+    Ok(history)
+}
+
 /// Universal committer that also handles indirect decisions.
 pub struct UniversalCommitter {
     base: BaseCommitter,
@@ -198,9 +255,7 @@ impl UniversalCommitter {
         // timeout can fire after the round was durably committed and must not
         // rewrite history to `Skip`.
         let mut decided = self.decided_leaders.write();
-        if !decided.contains_key(&round) {
-            decided.insert(round, info);
-        }
+        decided.entry(round).or_insert(info);
     }
 
     /// Update leader information for a round.
@@ -294,6 +349,42 @@ impl UniversalCommitter {
         false
     }
 
+    /// Record an already-authenticated vote, rejecting it if no leader block
+    /// is registered for `leader_round`, if `vote_hash` does not match that
+    /// block, or if `voter` has already voted for the round. The checks and
+    /// the insert happen under one write lock, so concurrent duplicates are
+    /// counted at most once. Returns whether the leader now has a quorum.
+    pub fn add_verified_vote(
+        &self,
+        leader_round: Round,
+        voter: AuthorityIndex,
+        vote_hash: Hash,
+    ) -> Result<bool, VoteRejection> {
+        let mut leaders = self.leaders.write();
+        let leader_info = leaders
+            .get_mut(&leader_round)
+            .ok_or(VoteRejection::UnknownLeaderRound(leader_round))?;
+        if leader_info.block_hash != Some(vote_hash) {
+            return Err(VoteRejection::LeaderHashMismatch(leader_round));
+        }
+        if leader_info.votes.contains_key(&voter) {
+            return Err(VoteRejection::Duplicate {
+                round: leader_round,
+                voter,
+            });
+        }
+        leader_info.votes.insert(voter, vote_hash);
+        if self
+            .base
+            .committee
+            .has_quorum(&leader_info.votes, leader_info.block_hash.as_ref())
+        {
+            leader_info.status = LeaderStatus::Commit;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Decide (commit or skip) any still-undecided leaders *earlier in the
     /// same wave* as `commit_round`, using the indirect rule.
     ///
@@ -383,7 +474,7 @@ impl UniversalCommitter {
         let mut candidate_rounds: Vec<Round> = leaders
             .keys()
             .copied()
-            .filter(|round| *round >= last_decided + 1)
+            .filter(|round| *round > last_decided)
             .collect();
         candidate_rounds.sort_unstable();
 
@@ -493,9 +584,10 @@ impl UniversalCommitter {
 
         // Persist the exact eligible leader selected above; never synthesize a
         // leader record from a caller-provided sub-DAG.
-        dag_store.mark_round_decided(subdag.leader_round, &subdag.leader.digest)?;
-        // Increment the committed leader height so RPCs and restarts see the new height.
-        dag_store.commit_leader(&subdag.leader.digest)?;
+        // The decided-round mark and the committed leader height / last
+        // committed leader are written atomically (both or neither), so a
+        // crash between them cannot leave inconsistent durable state.
+        dag_store.mark_decided_and_commit_leader(subdag.leader_round, &subdag.leader.digest)?;
         decided_leader.status = LeaderStatus::Commit;
         self.mark_decided(subdag.leader_round, decided_leader);
 
@@ -578,14 +670,8 @@ impl UniversalCommitter {
         dag_store: &D,
         leader_block: &StatementBlock,
     ) -> Option<CommittedSubDag> {
-        // Get all ancestors of this leader (causal history)
-        let ancestors = dag_store.get_ancestors(&leader_block.digest, 0).ok()?;
-
-        // Get the actual blocks for ancestors
-        let mut history = Vec::new();
-        for hash in ancestors {
-            history.push(dag_store.get_block(&hash).ok()?);
-        }
+        // Only the not-yet-committed part of the leader's causal history.
+        let history = uncommitted_history(dag_store, leader_block).ok()?;
 
         // Linearize the sub-DAG
         let linearizer = crate::linearizer::Linearizer::new();
@@ -874,6 +960,15 @@ mod tests {
 
         fn commit_leader(&self, _leader_hash: &Hash) -> Result<u64, kvnc_dag::DagStoreError> {
             Ok(1)
+        }
+
+        fn mark_decided_and_commit_leader(
+            &self,
+            round: Round,
+            leader_hash: &Hash,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            self.mark_round_decided(round, leader_hash)?;
+            self.commit_leader(leader_hash)
         }
 
         fn mark_round_decided(
