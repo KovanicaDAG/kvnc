@@ -303,6 +303,12 @@ pub enum StakingError {
     EvidenceProcessed,
     #[error("Treasury has insufficient available balance")]
     TreasuryInsufficient,
+    #[error("Validator already registered")]
+    ValidatorExists,
+    #[error("Commission must be <= 10000 bps")]
+    InvalidCommission,
+    #[error("Remaining self-stake would be below MIN_VALIDATOR_STAKE")]
+    BelowMinimumStake,
 }
 
 /// Combined staking + emission + treasury state.
@@ -351,6 +357,12 @@ impl StakingState {
         if stake < MIN_VALIDATOR_STAKE {
             return Err(StakingError::InsufficientStake);
         }
+        if commission_bps > 10_000 {
+            return Err(StakingError::InvalidCommission);
+        }
+        if self.validators.iter().any(|v| v.address == address) {
+            return Err(StakingError::ValidatorExists);
+        }
         if self.validators.iter().filter(|v| v.active).count() >= MAX_ACTIVE_VALIDATORS {
             return Err(StakingError::ValidatorSetFull);
         }
@@ -367,11 +379,131 @@ impl StakingState {
         Ok(())
     }
 
+    /// Validators in consensus committee order: active with
+    /// `stake >= MIN_VALIDATOR_STAKE`, top [`MAX_ACTIVE_VALIDATORS`] by stake
+    /// (ties by address), then sorted by address. The position in this list
+    /// is the authority index. Mirrors `kvnc-node::build_committee` exactly.
+    pub fn committee_order(&self) -> Vec<&ValidatorInfo> {
+        let mut active: Vec<&ValidatorInfo> = self
+            .validators
+            .iter()
+            .filter(|v| v.active && v.stake >= MIN_VALIDATOR_STAKE)
+            .collect();
+        active.sort_by(|a, b| {
+            b.stake
+                .cmp(&a.stake)
+                .then_with(|| a.address.0.cmp(&b.address.0))
+        });
+        active.truncate(MAX_ACTIVE_VALIDATORS);
+        active.sort_by_key(|v| v.address.0);
+        active
+    }
+
+    /// Validator behind a consensus authority index (identity-based: the
+    /// committee is ordered by validator address/key, not by insertion
+    /// position in `validators`).
+    pub fn authority_validator(&self, authority_index: u16) -> Option<&ValidatorInfo> {
+        self.committee_order()
+            .get(authority_index as usize)
+            .copied()
+    }
+
     /// Look up payout address for a given authority index.
     pub fn payout_address_for(&self, authority_index: u16) -> Option<Address> {
-        self.validators
-            .get(authority_index as usize)
+        self.authority_validator(authority_index)
             .map(|v| v.payout_address)
+    }
+
+    /// Total amount delegated to `validator` by delegators.
+    pub fn delegated_to(&self, validator: Address) -> Stake {
+        self.delegations
+            .iter()
+            .filter(|d| d.validator == validator)
+            .map(|d| d.amount)
+            .fold(0, Stake::saturating_add)
+    }
+
+    /// Validator's own bonded stake (`stake` minus delegations).
+    pub fn self_stake(&self, validator: Address) -> Stake {
+        self.validators
+            .iter()
+            .find(|v| v.address == validator)
+            .map(|v| v.stake.saturating_sub(self.delegated_to(validator)))
+            .unwrap_or(0)
+    }
+
+    /// Add `amount` of self-stake to an existing active validator.
+    pub fn bond_validator(&mut self, address: Address, amount: Stake) -> Result<(), StakingError> {
+        if amount == 0 {
+            return Err(StakingError::InsufficientStake);
+        }
+        let v = self
+            .validators
+            .iter_mut()
+            .find(|v| v.address == address && v.active)
+            .ok_or(StakingError::NotValidator)?;
+        v.stake = v.stake.saturating_add(amount);
+        self.total_staked = self.total_staked.saturating_add(amount);
+        Ok(())
+    }
+
+    /// Start unbonding `amount` of a validator's own stake. The remaining
+    /// self-stake must be 0 (validator deactivated) or `>= MIN_VALIDATOR_STAKE`.
+    /// Funds go to the unbonding queue (`UNBONDING_ROUNDS`).
+    pub fn unbond_validator(
+        &mut self,
+        address: Address,
+        amount: Stake,
+    ) -> Result<(), StakingError> {
+        if amount == 0 {
+            return Err(StakingError::InsufficientStake);
+        }
+        let own = self.self_stake(address);
+        let v_idx = self
+            .validators
+            .iter()
+            .position(|v| v.address == address)
+            .ok_or(StakingError::NotValidator)?;
+        if amount > own {
+            return Err(StakingError::InsufficientStake);
+        }
+        let remaining = own - amount;
+        if remaining != 0 && remaining < MIN_VALIDATOR_STAKE {
+            return Err(StakingError::BelowMinimumStake);
+        }
+        let v = &mut self.validators[v_idx];
+        v.stake -= amount;
+        if remaining == 0 {
+            v.active = false;
+        }
+        self.total_staked = self.total_staked.saturating_sub(amount);
+        self.unbonding_queue.push(UnbondingEntry {
+            delegator: address,
+            validator: address,
+            amount,
+            release_height: self
+                .committed_leader_height
+                .saturating_add(UNBONDING_ROUNDS),
+        });
+        Ok(())
+    }
+
+    /// Set a validator's commission (basis points, `<= 10_000`).
+    pub fn set_commission(
+        &mut self,
+        address: Address,
+        commission_bps: u16,
+    ) -> Result<(), StakingError> {
+        if commission_bps > 10_000 {
+            return Err(StakingError::InvalidCommission);
+        }
+        let v = self
+            .validators
+            .iter_mut()
+            .find(|v| v.address == address)
+            .ok_or(StakingError::NotValidator)?;
+        v.commission_bps = commission_bps;
+        Ok(())
     }
 
     /// Called by the execution layer when a leader block is committed.
@@ -608,78 +740,95 @@ impl StakingState {
         Ok(withdrawn)
     }
 
-    /// Reward sharing for delegated stake (commission-based, deterministic).
-    /// Splits `reward_amount` between validator (commission %) and delegators (pro-rata share).
-    /// Delegators processed in address-sorted order for determinism.
+    /// Reward sharing (commission-based, deterministic, exact).
+    ///
+    /// The validator takes `commission_bps` of `reward_amount`; the rest is
+    /// split pro-rata over the validator's self-stake and every delegation.
+    /// Integer-division dust goes to the validator, so the shares always sum
+    /// to exactly `reward_amount`. Output is sorted by address and merged
+    /// (one entry per address). Unknown validator → empty.
     pub fn reward_share(
         &self,
         validator_address: Address,
         reward_amount: u64,
         commission_bps: u16,
     ) -> Vec<(Address, u64)> {
-        let v_idx = self
+        if !self
             .validators
             .iter()
-            .position(|v| v.address == validator_address);
-        if v_idx.is_none() {
+            .any(|v| v.address == validator_address)
+        {
             return Vec::new();
         }
-        let mut shares: Vec<(Address, u64)> = Vec::new();
-        let validator_cut = reward_amount
-            .saturating_mul(commission_bps as u64)
-            .saturating_div(10_000);
-        shares.push((validator_address, validator_cut));
-        let remaining = reward_amount.saturating_sub(validator_cut);
-        let mut delegator_shares: Vec<(Address, u64, Stake)> = self
+        let commission_bps = u128::from(commission_bps.min(10_000));
+        let reward = u128::from(reward_amount);
+        let validator_cut = reward * commission_bps / 10_000;
+        let pool = reward - validator_cut;
+        let own = u128::from(self.self_stake(validator_address));
+        let mut stakes: Vec<(Address, u128)> = self
             .delegations
             .iter()
             .filter(|d| d.validator == validator_address && d.amount > 0)
-            .map(|d| (d.delegator, d.amount, d.amount))
+            .map(|d| (d.delegator, u128::from(d.amount)))
             .collect();
-        delegator_shares.sort_by_key(|a| a.0 .0);
-        let total_delegated: Stake = delegator_shares.iter().map(|(_, _, s)| s).sum();
-        if total_delegated > 0 {
-            for (addr, _, stake) in delegator_shares {
-                let share = remaining
-                    .saturating_mul(stake)
-                    .saturating_div(total_delegated as u64);
-                shares.push((addr, share));
+        let total: u128 = own + stakes.iter().map(|(_, a)| a).sum::<u128>();
+        let mut merged: std::collections::BTreeMap<[u8; 32], u128> = Default::default();
+        let mut distributed = 0u128;
+        if total > 0 {
+            stakes.sort_by_key(|(a, _)| a.0);
+            for (addr, stake) in stakes {
+                let share = (pool * stake).checked_div(total).unwrap_or(0);
+                distributed += share;
+                *merged.entry(addr.0).or_default() += share;
             }
         }
-        shares.sort_by_key(|a| a.0 .0);
-        shares
+        // Commission + own pro-rata share + rounding dust.
+        *merged.entry(validator_address.0).or_default() += reward - distributed;
+        merged
+            .into_iter()
+            .map(|(a, v)| (Address(a), v as u64))
+            .collect()
     }
 
     /// Process double-sign evidence: apply fixed % slash to validator stake and delegations.
     /// Security audit (20.1): slash is deterministic — fixed 500 bps, sum is commutative,
     /// so delegation processing order does not affect total slashed amount.
+    ///
+    /// `validator.stake` already includes delegated stake, so the cut is
+    /// computed once on the self-stake and once per delegation (never twice
+    /// on delegated stake). Returns the total amount removed from stake; the
+    /// caller decides its destination (execution burns it). Duplicate
+    /// evidence must be rejected by the caller (`EvidenceProcessed`), as the
+    /// processed-evidence set is persisted outside `StakingState`.
     pub fn slash(&mut self, evidence: DoubleSignEvidence) -> Result<u64, StakingError> {
         let v_idx = self
             .validators
             .iter()
             .position(|v| v.address == evidence.validator)
             .ok_or(StakingError::NotValidator)?;
-        let original = self.validators[v_idx].stake;
-        let slash_amount = original
-            .saturating_mul(SLASH_PCT_BPS as u64)
-            .saturating_div(10_000);
-        self.validators[v_idx].stake = original.saturating_sub(slash_amount);
-        let mut total_slash_delegations = 0u64;
+        let cut = |x: u64| (u128::from(x) * u128::from(SLASH_PCT_BPS) / 10_000) as u64;
+        let own_slash = cut(self.self_stake(evidence.validator));
+        let mut delegated_slash = 0u64;
         for d in self.delegations.iter_mut() {
             if d.validator == evidence.validator && d.amount > 0 {
-                let d_slash = d
-                    .amount
-                    .saturating_mul(SLASH_PCT_BPS as u64)
-                    .saturating_div(10_000);
-                d.amount = d.amount.saturating_sub(d_slash);
-                total_slash_delegations = total_slash_delegations.saturating_add(d_slash);
+                let d_slash = cut(d.amount);
+                d.amount -= d_slash;
+                delegated_slash = delegated_slash.saturating_add(d_slash);
             }
         }
-        self.total_staked = self
-            .total_staked
-            .saturating_sub(slash_amount)
-            .saturating_sub(total_slash_delegations);
-        Ok(slash_amount.saturating_add(total_slash_delegations))
+        let total = own_slash.saturating_add(delegated_slash);
+        self.validators[v_idx].stake = self.validators[v_idx].stake.saturating_sub(total);
+        self.total_staked = self.total_staked.saturating_sub(total);
+        Ok(total)
+    }
+
+    /// Deterministic id of a piece of double-sign evidence
+    /// (`validator || height_le`).
+    pub fn evidence_id(evidence: &DoubleSignEvidence) -> [u8; 40] {
+        let mut id = [0u8; 40];
+        id[..32].copy_from_slice(&evidence.validator.0);
+        id[32..].copy_from_slice(&evidence.height.to_le_bytes());
+        id
     }
 }
 
@@ -1146,5 +1295,193 @@ mod tests {
             decoded.committed_leader_height
         );
         assert_eq!(state.total_mining_issued, decoded.total_mining_issued);
+    }
+    // ---- staking wiring -------------------------------------------------
+
+    fn a(b: u8) -> Address {
+        Address([b; 32])
+    }
+
+    #[test]
+    fn join_validator_rejects_duplicates() {
+        let mut st = StakingState::new();
+        st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        let err = st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None);
+        assert!(matches!(err, Err(StakingError::ValidatorExists)));
+        assert_eq!(st.validators.len(), 1);
+        assert_eq!(st.total_staked, MIN_VALIDATOR_STAKE);
+    }
+
+    #[test]
+    fn bond_unbond_validator_uses_queue_and_unbonding_rounds() {
+        let mut st = StakingState::new();
+        st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        st.bond_validator(a(1), 10 * ONE_KVNC).unwrap();
+        assert_eq!(st.self_stake(a(1)), MIN_VALIDATOR_STAKE + 10 * ONE_KVNC);
+        // Leaving 1..MIN-1 of self-stake is rejected.
+        assert!(matches!(
+            st.unbond_validator(a(1), 20 * ONE_KVNC),
+            Err(StakingError::BelowMinimumStake)
+        ));
+        st.unbond_validator(a(1), 10 * ONE_KVNC).unwrap();
+        assert_eq!(st.unbonding_queue[0].release_height, UNBONDING_ROUNDS);
+        assert!(matches!(
+            st.withdraw_unbonded(a(1), a(1)),
+            Err(StakingError::UnbondNotComplete)
+        ));
+        st.committed_leader_height = UNBONDING_ROUNDS;
+        assert_eq!(st.withdraw_unbonded(a(1), a(1)).unwrap(), 10 * ONE_KVNC);
+        // Full exit deactivates.
+        st.unbond_validator(a(1), MIN_VALIDATOR_STAKE).unwrap();
+        assert!(!st.validators[0].active);
+        assert_eq!(st.total_staked, 0);
+    }
+
+    #[test]
+    fn set_commission_validates() {
+        let mut st = StakingState::new();
+        st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        assert!(st.set_commission(a(1), 10_001).is_err());
+        st.set_commission(a(1), 1_000).unwrap();
+        assert_eq!(st.validators[0].commission_bps, 1_000);
+    }
+
+    // Old behaviour: authority index was the insertion position.
+    #[test]
+    fn authority_index_maps_by_identity_not_position() {
+        let mut st = StakingState::new();
+        for b in [3u8, 1, 2] {
+            st.join_validator(a(b), MIN_VALIDATOR_STAKE, 0, Some(a(b + 10)), None)
+                .unwrap();
+        }
+        assert_eq!(st.payout_address_for(0), Some(a(11)));
+        assert_eq!(st.payout_address_for(1), Some(a(12)));
+        assert_eq!(st.payout_address_for(2), Some(a(13)));
+        assert_eq!(st.payout_address_for(3), None);
+    }
+
+    // Old behaviour: self-stake earned nothing and the shares did not sum to
+    // the reward.
+    #[test]
+    fn reward_share_is_exact_and_pays_commission_and_delegators() {
+        let mut st = StakingState::new();
+        st.join_validator(a(1), MIN_VALIDATOR_STAKE, 1_000, None, None)
+            .unwrap();
+        let alone = st.reward_share(a(1), 10 * ONE_KVNC, 1_000);
+        assert_eq!(alone, vec![(a(1), 10 * ONE_KVNC)]);
+        st.delegate(a(5), a(1), MIN_VALIDATOR_STAKE).unwrap();
+        let shares = st.reward_share(a(1), 10 * ONE_KVNC, 1_000);
+        let sum: u64 = shares.iter().map(|(_, x)| x).sum();
+        assert_eq!(sum, 10 * ONE_KVNC);
+        // 10% commission, rest split 50/50.
+        assert_eq!(shares, vec![(a(1), 5_500_000_000), (a(5), 4_500_000_000)]);
+    }
+
+    // Old behaviour: delegated stake was cut twice (inside validator.stake
+    // and again per delegation), desynchronising total_staked.
+    #[test]
+    fn slash_cuts_delegated_stake_once() {
+        let mut st = StakingState::new();
+        st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
+            .unwrap();
+        st.delegate(a(5), a(1), 10_000 * ONE_KVNC).unwrap();
+        let slashed = st
+            .slash(DoubleSignEvidence {
+                validator: a(1),
+                height: 7,
+            })
+            .unwrap();
+        assert_eq!(slashed, 3_000 * ONE_KVNC); // 5% of 60k
+        assert_eq!(st.validators[0].stake, 57_000 * ONE_KVNC);
+        assert_eq!(st.total_staked, 57_000 * ONE_KVNC);
+        assert_eq!(st.self_stake(a(1)), 47_500 * ONE_KVNC);
+        assert_eq!(st.delegations[0].amount, 9_500 * ONE_KVNC);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Join(u8),
+        Delegate(u8, u8, u64),
+        Unbond(u8, u8, u64),
+        Leader(u16),
+        Slash(u8),
+        Advance,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0u8..4).prop_map(Op::Join),
+            (10u8..13, 0u8..4, 1u64..20_000).prop_map(|(d, v, x)| Op::Delegate(d, v, x)),
+            (10u8..13, 0u8..4, 1u64..20_000).prop_map(|(d, v, x)| Op::Unbond(d, v, x)),
+            (0u16..4).prop_map(Op::Leader),
+            (0u8..4).prop_map(Op::Slash),
+            Just(Op::Advance),
+        ]
+    }
+
+    proptest! {
+        // Conservation: liquid + staked + unbonding + burned
+        // == premine + mining issued, and everything stays <= the cap.
+        #[test]
+        fn supply_never_exceeds_cap(ops in proptest::collection::vec(op(), 1..60)) {
+            let mut st = StakingState::new();
+            st.init_treasury(a(0xFF));
+            let mut liquid: u128 = u128::from(FOUNDER_PREMINE);
+            let mut burned: u128 = 0;
+            let mut slashed_evidence = std::collections::BTreeSet::new();
+            for o in ops {
+                match o {
+                    Op::Join(v) => {
+                        if liquid >= u128::from(MIN_VALIDATOR_STAKE)
+                            && st.join_validator(a(v + 1), MIN_VALIDATOR_STAKE, 500, None, None).is_ok() {
+                            liquid -= u128::from(MIN_VALIDATOR_STAKE);
+                        }
+                    }
+                    Op::Delegate(d, v, x) => {
+                        let x = x * ONE_KVNC;
+                        if liquid >= u128::from(x) && st.delegate(a(d), a(v + 1), x).is_ok() {
+                            liquid -= u128::from(x);
+                        }
+                    }
+                    Op::Unbond(d, v, x) => { let _ = st.unbond(a(d), a(v + 1), x * ONE_KVNC); }
+                    Op::Leader(i) => {
+                        if let Some(v) = st.authority_validator(i).cloned() {
+                            let before = st.total_mining_issued;
+                            let out = st.on_leader_committed(i).unwrap();
+                            let shares = st.reward_share(v.address, out.amount, v.commission_bps);
+                            let paid: u64 = shares.iter().map(|(_, x)| x).sum();
+                            prop_assert_eq!(paid, out.amount);
+                            prop_assert_eq!(st.total_mining_issued - before, out.amount);
+                            liquid += u128::from(paid);
+                        }
+                    }
+                    Op::Slash(v) => {
+                        let ev = DoubleSignEvidence { validator: a(v + 1), height: st.committed_leader_height };
+                        if slashed_evidence.insert(StakingState::evidence_id(&ev)) {
+                            if let Ok(x) = st.slash(ev) { burned += u128::from(x); }
+                        }
+                    }
+                    Op::Advance => {
+                        st.committed_leader_height += UNBONDING_ROUNDS;
+                        let pairs: Vec<_> = st.unbonding_ready().iter().map(|e| (e.delegator, e.validator)).collect();
+                        for (d, v) in pairs {
+                            if let Ok(x) = st.withdraw_unbonded(d, v) { liquid += u128::from(x); }
+                        }
+                    }
+                }
+                let queued: u128 = st.unbonding_queue.iter().map(|e| u128::from(e.amount)).sum();
+                let stakes: u128 = st.validators.iter().map(|v| u128::from(v.stake)).sum();
+                prop_assert_eq!(stakes, u128::from(st.total_staked));
+                for v in &st.validators {
+                    prop_assert!(v.stake >= st.delegated_to(v.address));
+                }
+                let accounted = liquid + u128::from(st.total_staked) + queued + burned;
+                prop_assert_eq!(accounted, u128::from(FOUNDER_PREMINE) + u128::from(st.total_mining_issued));
+                prop_assert!(accounted + u128::from(TREASURY_TOTAL) <= u128::from(TOTAL_SUPPLY));
+            }
+        }
     }
 }

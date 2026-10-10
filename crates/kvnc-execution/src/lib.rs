@@ -33,8 +33,8 @@ use tracing::{debug, info};
 
 pub mod contracts;
 pub use contracts::{
-    execute_contract_call, is_entry_point, ContractEvent, ContractHost, ContractRunner, WasmCall,
-    ENTRY_POINTS,
+    execute_contract_call, execute_contract_call_in_txn, is_entry_point, ContractEvent,
+    ContractHost, ContractRunner, WasmCall, ENTRY_POINTS,
 };
 
 /// Table tracking executed sub-DAG leaders (idempotency).
@@ -43,6 +43,25 @@ const EXECUTED_SUBDAGS: TableDefinition<[u8; 32], u8> =
 
 /// Table for transaction receipts (committed_leader_height -> receipts).
 const TX_RECEIPTS: TableDefinition<u64, Vec<u8>> = TableDefinition::new("tx_receipts");
+
+/// Accrued, unclaimed delegator rewards: `delegator || validator` -> amount.
+/// Kept outside `StakingState` so its persisted (bincode) format is unchanged.
+const PENDING_REWARDS: TableDefinition<[u8; 64], u64> =
+    TableDefinition::new("staking_pending_rewards");
+
+/// Processed double-sign evidence ids (`StakingState::evidence_id`).
+const PROCESSED_EVIDENCE: TableDefinition<[u8; 40], u8> =
+    TableDefinition::new("staking_processed_evidence");
+
+/// Supply accounting counters kept by execution (e.g. `"slashed_burned"`).
+const SUPPLY_COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("supply_counters");
+
+fn reward_key(delegator: &Address, validator: &Address) -> [u8; 64] {
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(&delegator.0);
+    k[32..].copy_from_slice(&validator.0);
+    k
+}
 
 #[derive(Error, Debug)]
 pub enum ExecutionError {
@@ -240,10 +259,46 @@ impl ExecutionContext {
         // Perform the transition on a candidate state. The live in-memory state
         // is published only after all related storage writes commit successfully.
         let mut candidate_staking = snapshot_staking(&self.staking);
+        let leader = candidate_staking
+            .authority_validator(subdag.leader_author)
+            .cloned()
+            .ok_or(StakingError::NotValidator)?;
         let reward = candidate_staking.on_leader_committed(subdag.leader_author)?;
+        // Split the reward: commission + the validator's own pro-rata share
+        // go straight to its payout address; delegator shares accrue per
+        // (delegator, validator) and are paid by ClaimRewards.
+        let shares =
+            candidate_staking.reward_share(leader.address, reward.amount, leader.commission_bps);
+        {
+            let mut pending = txn.open_table(PENDING_REWARDS)?;
+            for (addr, amount) in &shares {
+                if *addr != leader.address && *amount > 0 {
+                    let key = reward_key(addr, &leader.address);
+                    let cur = pending.get(key)?.map(|v| v.value()).unwrap_or(0);
+                    pending.insert(key, cur.saturating_add(*amount))?;
+                }
+            }
+        }
+        let validator_part: u64 = shares
+            .iter()
+            .filter(|(a, _)| *a == leader.address)
+            .map(|(_, x)| *x)
+            .sum();
         storage
             .state()
-            .add_balance(&txn, &reward.recipient, reward.amount)?;
+            .add_balance(&txn, &reward.recipient, validator_part)?;
+        // Pay out matured unbonding entries (UNBONDING_ROUNDS elapsed) via
+        // withdraw_unbonded, in deterministic (delegator, validator) order.
+        let mut ready: Vec<(Address, Address)> = candidate_staking
+            .unbonding_ready()
+            .iter()
+            .map(|e| (e.delegator, e.validator))
+            .collect();
+        ready.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        for (delegator, validator) in ready {
+            let amount = candidate_staking.withdraw_unbonded(delegator, validator)?;
+            storage.state().add_balance(&txn, &delegator, amount)?;
+        }
         // Persist staking state (height, total_mining_issued, treasury vesting)
         storage
             .state()
@@ -495,121 +550,99 @@ impl ExecutionContext {
         Ok(events)
     }
 
-    /// Execute a stake transaction (bond tokens to become a validator or delegate).
+    /// Execute a stake transaction: register the sender as a validator
+    /// (`join_validator`, rejects duplicates) or, if it already is an active
+    /// validator, bond additional self-stake (`bond_validator`).
     fn execute_stake(
         &mut self,
         txn: &mut WriteTransaction,
-        _storage: &Storage,
+        storage: &Storage,
         from: &Address,
         amount: u64,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
-        // Check sender has sufficient balance and debit sender
-        let from_key = address_to_bytes(from);
-        let mut sender_account = {
-            let table = txn.open_table(tables::ACCOUNTS)?;
-            let value = table.get(from_key)?;
-            value
-                .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
-                .unwrap_or_default()
-        };
-        if sender_account.balance < amount {
+        let account = storage.state().get_account_or_default_write(txn, from)?;
+        if account.balance < amount {
             return Err(ExecutionError::Validation(
                 "Insufficient balance for stake".to_string(),
             ));
         }
-        sender_account.balance = sender_account.balance.saturating_sub(amount);
-        {
-            let mut table = txn.open_table(tables::ACCOUNTS)?;
-            table.insert(from_key, sender_account.to_bytes()?)?;
+        let is_validator = self
+            .staking
+            .validators
+            .iter()
+            .any(|v| v.address == *from && v.active);
+        if is_validator {
+            self.staking.bond_validator(*from, amount)?;
+        } else {
+            // Address == Ed25519 public key (unchanged address format).
+            let pk = kvnc_types::PublicKey(from.0);
+            self.staking
+                .join_validator(*from, amount, 0, None, Some(pk))?;
         }
-
-        // Add to staking state (self-delegation for simplicity)
-        // In a full implementation, this would allow delegating to a specific validator
-        self.staking.total_staked = self.staking.total_staked.saturating_add(amount);
-
-        // Add delegation record
-        self.staking.delegations.push(kvnc_staking::Delegation {
-            delegator: *from,
-            validator: *from, // Self-stake for now
-            amount,
-        });
-
-        // Emit stake event
-        let events = vec![ContractEvent {
+        debit(storage, txn, from, amount)?;
+        Ok(vec![ContractEvent {
             topic: b"stake".to_vec(),
             data: bincode::serialize(&(from, amount))
                 .map_err(|e| ExecutionError::Other(e.to_string()))?,
-        }];
-
-        Ok(events)
+        }])
     }
 
-    /// Execute an unstake transaction (begin unbonding).
+    /// Execute an unstake transaction. Validators unbond self-stake
+    /// (`unbond_validator`); delegators unbond via `unbond()` across their
+    /// delegations in validator-address order. Funds enter the unbonding
+    /// queue and are paid out automatically after `UNBONDING_ROUNDS`.
     fn execute_unstake(
         &mut self,
-        txn: &mut WriteTransaction,
+        _txn: &mut WriteTransaction,
         _storage: &Storage,
         from: &Address,
         amount: u64,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
-        // Find delegation
-        let delegation_idx = self
-            .staking
-            .delegations
-            .iter()
-            .position(|d| d.delegator == *from && d.validator == *from);
-        let Some(idx) = delegation_idx else {
+        if amount == 0 {
             return Err(ExecutionError::Validation(
-                "No active delegation found".to_string(),
-            ));
-        };
-
-        let delegation = &self.staking.delegations[idx];
-        if delegation.amount < amount {
-            return Err(ExecutionError::Validation(
-                "Insufficient staked amount to unstake".to_string(),
+                "Unstake amount must be positive".into(),
             ));
         }
-
-        // Reduce delegation amount
-        self.staking.delegations[idx].amount -= amount;
-        self.staking.total_staked = self.staking.total_staked.saturating_sub(amount);
-
-        // If delegation is fully unstaked, remove it
-        if self.staking.delegations[idx].amount == 0 {
-            self.staking.delegations.remove(idx);
+        if self.staking.validators.iter().any(|v| v.address == *from) {
+            self.staking.unbond_validator(*from, amount)?;
+        } else {
+            let mut per_validator: std::collections::BTreeMap<[u8; 32], u64> = Default::default();
+            for d in self
+                .staking
+                .delegations
+                .iter()
+                .filter(|d| d.delegator == *from)
+            {
+                *per_validator.entry(d.validator.0).or_default() += d.amount;
+            }
+            let total: u64 = per_validator.values().fold(0, |a, b| a.saturating_add(*b));
+            if total < amount {
+                return Err(ExecutionError::Validation(
+                    "Insufficient staked amount to unstake".to_string(),
+                ));
+            }
+            let mut remaining = amount;
+            for (validator, delegated) in per_validator {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(delegated);
+                self.staking.unbond(*from, Address(validator), take)?;
+                remaining -= take;
+            }
         }
-
-        // Credit back to sender's balance
-        let from_key = address_to_bytes(from);
-        let mut sender_account = {
-            let table = txn.open_table(tables::ACCOUNTS)?;
-            let value = table.get(from_key)?;
-            value
-                .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
-                .unwrap_or_default()
-        };
-        sender_account.balance = sender_account.balance.saturating_add(amount);
-        {
-            let mut table = txn.open_table(tables::ACCOUNTS)?;
-            table.insert(from_key, sender_account.to_bytes()?)?;
-        }
-
-        // Emit unstake event
-        let events = vec![ContractEvent {
+        Ok(vec![ContractEvent {
             topic: b"unstake".to_vec(),
             data: bincode::serialize(&(from, amount))
                 .map_err(|e| ExecutionError::Other(e.to_string()))?,
-        }];
-
-        Ok(events)
+        }])
     }
 
-    /// Execute a delegate transaction (delegate stake to a validator).
+    /// Execute a delegate transaction via `StakingState::delegate`.
     fn execute_delegate(
         &mut self,
         txn: &mut WriteTransaction,
-        _storage: &Storage,
+        storage: &Storage,
         from: &Address,
         validator: Address,
         amount: u64,
@@ -619,98 +652,77 @@ impl ExecutionContext {
                 "Delegate amount must be positive".to_string(),
             ));
         }
-
-        // Check sender has sufficient balance and debit sender
-        let from_key = address_to_bytes(from);
-        let mut sender_account = {
-            let table = txn.open_table(tables::ACCOUNTS)?;
-            let value = table.get(from_key)?;
-            value
-                .map(|v| Account::from_bytes(&v.value()).unwrap_or_default())
-                .unwrap_or_default()
-        };
-        if sender_account.balance < amount {
+        let account = storage.state().get_account_or_default_write(txn, from)?;
+        if account.balance < amount {
             return Err(ExecutionError::Validation(
                 "Insufficient balance for delegate".to_string(),
             ));
         }
-        // Verify validator exists and is active BEFORE any write.
-        let v_idx = self
-            .staking
-            .validators
-            .iter()
-            .position(|v| v.address == validator && v.active)
-            .ok_or(ExecutionError::Validation(
-                "Validator not found or inactive".to_string(),
-            ))?;
-
-        sender_account.balance = sender_account.balance.saturating_sub(amount);
-        {
-            let mut table = txn.open_table(tables::ACCOUNTS)?;
-            table.insert(from_key, sender_account.to_bytes()?)?;
-        }
-
-        // Update validator stake
-        self.staking.validators[v_idx].stake =
-            self.staking.validators[v_idx].stake.saturating_add(amount);
-        self.staking.total_staked = self.staking.total_staked.saturating_add(amount);
-
-        // Add delegation record
-        self.staking.delegations.push(kvnc_staking::Delegation {
-            delegator: *from,
-            validator,
-            amount,
-        });
-
-        // Emit delegate event
-        let events = vec![ContractEvent {
+        self.staking
+            .delegate(*from, validator, amount)
+            .map_err(|_| {
+                ExecutionError::Validation("Validator not found or inactive".to_string())
+            })?;
+        debit(storage, txn, from, amount)?;
+        Ok(vec![ContractEvent {
             topic: b"delegate".to_vec(),
             data: bincode::serialize(&(from, &validator, amount))
                 .map_err(|e| ExecutionError::Other(e.to_string()))?,
-        }];
-
-        Ok(events)
+        }])
     }
 
-    /// Execute a claim-rewards transaction (claim delegation rewards).
+    /// Execute a claim-rewards transaction: pay the sender's accrued
+    /// delegator rewards (for one validator, or all) to its balance.
     fn execute_claim_rewards(
         &mut self,
-        _txn: &mut WriteTransaction,
-        _storage: &Storage,
+        txn: &mut WriteTransaction,
+        storage: &Storage,
         from: &Address,
         validator: Option<Address>,
     ) -> Result<Vec<ContractEvent>, ExecutionError> {
-        // Collect rewards for the delegator
-        let total_claimed = 0u64;
-        let mut events = Vec::new();
-
-        if let Some(validator_addr) = validator {
-            // Claim rewards for specific validator
-            // We'll compute actual rewards
-            let shares = self.staking.reward_share(validator_addr, 0, 0);
-            // For now, just emit event - actual reward distribution happens via staking module
-            for (addr, _share) in shares {
-                if addr == *from {
-                    events.push(ContractEvent {
-                        topic: b"claim_rewards".to_vec(),
-                        data: bincode::serialize(&(&validator_addr, total_claimed))
-                            .map_err(|e| ExecutionError::Other(e.to_string()))?,
-                    });
+        // Collect first (no writes), then validate, then write.
+        let claims: Vec<([u8; 64], Address, u64)> = {
+            let table = txn.open_table(PENDING_REWARDS)?;
+            match validator {
+                Some(v) => {
+                    let key = reward_key(from, &v);
+                    let amt = table.get(key)?.map(|x| x.value()).unwrap_or(0);
+                    vec![(key, v, amt)]
+                }
+                None => {
+                    let lo = reward_key(from, &Address([0u8; 32]));
+                    let hi = reward_key(from, &Address([0xFF; 32]));
+                    let mut out = Vec::new();
+                    for row in table.range(lo..=hi)? {
+                        let (k, v) = row?;
+                        let k = k.value();
+                        let mut va = [0u8; 32];
+                        va.copy_from_slice(&k[32..]);
+                        out.push((k, Address(va), v.value()));
+                    }
+                    out
                 }
             }
-        } else {
-            // Claim all rewards for all validators the delegator has delegated to
-            for d in &self.staking.delegations {
-                if d.delegator == *from {
-                    events.push(ContractEvent {
-                        topic: b"claim_rewards".to_vec(),
-                        data: bincode::serialize(&(&d.validator, total_claimed))
-                            .map_err(|e| ExecutionError::Other(e.to_string()))?,
-                    });
-                }
+        };
+        let total: u64 = claims.iter().map(|c| c.2).fold(0, u64::saturating_add);
+        if total == 0 {
+            return Err(ExecutionError::Validation(
+                "No rewards to claim".to_string(),
+            ));
+        }
+        let mut events = Vec::new();
+        {
+            let mut table = txn.open_table(PENDING_REWARDS)?;
+            for (key, v, amt) in &claims {
+                table.remove(*key)?;
+                events.push(ContractEvent {
+                    topic: b"claim_rewards".to_vec(),
+                    data: bincode::serialize(&(v, *amt))
+                        .map_err(|e| ExecutionError::Other(e.to_string()))?,
+                });
             }
         }
-
+        storage.state().add_balance(txn, from, total)?;
         Ok(events)
     }
 
@@ -796,12 +808,49 @@ impl ExecutionContext {
             timestamp: block_height, // Simplified: use height as timestamp
             args,
             storage,
+            // Single writer: the host reads and writes through the sub-DAG's
+            // open write transaction instead of opening a second one.
+            txn: Some(&*txn),
             config: &config,
         };
 
         let (_, events) = self.contract_runner.execute_wasm_call(wasm_call)?;
 
         Ok(events)
+    }
+
+    /// Apply double-sign evidence: slash 5% (SLASH_PCT_BPS) of the
+    /// validator's self-stake and of each delegation, once per evidence.
+    ///
+    /// Destination: **burned**. Slashed stake is removed from circulation and
+    /// recorded in `supply_counters["slashed_burned"]`; no tokenomics doc
+    /// assigns it to the treasury, so it is not credited anywhere.
+    /// Opens its own write transaction: call only between sub-DAGs.
+    pub fn apply_double_sign_evidence(
+        &mut self,
+        evidence: kvnc_staking::DoubleSignEvidence,
+        storage: &Storage,
+    ) -> Result<u64, ExecutionError> {
+        let id = StakingState::evidence_id(&evidence);
+        let txn = storage.begin_write()?;
+        if txn.open_table(PROCESSED_EVIDENCE)?.get(id)?.is_some() {
+            return Err(StakingError::EvidenceProcessed.into());
+        }
+        let mut candidate = snapshot_staking(&self.staking);
+        let slashed = candidate.slash(evidence)?;
+        {
+            let mut counters = txn.open_table(SUPPLY_COUNTERS)?;
+            let cur = counters
+                .get("slashed_burned")?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            counters.insert("slashed_burned", cur.saturating_add(slashed))?;
+        }
+        txn.open_table(PROCESSED_EVIDENCE)?.insert(id, 1)?;
+        storage.state().save_staking_state(&txn, &candidate)?;
+        txn.commit().map_err(StorageError::Commit)?;
+        self.staking = candidate;
+        Ok(slashed)
     }
 
     /// Claim available treasury funds and credit them to the treasury address.
@@ -852,6 +901,26 @@ impl ExecutionContext {
 
         Ok(claimed)
     }
+}
+
+/// Debit `amount` from `address` (balance checked by the caller).
+/// (`StateStore::sub_balance` keeps the ACCOUNTS table open while writing,
+/// which redb rejects inside one write transaction.)
+fn debit(
+    storage: &Storage,
+    txn: &WriteTransaction,
+    address: &Address,
+    amount: u64,
+) -> Result<(), ExecutionError> {
+    let mut account = storage.state().get_account_or_default_write(txn, address)?;
+    account.balance = account
+        .balance
+        .checked_sub(amount)
+        .ok_or(ExecutionError::Validation(
+            "Insufficient balance".to_string(),
+        ))?;
+    storage.state().set_account(txn, address, &account)?;
+    Ok(())
 }
 
 /// Field-by-field copy of the staking state (it does not derive `Clone`).
@@ -1829,12 +1898,12 @@ mod tests {
         let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
         let key = test_keypair(1);
         let sender = address_of(&key);
-        let mut ctx = setup_funded_sender(&storage, &sender, 1000 * kvnc_staking::ONE_KVNC);
+        let mut ctx = setup_funded_sender(&storage, &sender, 100_000 * kvnc_staking::ONE_KVNC);
         let before = staking_state_bytes(&ctx.staking);
         let tx = signed_tx(
             &key,
             TransactionKind::Stake {
-                amount: 5 * kvnc_staking::ONE_KVNC,
+                amount: kvnc_staking::MIN_VALIDATOR_STAKE,
             },
             0,
             1000,
@@ -1890,5 +1959,609 @@ mod tests {
         let b = run();
         assert_eq!(a.5, vec![true, false, true, false]);
         assert_eq!(a, b);
+    }
+    // ---- single redb writer for contract calls --------------------------
+
+    fn leb_u32(out: &mut Vec<u8>, mut v: u32) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn leb_i32(out: &mut Vec<u8>, mut v: i32) {
+        loop {
+            let b = (v as u8) & 0x7f;
+            v >>= 7;
+            let done = (v == 0 && b & 0x40 == 0) || (v == -1 && b & 0x40 != 0);
+            out.push(if done { b } else { b | 0x80 });
+            if done {
+                break;
+            }
+        }
+    }
+
+    fn section(wasm: &mut Vec<u8>, id: u8, payload: &[u8]) {
+        wasm.push(id);
+        leb_u32(wasm, payload.len() as u32);
+        wasm.extend(payload);
+    }
+
+    fn name(out: &mut Vec<u8>, n: &str) {
+        leb_u32(out, n.len() as u32);
+        out.extend(n.as_bytes());
+    }
+
+    /// Hand-assembled probe contract (entry `probe`): reads the caller's
+    /// native balance via `kvnc_balance_of`, stores it (i64 LE) under raw
+    /// key `[0]`, then succeeds if `args` is empty and fails (contract
+    /// error) otherwise — i.e. a failing call that already wrote its overlay.
+    fn probe_wasm() -> Vec<u8> {
+        let mut w = b"\0asm\x01\0\0\0".to_vec();
+        let mut types = vec![5];
+        types.extend([0x60, 2, 0x7f, 0x7f, 1, 0x7e]); // 0 (i32,i32)->i64
+        types.extend([0x60, 1, 0x7f, 1, 0x7f]); // 1 i32->i32
+        types.extend([0x60, 2, 0x7f, 0x7f, 0]); // 2 (i32,i32)->()
+        types.extend([0x60, 1, 0x7f, 0]); // 3 i32->()
+        types.extend([0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f]); // 4
+        section(&mut w, 1, &types);
+        let mut imports = vec![3];
+        for (n, t) in [
+            ("kvnc_caller", 3u8),
+            ("kvnc_balance_of", 0),
+            ("kvnc_storage_set", 4),
+        ] {
+            name(&mut imports, "env");
+            name(&mut imports, n);
+            imports.extend([0, t]);
+        }
+        section(&mut w, 2, &imports);
+        section(&mut w, 3, &[3, 1, 2, 0]);
+        section(&mut w, 5, &[1, 0, 1]);
+        let mut exports = vec![4];
+        for (n, kind, idx) in [
+            ("memory", 2u8, 0u8),
+            ("kvnc_alloc", 0, 3),
+            ("kvnc_dealloc", 0, 4),
+            ("probe", 0, 5),
+        ] {
+            name(&mut exports, n);
+            exports.extend([kind, idx]);
+        }
+        section(&mut w, 7, &exports);
+
+        let mut alloc = vec![0, 0x41];
+        leb_i32(&mut alloc, 64);
+        alloc.push(0x0b);
+        let dealloc = vec![0, 0x0b];
+        let c = |v: i32| {
+            let mut o = vec![0x41];
+            leb_i32(&mut o, v);
+            o
+        };
+        let mut entry = vec![0];
+        entry.extend(c(256));
+        entry.extend([0x10, 0]); // kvnc_caller(256)
+        entry.extend(c(512));
+        entry.extend(c(256));
+        entry.extend(c(32));
+        entry.extend([0x10, 1]); // kvnc_balance_of(256, 32)
+        entry.extend([0x37, 0x03, 0x00]); // i64.store [512]
+        entry.extend(c(600));
+        entry.extend(c(1));
+        entry.extend(c(512));
+        entry.extend(c(8));
+        entry.extend([0x10, 2, 0x1a]); // kvnc_storage_set(...); drop
+        entry.extend([0x20, 1, 0x04, 0x40, 0x42, 0x7f, 0x0f, 0x0b]); // if len { return -1 }
+        entry.extend([0x42, 0x00, 0x0b]); // i64.const 0; end
+        let mut code = vec![3];
+        for body in [&alloc, &dealloc, &entry] {
+            leb_u32(&mut code, body.len() as u32);
+            code.extend(body.iter());
+        }
+        section(&mut w, 10, &code);
+        w
+    }
+
+    const PROBE_CONTRACT: Address = Address([0xC0; 32]);
+
+    fn deploy_probe(storage: &Storage) {
+        let txn = storage.begin_write().expect("write txn");
+        let code = probe_wasm();
+        storage
+            .state()
+            .set_account(
+                &txn,
+                &PROBE_CONTRACT,
+                &Account {
+                    balance: 0,
+                    nonce: 0,
+                    code_hash: kvnc_common::hash(&code),
+                    code,
+                },
+            )
+            .expect("deploy probe");
+        txn.commit().expect("commit");
+    }
+
+    fn probe_call(key: &SigningKey, fail: bool, nonce: u64, fee: u64) -> Transaction {
+        let kind = TransactionKind::Call {
+            contract: PROBE_CONTRACT,
+            method: "probe".to_string(),
+            args: if fail { vec![1] } else { Vec::new() },
+            gas_limit: 1_000_000,
+        };
+        signed_tx(key, kind, nonce, fee)
+    }
+
+    fn probe_slot(storage: &Storage) -> Option<u64> {
+        let txn = storage.begin_read().expect("read");
+        storage
+            .state()
+            .get_storage(&txn, &PROBE_CONTRACT, &kvnc_common::hash(&[0u8]))
+            .expect("storage read")
+            .map(|v| u64::from_le_bytes(v.try_into().expect("8 bytes")))
+    }
+
+    /// Run `f` on a worker thread; fail (instead of hanging the suite) if it
+    /// does not finish within 30 s. The old code deadlocked here.
+    fn with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("contract call hung: a second redb writer was opened (deadlock)")
+    }
+
+    // Call via execute_committed_subdag must not hang, and the contract must
+    // see the fee already deducted in the same open write transaction.
+    #[test]
+    fn wasm_call_in_subdag_uses_single_writer_and_sees_fee() {
+        let (receipt, slot, balance) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call(&key, false, 0, 1000));
+            (
+                r.receipts[0].clone(),
+                probe_slot(&storage),
+                read_balance(&storage, &sender),
+            )
+        });
+        assert!(receipt.success, "{:?}", receipt.error);
+        assert_eq!(
+            slot,
+            Some(1_000_000 - 1000),
+            "contract saw the fee deducted"
+        );
+        assert_eq!(balance, 1_000_000 - 1000);
+    }
+
+    // A transfer earlier in the same block is visible to the contract.
+    #[test]
+    fn wasm_call_sees_earlier_writes_in_same_block() {
+        let (ok, slot) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let txs = vec![
+                create_transfer_tx(&key, &Address([2u8; 32]), 100_000, 0, 1000),
+                probe_call(&key, false, 1, 1000),
+            ];
+            let subdag = CommittedSubDag {
+                leader: sample_block(0),
+                blocks: vec![sample_block_with_txs(0, txs)],
+                leader_round: 1,
+                leader_author: 0,
+            };
+            let r = ctx
+                .execute_committed_subdag(&subdag, &storage)
+                .expect("execute");
+            (
+                r.receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+                probe_slot(&storage),
+            )
+        });
+        assert_eq!(ok, vec![true, true]);
+        assert_eq!(slot, Some(1_000_000 - 100_000 - 2000));
+    }
+
+    // A failing call (after it already wrote its overlay) leaves no storage
+    // write; only fee and nonce are charged.
+    #[test]
+    fn failed_wasm_call_leaves_no_storage_writes() {
+        let (receipt, slot, balance, nonce) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call(&key, true, 0, 1000));
+            (
+                r.receipts[0].clone(),
+                probe_slot(&storage),
+                read_balance(&storage, &sender),
+                read_nonce(&storage, &sender),
+            )
+        });
+        assert!(!receipt.success);
+        assert_eq!(slot, None, "failed call must not write contract storage");
+        assert_eq!(balance, 1_000_000 - 1000);
+        assert_eq!(nonce, 1);
+    }
+
+    // Deterministic replay with successful and failing contract calls.
+    #[test]
+    fn replay_with_contract_calls_is_deterministic() {
+        let run = || {
+            with_timeout(|| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+                let key = test_keypair(1);
+                let sender = address_of(&key);
+                let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+                deploy_probe(&storage);
+                let txs = vec![
+                    probe_call(&key, true, 0, 1000),
+                    create_transfer_tx(&key, &Address([2u8; 32]), 5_000, 1, 1000),
+                    probe_call(&key, false, 2, 1000),
+                ];
+                let subdag = CommittedSubDag {
+                    leader: sample_block(0),
+                    blocks: vec![sample_block_with_txs(0, txs)],
+                    leader_round: 1,
+                    leader_author: 0,
+                };
+                let r = ctx
+                    .execute_committed_subdag(&subdag, &storage)
+                    .expect("execute");
+                (
+                    bincode::serialize(&r.receipts).expect("receipts"),
+                    staking_state_bytes(&ctx.staking),
+                    probe_slot(&storage),
+                    read_balance(&storage, &sender),
+                    read_nonce(&storage, &sender),
+                )
+            })
+        };
+        let a = run();
+        assert_eq!(a.2, Some(1_000_000 - 5_000 - 3000));
+        assert_eq!(a, run());
+    }
+    // ---- staking wiring -------------------------------------------------
+
+    const K: u64 = kvnc_staking::ONE_KVNC;
+
+    fn subdag_at(round: u64, txs: Vec<Transaction>) -> CommittedSubDag {
+        let leader = sample_block_at(0, round);
+        let mut block = sample_block_with_txs(0, txs);
+        block.round = round;
+        CommittedSubDag {
+            blocks: vec![block],
+            leader,
+            leader_round: round,
+            leader_author: 0,
+        }
+    }
+
+    fn run(
+        ctx: &mut ExecutionContext,
+        storage: &Storage,
+        round: u64,
+        txs: Vec<Transaction>,
+    ) -> Vec<TransactionReceipt> {
+        ctx.execute_committed_subdag(&subdag_at(round, txs), storage)
+            .expect("execute")
+            .receipts
+    }
+
+    fn pending_reward(storage: &Storage, d: &Address, v: &Address) -> u64 {
+        let txn = storage.begin_read().expect("read");
+        match txn.open_table(PENDING_REWARDS) {
+            Ok(t) => t
+                .get(reward_key(d, v))
+                .expect("get")
+                .map(|x| x.value())
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn stake_tx_joins_then_bonds_validator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let me = address_of(&key);
+        let mut ctx = setup_funded_sender(&storage, &me, 100_000 * K);
+        let min = kvnc_staking::MIN_VALIDATOR_STAKE;
+        let r = run(
+            &mut ctx,
+            &storage,
+            1,
+            vec![
+                signed_tx(&key, TransactionKind::Stake { amount: min }, 0, 1000),
+                signed_tx(&key, TransactionKind::Stake { amount: 5 * K }, 1, 1000),
+            ],
+        );
+        assert!(r.iter().all(|r| r.success), "{r:?}");
+        let v = ctx
+            .staking
+            .validators
+            .iter()
+            .find(|v| v.address == me)
+            .expect("validator");
+        assert!(v.active);
+        assert_eq!(v.stake, min + 5 * K);
+        assert_eq!(v.public_key, Some(kvnc_types::PublicKey(me.0)));
+        assert_eq!(
+            ctx.staking
+                .validators
+                .iter()
+                .filter(|v| v.address == me)
+                .count(),
+            1
+        );
+        assert_eq!(
+            read_balance(&storage, &me),
+            100_000 * K - min - 5 * K - 2000
+        );
+        // Below-minimum fresh stake is rejected and rolled back.
+        let k2 = test_keypair(2);
+        let other = address_of(&k2);
+        let txn = storage.begin_write().expect("w");
+        storage
+            .state()
+            .add_balance(&txn, &other, 10 * K)
+            .expect("fund");
+        txn.commit().expect("c");
+        let r = run(
+            &mut ctx,
+            &storage,
+            2,
+            vec![signed_tx(
+                &k2,
+                TransactionKind::Stake { amount: 5 * K },
+                0,
+                1000,
+            )],
+        );
+        assert!(!r[0].success);
+        assert_eq!(read_balance(&storage, &other), 10 * K - 1000);
+    }
+
+    #[test]
+    fn unstake_goes_through_queue_and_pays_after_unbonding_rounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let me = address_of(&key);
+        let validator = Address([3u8; 32]);
+        let mut ctx = setup_funded_sender(&storage, &me, 1_000 * K);
+        let r = run(
+            &mut ctx,
+            &storage,
+            1,
+            vec![
+                signed_tx(
+                    &key,
+                    TransactionKind::Delegate {
+                        validator,
+                        amount: 400 * K,
+                    },
+                    0,
+                    1000,
+                ),
+                signed_tx(&key, TransactionKind::Unstake { amount: 150 * K }, 1, 1000),
+            ],
+        );
+        assert!(r.iter().all(|r| r.success), "{r:?}");
+        assert_eq!(ctx.staking.delegated_to(validator), 250 * K);
+        assert_eq!(ctx.staking.unbonding_queue.len(), 1);
+        let release = ctx.staking.unbonding_queue[0].release_height;
+        assert_eq!(
+            release,
+            kvnc_staking::UNBONDING_ROUNDS,
+            "unbonded at height 0"
+        );
+        let liquid = read_balance(&storage, &me);
+        assert_eq!(liquid, 600 * K - 2000, "unstaked funds are not liquid yet");
+        // Not yet matured.
+        run(&mut ctx, &storage, 2, vec![]);
+        assert_eq!(read_balance(&storage, &me), liquid);
+        // Jump to just before maturity; the next commit pays out.
+        ctx.staking.committed_leader_height = release - 1;
+        run(&mut ctx, &storage, 3, vec![]);
+        assert_eq!(read_balance(&storage, &me), liquid + 150 * K);
+        assert!(ctx.staking.unbonding_queue.is_empty());
+    }
+
+    // Old behaviour: ClaimRewards only emitted events, delegators were never paid.
+    #[test]
+    fn delegator_rewards_accrue_and_claim_pays_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let me = address_of(&key);
+        let validator = Address([3u8; 32]);
+        let payout = Address([4u8; 32]);
+        let mut ctx = setup_funded_sender(&storage, &me, 100_000 * K);
+        let min = kvnc_staking::MIN_VALIDATOR_STAKE;
+        let r = run(
+            &mut ctx,
+            &storage,
+            1,
+            vec![signed_tx(
+                &key,
+                TransactionKind::Delegate {
+                    validator,
+                    amount: min,
+                },
+                0,
+                1000,
+            )],
+        );
+        assert!(r[0].success);
+        // Reward of round 1 (10 KVNC) split 50/50 (commission 0).
+        assert_eq!(pending_reward(&storage, &me, &validator), 5 * K);
+        assert_eq!(read_balance(&storage, &payout), 5 * K);
+        let before = read_balance(&storage, &me);
+        let r = run(
+            &mut ctx,
+            &storage,
+            2,
+            vec![signed_tx(
+                &key,
+                TransactionKind::ClaimRewards { validator: None },
+                1,
+                1000,
+            )],
+        );
+        assert!(r[0].success, "{r:?}");
+        assert_eq!(read_balance(&storage, &me), before + 5 * K - 1000);
+        // Round-2 reward accrued again after the claim tx.
+        assert_eq!(pending_reward(&storage, &me, &validator), 5 * K);
+        // Commission is paid to the validator payout.
+        ctx.staking
+            .set_commission(validator, 2_000)
+            .expect("commission");
+        run(&mut ctx, &storage, 3, vec![]);
+        // 20% of 10 = 2, rest 8 split 4/4 → validator 6, delegator +4.
+        assert_eq!(read_balance(&storage, &payout), 5 * K + 5 * K + 6 * K);
+        assert_eq!(pending_reward(&storage, &me, &validator), 9 * K);
+        // Claiming with nothing pending fails honestly.
+        let k2 = test_keypair(2);
+        let other = address_of(&k2);
+        let txn = storage.begin_write().expect("w");
+        storage.state().add_balance(&txn, &other, K).expect("fund");
+        txn.commit().expect("c");
+        let r = run(
+            &mut ctx,
+            &storage,
+            4,
+            vec![signed_tx(
+                &k2,
+                TransactionKind::ClaimRewards {
+                    validator: Some(validator),
+                },
+                0,
+                1000,
+            )],
+        );
+        assert!(!r[0].success);
+    }
+
+    #[test]
+    fn double_sign_evidence_slashes_once_and_burns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let mut ctx = setup_funded_sender(&storage, &Address([9u8; 32]), 0);
+        let v = Address([3u8; 32]);
+        ctx.staking
+            .delegate(Address([9u8; 32]), v, 10_000 * K)
+            .expect("delegate");
+        let ev = kvnc_staking::DoubleSignEvidence {
+            validator: v,
+            height: 1,
+        };
+        let slashed = ctx
+            .apply_double_sign_evidence(ev.clone(), &storage)
+            .expect("slash");
+        assert_eq!(slashed, 3_000 * K);
+        assert_eq!(ctx.staking.total_staked, 57_000 * K);
+        let err = ctx
+            .apply_double_sign_evidence(ev, &storage)
+            .expect_err("dup");
+        assert!(matches!(
+            err,
+            ExecutionError::Staking(StakingError::EvidenceProcessed)
+        ));
+        assert_eq!(ctx.staking.total_staked, 57_000 * K);
+        let txn = storage.begin_read().expect("r");
+        let burned = txn
+            .open_table(SUPPLY_COUNTERS)
+            .expect("t")
+            .get("slashed_burned")
+            .expect("g")
+            .map(|x| x.value());
+        assert_eq!(burned, Some(3_000 * K));
+        assert_eq!(
+            staking_state_bytes(&load_staking_state(&storage)),
+            staking_state_bytes(&ctx.staking)
+        );
+    }
+
+    #[test]
+    fn staking_replay_is_deterministic() {
+        let go = || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let me = address_of(&key);
+            let validator = Address([3u8; 32]);
+            let mut ctx = setup_funded_sender(&storage, &me, 200_000 * K);
+            let mut receipts = Vec::new();
+            receipts.extend(run(
+                &mut ctx,
+                &storage,
+                1,
+                vec![
+                    signed_tx(
+                        &key,
+                        TransactionKind::Delegate {
+                            validator,
+                            amount: 1_000 * K,
+                        },
+                        0,
+                        1000,
+                    ),
+                    signed_tx(
+                        &key,
+                        TransactionKind::Stake {
+                            amount: kvnc_staking::MIN_VALIDATOR_STAKE,
+                        },
+                        1,
+                        1000,
+                    ),
+                ],
+            ));
+            receipts.extend(run(
+                &mut ctx,
+                &storage,
+                2,
+                vec![
+                    signed_tx(
+                        &key,
+                        TransactionKind::ClaimRewards { validator: None },
+                        2,
+                        1000,
+                    ),
+                    signed_tx(&key, TransactionKind::Unstake { amount: 10 * K }, 3, 1000),
+                ],
+            ));
+            (
+                bincode::serialize(&receipts).expect("r"),
+                staking_state_bytes(&ctx.staking),
+                read_balance(&storage, &me),
+                pending_reward(&storage, &me, &validator),
+            )
+        };
+        let a = go();
+        assert_eq!(a, go());
     }
 }
