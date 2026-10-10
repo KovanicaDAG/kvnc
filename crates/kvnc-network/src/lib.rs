@@ -14,6 +14,7 @@ mod behaviour;
 mod block_sync;
 mod error;
 pub mod identity;
+pub mod scoring;
 mod service;
 mod state_sync;
 mod sync;
@@ -25,6 +26,7 @@ pub use block_sync::{
     BLOCK_SYNC_PROTOCOL,
 };
 pub use error::NetworkError;
+pub use scoring::PeerScoringConfig;
 pub use service::NetworkService;
 pub use state_sync::{StateSyncCodec, StateSyncRequest, StateSyncResponse, STATE_SYNC_PROTOCOL};
 pub use sync::SyncRequest;
@@ -109,6 +111,8 @@ pub struct NetworkConfig {
     /// the validator key). Created with mode `0600` on first start. `None`
     /// uses a fresh identity per process (tests).
     pub node_key_path: Option<std::path::PathBuf>,
+    /// Gossipsub peer scoring (on by default, see [`PeerScoringConfig`]).
+    pub peer_scoring: PeerScoringConfig,
 }
 
 impl Default for NetworkConfig {
@@ -136,6 +140,7 @@ impl Default for NetworkConfig {
             max_peers: 50,
             ping_interval: Duration::from_secs(10),
             node_key_path: None,
+            peer_scoring: PeerScoringConfig::default(),
         }
     }
 }
