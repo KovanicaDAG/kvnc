@@ -366,7 +366,7 @@ pub async fn handle_get_transaction_by_hash(
 // Account methods
 // ============================================================================
 
-/// `kvnc_getBalance(address)` — native KVNC balance in atoms.
+/// `kvnc_getBalance(address)` — native KUNA balance in atoms.
 pub async fn handle_get_balance(params: Value, state: RpcState) -> Result<Value, RpcError> {
     let args = params_vec(&params);
     let address = parse_address(required(&args, 0, "address")?, "address")?;

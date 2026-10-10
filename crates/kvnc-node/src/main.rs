@@ -68,7 +68,7 @@ use kvnc_types::{
 /// Command line arguments.
 #[derive(Parser, Debug)]
 #[command(name = "kvnc-node")]
-#[command(about = "Kovanica (KVNC) full node", long_about = None)]
+#[command(about = "Kovanica (KUNA) full node", long_about = None)]
 #[command(subcommand_required = false, arg_required_else_help = false)]
 struct Args {
     #[command(subcommand)]
@@ -95,7 +95,7 @@ struct GenesisArgs {
     #[arg(long, value_name = "HEX")]
     treasury_address: String,
 
-    /// Founder premine address (32-byte hex, receives 200,000 KVNC)
+    /// Founder premine address (32-byte hex, receives 200,000 KUNA)
     #[arg(long, value_name = "HEX")]
     founder_address: String,
 
@@ -160,7 +160,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
-    // Founder premine (200,000 KVNC) - included in genesis allocations output
+    // Founder premine (200,000 KUNA) - included in genesis allocations output
     // Actual balance set when genesis block is executed on first run
 
     // Join each validator
@@ -230,6 +230,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             "founder_address_bytes": hex::encode(founder.0),
             "founder_premine_atoms": FOUNDER_PREMINE,
             "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
+            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KVNC,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
@@ -757,7 +758,7 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     // Begin write transaction early (needed for premine + staking save)
     let txn = state_storage.begin_write()?;
 
-    // Founder premine (200_000 KVNC) — write to state store if founder file present.
+    // Founder premine (200_000 KUNA) — write to state store if founder file present.
     let premine_path = config.data_dir.join("founder_premine.hex");
     if premine_path.exists() {
         let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
@@ -2045,7 +2046,7 @@ mod tests {
         let mut staking = StakingState::new();
         staking.init_treasury(Address([0xaa; 32]));
 
-        // Validator stakes: 100K, 80K, 120K, 60K KVNC (all above MIN_VALIDATOR_STAKE = 50K)
+        // Validator stakes: 100K, 80K, 120K, 60K KUNA (all above MIN_VALIDATOR_STAKE = 50K)
         staking
             .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
             .unwrap();
