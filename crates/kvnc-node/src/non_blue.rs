@@ -1,17 +1,8 @@
 //! #13: return transactions from non-blue (red) blocks of a committed
-//! sub-DAG to the mempool.
-//!
-//! The authoritative helper is Consensus's `kvnc_consensus::non_blue_transactions(dag, subdag)`,
-//! which is not published yet. Until it is, [`LocalNonBlue`] is a local
-//! stand-in behind the [`NonBlueSource`] adapter.
-//!
-//! SWAP POINT: when the helper lands, replace the body of
-//! [`LocalNonBlue::non_blue_transactions`] with
-//! `kvnc_consensus::non_blue_transactions(dag, subdag)` (or add a
-//! `ConsensusNonBlue` impl and change the one constructor call in
-//! `run_node`, see `NonBlueSource` usage in `main.rs`). Nothing else changes.
+//! sub-DAG to the mempool, via Consensus's `non_blue_transactions` (#47)
+//! behind the small [`NonBlueSource`] seam (tests inject doubles).
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use kvnc_consensus::CommittedSubDag;
 use kvnc_dag::DagStore;
@@ -26,34 +17,23 @@ pub trait NonBlueSource: Send + Sync {
     fn non_blue_transactions(&self, dag: &DagStore, subdag: &CommittedSubDag) -> Vec<Transaction>;
 }
 
-/// Local stand-in for `kvnc_consensus::non_blue_transactions`.
-pub struct LocalNonBlue;
+/// Production source: Consensus's `kvnc_consensus::non_blue_transactions`
+/// (#47). Red blocks stay in the DAG until round pruning, so they are
+/// readable here after commit and on recovery.
+pub struct ConsensusNonBlue;
 
-impl NonBlueSource for LocalNonBlue {
+impl NonBlueSource for ConsensusNonBlue {
     fn non_blue_transactions(&self, dag: &DagStore, subdag: &CommittedSubDag) -> Vec<Transaction> {
-        // SWAP POINT: `kvnc_consensus::non_blue_transactions(dag, subdag)`.
-        let blue: HashSet<_> = subdag
-            .blocks
-            .iter()
-            .flat_map(|b| b.transactions.iter().map(|t| t.hash))
-            .collect();
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for reference in &subdag.non_blue {
-            match dag.get_block(&reference.digest) {
-                Ok(block) => {
-                    for tx in block.transactions {
-                        if !blue.contains(&tx.hash) && seen.insert(tx.hash) {
-                            out.push(tx);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(digest = %reference.digest, error = %e, "non-blue block unavailable")
-                }
+        let store = crate::NodeDagStore {
+            inner: Arc::new(dag.clone()),
+        };
+        match kvnc_consensus::non_blue_transactions(&store, subdag) {
+            Ok(txs) => txs,
+            Err(e) => {
+                warn!(round = subdag.leader_round, error = %e, "could not read non-blue transactions");
+                Vec::new()
             }
         }
-        out
     }
 }
 
@@ -159,6 +139,25 @@ pub(crate) mod test_support {
         }
     }
 
+    pub fn block_with_parents(
+        author: u32,
+        round: u64,
+        parents: Vec<BlockReference>,
+        txs: Vec<Transaction>,
+    ) -> StatementBlock {
+        let digest = StatementBlock::compute_digest(author as _, round, &parents, &txs);
+        StatementBlock {
+            author: author as _,
+            round,
+            parents,
+            transactions: txs,
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest,
+            merkle_root: Default::default(),
+        }
+    }
+
     pub fn reference(b: &StatementBlock) -> BlockReference {
         BlockReference {
             author: b.author,
@@ -176,7 +175,7 @@ mod tests {
     use kvnc_storage::Storage;
 
     #[test]
-    fn local_adapter_returns_only_red_only_transactions_and_reinserts_them() {
+    fn consensus_source_returns_only_red_only_transactions_and_reinserts_them() {
         let dir = tempfile::tempdir().unwrap();
         let dag =
             Arc::new(DagStore::new(Storage::new(dir.path().join("dag.redb")).unwrap()).unwrap());
@@ -198,7 +197,7 @@ mod tests {
             non_blue: vec![reference(&red)],
         };
 
-        let txs = LocalNonBlue.non_blue_transactions(&dag, &subdag);
+        let txs = ConsensusNonBlue.non_blue_transactions(&dag, &subdag);
         assert_eq!(
             txs.iter().map(|t| t.hash).collect::<Vec<_>>(),
             vec![red_only.hash]
@@ -207,7 +206,7 @@ mod tests {
         let mempool = Mempool::new(MempoolConfig::default(), state, CTX);
         let returned = ReturnedTxs {
             dag,
-            source: Arc::new(LocalNonBlue),
+            source: Arc::new(ConsensusNonBlue),
         };
         let report = returned.reinsert(&mempool, &subdag);
         assert_eq!(report.len(), 1);

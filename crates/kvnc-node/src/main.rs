@@ -677,10 +677,10 @@ where
         events.clone(),
         Some(non_blue::ExecPool {
             mempool: mempool.clone(),
-            // #13 adapter: swap `LocalNonBlue` for Consensus's helper (non_blue.rs).
+            // #13: Consensus #47 helper behind the NonBlueSource seam.
             returned: Some(non_blue::ReturnedTxs {
                 dag: dag_store.clone(),
-                source: Arc::new(non_blue::LocalNonBlue),
+                source: Arc::new(non_blue::ConsensusNonBlue),
             }),
         }),
         signing_ctx,
@@ -1513,6 +1513,13 @@ fn recover_committed_subdag_mysticghost(
             // Use the blue-set order from GHOSTDAG
             let blue_ordered = colouring.blue_ordered();
 
+            // Red mergeset blocks, computed exactly like the live committer.
+            let non_blue = kvnc_consensus::non_blue_refs(
+                &mergeset_blocks,
+                &colouring.blue,
+                &leader_block.digest,
+            );
+
             // Build blocks in blue order, filtering to only those in mergeset
             let block_map: std::collections::HashMap<Hash, StatementBlock> =
                 mergeset_blocks.into_iter().map(|b| (b.digest, b)).collect();
@@ -1537,8 +1544,7 @@ fn recover_committed_subdag_mysticghost(
                 leader: leader_block.clone(),
                 leader_round,
                 leader_author: leader_block.author,
-                // TODO(#13 owner): fill with the red mergeset blocks (same helper live and on recovery).
-                non_blue: Vec::new(),
+                non_blue,
             })
         }
         MysticGhostOrder::Fallback => {
@@ -2512,6 +2518,128 @@ mod tests {
             mempool.contains(&returned_tx.hash),
             "returned tx back in the pool"
         );
+        assert!(mempool.get_pending_propagation().is_empty(), "no gossip");
+    }
+
+    /// #13 restart: a red block committed before a restart. After restart,
+    /// recovery reports it in `non_blue` and replay hands its transactions
+    /// back to the mempool: none lost (each tx executed via a blue block or
+    /// pooled) and no red-only tx executed.
+    #[tokio::test]
+    async fn red_block_transactions_return_to_mempool_after_restart() {
+        use non_blue::test_support::{block_with_parents, funded_tx, reference, CTX};
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Arc::new(Storage::new(dir.path().join("state.redb")).unwrap());
+        let mut staking = StakingState::new();
+        for a in 0..4u8 {
+            staking
+                .join_validator(
+                    Address([0x30 + a; 32]),
+                    MIN_VALIDATOR_STAKE,
+                    0,
+                    Some(Address([0xa0 + a; 32])),
+                    Some(PublicKey([0x30 + a; 32])),
+                )
+                .unwrap();
+        }
+        let txn = state_storage.begin_write().unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
+        txn.commit().unwrap();
+
+        // Before restart: wide wave (6 unordered round-1 blocks, k = 3) so
+        // GHOSTDAG colours some red; leader at round 3 is committed durably.
+        let mut all_txs = Vec::new();
+        {
+            let dag = DagStore::new(Storage::new(dir.path().join("dag.redb")).unwrap()).unwrap();
+            let genesis = block_with_parents(0, 0, Vec::new(), Vec::new());
+            dag.put_block(&genesis).unwrap();
+            let mut wide = Vec::new();
+            for i in 0..6u32 {
+                let tx = funded_tx(&state_storage, 0);
+                all_txs.push(tx.clone());
+                let b = block_with_parents(i % 4, 1, vec![reference(&genesis)], vec![tx]);
+                dag.put_block(&b).unwrap();
+                wide.push(b);
+            }
+            let leader = block_with_parents(0, 3, wide.iter().map(reference).collect(), Vec::new());
+            dag.put_block(&leader).unwrap();
+            dag.mark_decided_and_commit_leader(3, &leader.digest)
+                .unwrap();
+        } // "restart": DAG store closed and reopened below.
+
+        let dag =
+            Arc::new(DagStore::new(Storage::new(dir.path().join("dag.redb")).unwrap()).unwrap());
+        let recovered = recover_committed_subdags(&dag, true).unwrap();
+        let subdag = recovered
+            .iter()
+            .find(|s| s.leader_round == 3)
+            .expect("round-3 commit recovered")
+            .clone();
+        assert!(
+            !subdag.non_blue.is_empty(),
+            "recovery must report red blocks"
+        );
+        let red: std::collections::HashSet<Hash> =
+            subdag.non_blue.iter().map(|r| r.digest).collect();
+        let blue: std::collections::HashSet<Hash> =
+            subdag.blocks.iter().map(|b| b.digest).collect();
+        assert!(red.is_disjoint(&blue));
+
+        // Mempool exists (empty, in-memory) before replay, as in run_node.
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            state_storage.clone(),
+            CTX,
+        ));
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        for s in recovered {
+            exec_tx.send(s).unwrap();
+        }
+        drop(exec_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = NodeHealth::new();
+        run_execution(
+            exec_rx,
+            state_storage.clone(),
+            EventBus::new(),
+            Some(non_blue::ExecPool {
+                mempool: mempool.clone(),
+                returned: Some(non_blue::ReturnedTxs {
+                    dag: dag.clone(),
+                    source: Arc::new(non_blue::ConsensusNonBlue),
+                }),
+            }),
+            CTX,
+            shutdown_rx,
+            health.clone(),
+        )
+        .await;
+        assert_ne!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+
+        let red_txs: std::collections::HashSet<Hash> = subdag
+            .non_blue
+            .iter()
+            .flat_map(|r| dag.get_block(&r.digest).unwrap().transactions)
+            .map(|t| t.hash)
+            .collect();
+        assert!(!red_txs.is_empty());
+        let read = state_storage.begin_read().unwrap();
+        for tx in &all_txs {
+            let nonce = state_storage
+                .state()
+                .get_account_or_default(&read, &tx.sender)
+                .unwrap()
+                .nonce;
+            if red_txs.contains(&tx.hash) {
+                assert_eq!(nonce, 0, "red-only tx {} must not be executed", tx.hash);
+                assert!(mempool.contains(&tx.hash), "red tx {} lost", tx.hash);
+            } else {
+                assert!(!mempool.contains(&tx.hash), "blue tx {} re-pooled", tx.hash);
+            }
+        }
         assert!(mempool.get_pending_propagation().is_empty(), "no gossip");
     }
 
