@@ -206,6 +206,8 @@ where
     commit_trigger_lock: Mutex<()>,
     /// Mempool for transaction selection during block proposal.
     mempool: Option<Arc<Mempool>>,
+    /// Signing context (chain_id/epoch) for vote signature bytes.
+    signing_ctx: kvnc_types::SigningContext,
     /// Timeout deadline for the current leader slot (round, instant).
     leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
 }
@@ -223,6 +225,8 @@ where
         block_manager: Arc<RwLock<B>>,
         signing_key: kvnc_types::SigningKey,
         mempool: Option<Arc<Mempool>>,
+        // TODO(owner): source chain_id/epoch from node config
+        signing_ctx: kvnc_types::SigningContext,
     ) -> Self {
         let our_authority = block_manager.read().our_authority();
         let our_stake = committee.stake_of(our_authority).unwrap_or(0);
@@ -245,6 +249,7 @@ where
         let (round_tx, _round_rx) = watch::channel(0);
 
         Self {
+            signing_ctx,
             config,
             committee,
             signing_key,
@@ -507,7 +512,7 @@ where
             voter: our_authority,
             signature: kvnc_types::Signature([0u8; 64]),
         };
-        vote.signature = sign(&self.signing_key, &vote.signature_data());
+        vote.signature = sign(&self.signing_key, &vote.signature_data(&self.signing_ctx));
 
         // Record the vote locally
         self.committer
@@ -633,7 +638,7 @@ where
         };
         if kvnc_crypto::verify(
             &authority.public_key,
-            &vote.signature_data(),
+            &vote.signature_data(&self.signing_ctx),
             &vote.signature,
         )
         .is_err()
@@ -768,6 +773,8 @@ pub enum VoteRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_CTX: kvnc_types::SigningContext =
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
     use crate::types::AuthorityInfo;
     use kvnc_types::{block::BlockReference, crypto::PublicKey, Address};
     use parking_lot::Mutex;
@@ -1039,6 +1046,7 @@ mod tests {
             manager,
             key.clone(),
             None, // No mempool for tests
+            TEST_CTX,
         );
         (engine, dag, key)
     }
@@ -1055,7 +1063,7 @@ mod tests {
             voter,
             signature: kvnc_types::Signature([0; 64]),
         };
-        vote.signature = kvnc_crypto::sign(key, &vote.signature_data());
+        vote.signature = kvnc_crypto::sign(key, &vote.signature_data(&TEST_CTX));
         vote
     }
 

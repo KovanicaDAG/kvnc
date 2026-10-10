@@ -1020,7 +1020,10 @@ impl NetworkService {
             debug!("committee keys not set; vote gossip dropped unforwarded");
             return Verdict::Ignore;
         }
-        if let Err(rejection) = self.validator.verify_vote(&vote) {
+        if let Err(rejection) = self
+            .validator
+            .verify_vote(&vote, &self.mempool.signing_context())
+        {
             warn!(%peer, voter = vote.voter, leader_round = vote.leader_round, %rejection, "rejected vote gossip");
             return Verdict::rejected("vote", rejection);
         }
@@ -1169,7 +1172,11 @@ mod tests {
         let mempool_storage =
             Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
         let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
-        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
         let (service, _events) =
             NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
         (dir, service)
@@ -1361,7 +1368,11 @@ mod tests {
         let mempool_storage =
             Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
         let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
-        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
         let (service, events) =
             NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
         let (signers, keys) = test_support::committee(4);
@@ -1389,7 +1400,8 @@ mod tests {
         let (_dir, service, mut events, signers) = validating_service();
         // Signed by validator 0 but claiming to be validator 2.
         let mut vote = test_support::signed_vote(&signers[0], 2);
-        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data());
+        vote.signature =
+            kvnc_crypto::sign(&signers[0], &vote.signature_data(&test_support::TEST_CTX));
         let payload = bincode::serialize(&vote).expect("serialize vote");
         assert!(matches!(
             service.on_vote_message(Some(PeerId::random()), &payload),
@@ -1506,7 +1518,11 @@ mod tests {
         let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
         let mempool_storage =
             Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
-        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
         let (service, mut events) =
             NetworkService::new(NetworkConfig::default(), dag_store.clone(), mempool)
                 .expect("service");
@@ -1534,7 +1550,11 @@ mod tests {
         let mempool_storage =
             Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
         let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
-        let mempool = Arc::new(Mempool::new(MempoolConfig::default(), mempool_storage));
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
         let (service, mut events) =
             NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
 

@@ -185,6 +185,8 @@ impl PoolState {
 pub struct Mempool {
     config: MempoolConfig,
     storage: Arc<Storage>,
+    /// Signing context (chain_id/epoch) for tx hash + signature checks.
+    signing_ctx: kvnc_types::SigningContext,
     state: Mutex<PoolState>,
     /// Last time we rebroadcast transactions.
     last_rebroadcast: Mutex<Instant>,
@@ -214,13 +216,24 @@ fn requires_fee(kind: &TransactionKind) -> bool {
 
 impl Mempool {
     /// Create a new mempool.
-    pub fn new(config: MempoolConfig, storage: Arc<Storage>) -> Self {
+    // TODO(owner): source chain_id/epoch from node config
+    pub fn new(
+        config: MempoolConfig,
+        storage: Arc<Storage>,
+        signing_ctx: kvnc_types::SigningContext,
+    ) -> Self {
         Self {
             config,
             storage,
+            signing_ctx,
             state: Mutex::new(PoolState::default()),
             last_rebroadcast: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Signing context this mempool verifies transactions under.
+    pub fn signing_context(&self) -> kvnc_types::SigningContext {
+        self.signing_ctx
     }
 
     /// Get the number of transactions in the mempool (queued and in flight).
@@ -269,7 +282,7 @@ impl Mempool {
         }
 
         // --- 2. hash binding --------------------------------------------
-        if tx.hash != tx.signing_hash() {
+        if tx.hash != tx.signing_hash(&self.signing_ctx) {
             return Err(MempoolError::HashMismatch);
         }
 
@@ -279,7 +292,7 @@ impl Mempool {
         }
 
         // --- 4. signature (expensive) -----------------------------------
-        if !tx.verify_signature() {
+        if !tx.verify_signature(&self.signing_ctx) {
             return Err(MempoolError::InvalidSignature);
         }
 
@@ -653,6 +666,8 @@ pub enum MempoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_CTX: kvnc_types::SigningContext =
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
 
     use kvnc_storage::state_store::Account;
     use kvnc_storage::Storage;
@@ -679,7 +694,7 @@ mod tests {
             hash: Hash::zero(),
         };
 
-        let signing_hash = tx.signing_hash();
+        let signing_hash = tx.signing_hash(&TEST_CTX);
         let signature = kvnc_crypto::sign(signing_key, signing_hash.as_ref());
 
         tx.signature = signature;
@@ -720,7 +735,7 @@ mod tests {
         tx.fee = size as u64 * (1 + (index % 10) as u64);
 
         // Re-sign with updated fee since fee is part of the signing hash
-        let signing_hash = tx.signing_hash();
+        let signing_hash = tx.signing_hash(&TEST_CTX);
         tx.signature = kvnc_crypto::sign(&signing_key, signing_hash.as_ref());
         tx.hash = signing_hash;
         tx
@@ -766,7 +781,7 @@ mod tests {
             max_tx_size: 1024 * 1024,
             ..MempoolConfig::default()
         };
-        let pool = Mempool::new(config.clone(), storage.clone());
+        let pool = Mempool::new(config.clone(), storage.clone(), TEST_CTX);
 
         let transactions: Vec<_> = (0..STRESS_TX_COUNT)
             .map(|i| stress_transaction(i, keypairs[i].clone()))
@@ -866,7 +881,7 @@ mod tests {
         txn.commit().unwrap();
 
         let config = MempoolConfig::default();
-        let pool = Mempool::new(config, storage.clone());
+        let pool = Mempool::new(config, storage.clone(), TEST_CTX);
 
         // Test 1: Valid transaction should pass
         let valid_tx = build_signed_tx(
@@ -1051,7 +1066,7 @@ mod tests {
         }
 
         fn pool(&self, config: MempoolConfig) -> Mempool {
-            Mempool::new(config, self.storage.clone())
+            Mempool::new(config, self.storage.clone(), TEST_CTX)
         }
     }
 

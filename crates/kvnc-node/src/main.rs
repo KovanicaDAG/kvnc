@@ -1956,7 +1956,10 @@ mod tests {
             "127.0.0.1:0",
         )
         .expect("single-validator committee is valid");
-        let block_manager = Arc::new(BlockManager::new(dag.clone()));
+        let block_manager = Arc::new(BlockManager::new(
+            dag.clone(),
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
+        ));
         block_manager.set_authority(0);
         block_manager.set_signing_key(signing_key.clone());
         block_manager.set_authority_keys(HashMap::from([(0, public_key)]));
@@ -1969,6 +1972,7 @@ mod tests {
             })),
             signing_key.clone(),
             None, // No mempool for this test
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
         );
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
         engine.set_commit_sender(exec_tx);
@@ -2000,7 +2004,12 @@ mod tests {
             voter: 0,
             signature: kvnc_types::Signature([0; 64]),
         };
-        vote.signature = kvnc_crypto::sign(&signing_key, &vote.signature_data());
+        vote.signature = kvnc_crypto::sign(
+            &signing_key,
+            &vote.signature_data(&kvnc_types::SigningContext::new(
+                kvnc_types::signing::chain_id::LOCAL,
+            )),
+        );
         engine.process_vote(&vote).unwrap();
 
         let mut committed_height = 0;

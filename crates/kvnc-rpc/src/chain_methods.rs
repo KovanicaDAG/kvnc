@@ -616,7 +616,11 @@ mod tests {
         };
         RpcState {
             consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
-            mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
+            mempool: Arc::new(Mempool::new(
+                MempoolConfig::default(),
+                storage.clone(),
+                kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
+            )),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
             committee: CommitteeInfo::try_new(0, vec![authority]).expect("test committee is valid"),
@@ -811,7 +815,9 @@ mod tests {
                 signature: Signature([0; 64]),
                 hash: Hash::zero(),
             };
-            let signing_hash = tx.signing_hash();
+            let signing_hash = tx.signing_hash(&kvnc_types::SigningContext::new(
+                kvnc_types::signing::chain_id::LOCAL,
+            ));
             tx.signature = kvnc_crypto::sign(sk, signing_hash.as_ref());
             tx.hash = signing_hash;
             tx
