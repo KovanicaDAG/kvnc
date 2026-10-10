@@ -13,7 +13,7 @@
 //!   match the transactions, the author must be a committee member and the
 //!   signature must verify over the digest under the author's key.
 
-use kvnc_types::{block::StatementBlock, AuthorityIndex, PublicKey, Vote};
+use kvnc_types::{block::StatementBlock, AuthorityIndex, PublicKey, SigningContext, Vote};
 use std::{
     collections::HashMap,
     fmt,
@@ -49,29 +49,9 @@ impl fmt::Display for Rejection {
     }
 }
 
-/// Errors returned by a [`VoteVerifier`].
-///
-/// Mirrors `kvnc_crypto::SigError` (Foundation's vote signature API, PR #9)
-/// variant for variant, so switching the stub to the crypto crate later is a
-/// one-line change. Kept local so the network crate does not depend on it yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigError {
-    /// The public key bytes are not a valid Ed25519 point.
-    InvalidPublicKey,
-    /// The signature does not verify over the vote's canonical bytes.
-    VerificationFailed,
-}
-
-impl fmt::Display for SigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SigError::InvalidPublicKey => write!(f, "invalid public key"),
-            SigError::VerificationFailed => write!(f, "vote signature verification failed"),
-        }
-    }
-}
-
-impl std::error::Error for SigError {}
+/// Errors returned by a [`VoteVerifier`]: Foundation's v1 vote signature
+/// error type (`kvnc_crypto::SigError`), re-exported unchanged.
+pub use kvnc_crypto::SigError;
 
 /// Vote signature verification used at the gossip edge.
 ///
@@ -80,34 +60,33 @@ impl std::error::Error for SigError {}
 /// Mapping `vote.voter` to the right committee `pubkey` is the caller's job
 /// (done by [`verify_vote_with`]); the verifier only checks the signature.
 pub trait VoteVerifier: Send + Sync {
-    /// Verify `vote.signature` over [`Vote::signature_data`] under `pubkey`.
+    /// Verify `vote.signature` over the v1 bytes
+    /// [`Vote::signature_data(ctx)`](Vote::signature_data) under `pubkey`.
+    ///
+    /// `ctx` is the verifier's own configured chain id + committee epoch,
+    /// never taken from the network message. Argument order mirrors
+    /// `kvnc_crypto::verify_vote_signature(ctx, vote, pubkey)`.
     fn verify_vote_signature(
         &self,
-        ctx: &kvnc_types::SigningContext,
+        ctx: &SigningContext,
         vote: &Vote,
         pubkey: &PublicKey,
     ) -> Result<(), SigError>;
 }
 
-/// Stub verifier: existing `kvnc_crypto::verify` over [`Vote::signature_data`].
-///
-/// Does not change the signature format. To be replaced by a thin wrapper
-/// around `kvnc_crypto::verify_vote_signature` (strict verification).
+/// Default verifier: Foundation's v1 `kvnc_crypto::verify_vote_signature`
+/// (domain tag `KUNA/vote/v1`, chain id, epoch, voter; Ed25519 strict).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Ed25519VoteVerifier;
 
 impl VoteVerifier for Ed25519VoteVerifier {
     fn verify_vote_signature(
         &self,
-        ctx: &kvnc_types::SigningContext,
+        ctx: &SigningContext,
         vote: &Vote,
         pubkey: &PublicKey,
     ) -> Result<(), SigError> {
-        kvnc_crypto::verify(pubkey, &vote.signature_data(ctx), &vote.signature).map_err(|e| match e
-        {
-            kvnc_crypto::CryptoError::InvalidPublicKey => SigError::InvalidPublicKey,
-            _ => SigError::VerificationFailed,
-        })
+        kvnc_crypto::verify_vote_signature(ctx, vote, pubkey)
     }
 }
 
@@ -117,7 +96,7 @@ pub fn verify_vote_with(
     verifier: &dyn VoteVerifier,
     keys: &AuthorityKeys,
     vote: &Vote,
-    ctx: &kvnc_types::SigningContext,
+    ctx: &SigningContext,
 ) -> Result<(), Rejection> {
     let key = keys
         .get(&vote.voter)
@@ -132,7 +111,7 @@ pub fn verify_vote_with(
 pub fn verify_vote(
     keys: &AuthorityKeys,
     vote: &Vote,
-    ctx: &kvnc_types::SigningContext,
+    ctx: &SigningContext,
 ) -> Result<(), Rejection> {
     verify_vote_with(&Ed25519VoteVerifier, keys, vote, ctx)
 }
@@ -202,11 +181,7 @@ impl GossipValidator {
             .is_empty()
     }
 
-    pub(crate) fn verify_vote(
-        &self,
-        vote: &Vote,
-        ctx: &kvnc_types::SigningContext,
-    ) -> Result<(), Rejection> {
+    pub(crate) fn verify_vote(&self, vote: &Vote, ctx: &SigningContext) -> Result<(), Rejection> {
         let verifier = self
             .vote_verifier
             .read()
@@ -228,8 +203,9 @@ impl GossipValidator {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
-    pub(crate) const TEST_CTX: kvnc_types::SigningContext =
-        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
+    /// Signing context used by the network tests (local chain, epoch 0).
+    pub(crate) const TEST_CTX: SigningContext =
+        SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
     use kvnc_types::{Hash, Signature};
 
     /// Deterministic committee of `n` keys (seed byte = index + 1).
@@ -426,7 +402,7 @@ mod tests {
         impl VoteVerifier for Panicking {
             fn verify_vote_signature(
                 &self,
-                _: &kvnc_types::SigningContext,
+                _: &SigningContext,
                 _: &Vote,
                 _: &PublicKey,
             ) -> Result<(), SigError> {
@@ -447,7 +423,7 @@ mod tests {
         impl VoteVerifier for RejectAll {
             fn verify_vote_signature(
                 &self,
-                _: &kvnc_types::SigningContext,
+                _: &SigningContext,
                 _: &Vote,
                 _: &PublicKey,
             ) -> Result<(), SigError> {
