@@ -1,11 +1,11 @@
 //! Staking, delegation, validator set management, token emission and treasury for KVNC.
 //!
 //! Tokenomics (locked):
-//! - Total supply: 90_200_000 KVNC
-//! - Founder premine: 200_000 KVNC
-//! - Treasury: 8_000_000 KVNC (1M/year × 8 years) with linear vesting
-//! - Mining subsidy: ~82_000_000 KVNC
-//! - Initial block reward: 10 KVNC (paid to the author of a committed leader block)
+//! - Total supply: 90_200_000 KUNA
+//! - Founder premine: 200_000 KUNA
+//! - Treasury: 8_000_000 KUNA (1M/year × 8 years) with linear vesting
+//! - Mining subsidy: ~82_000_000 KUNA
+//! - Initial block reward: 10 KUNA (paid to the author of a committed leader block)
 //! - Decay: × 3/4 every 2_050_000 blocks
 //! - Active validators: 15–21
 //!
@@ -23,17 +23,21 @@ use thiserror::Error;
 // Tokenomics constants (9 decimals)
 // ============================================================
 
-/// Number of base units in 1 KVNC.
+/// Ticker / display symbol of the native currency (display only; not
+/// persisted, not part of any hash or signature domain).
+pub const TICKER: &str = "KUNA";
+
+/// Number of base units in 1 KUNA.
 pub const DECIMALS: u32 = 9;
 pub const ONE_KVNC: u64 = 1_000_000_000; // 10^9
 
-/// Total maximum supply: 90.2 million KVNC.
+/// Total maximum supply: 90.2 million KUNA.
 pub const TOTAL_SUPPLY: u64 = 90_200_000 * ONE_KVNC;
 
-/// Founder premine: 200_000 KVNC.
+/// Founder premine: 200_000 KUNA.
 pub const FOUNDER_PREMINE: u64 = 200_000 * ONE_KVNC;
 
-/// Treasury allocation: 8 × 1_000_000 KVNC over 8 years.
+/// Treasury allocation: 8 × 1_000_000 KUNA over 8 years.
 pub const TREASURY_TOTAL: u64 = 8_000_000 * ONE_KVNC;
 pub const TREASURY_ANNUAL: u64 = 1_000_000 * ONE_KVNC;
 pub const TREASURY_YEARS: u32 = 8;
@@ -46,7 +50,7 @@ pub const BLOCKS_PER_YEAR: u64 = 15_768_000;
 /// Mining subsidy budget (everything that is not premine or treasury).
 pub const MINING_SUBSIDY_BUDGET: u64 = TOTAL_SUPPLY - FOUNDER_PREMINE - TREASURY_TOTAL; // ~82M
 
-/// Initial block reward: 10 KVNC.
+/// Initial block reward: 10 KUNA.
 ///
 /// (Skeleton name: `INITIAL_REWARD` — same value.)
 pub const INITIAL_BLOCK_REWARD: u64 = 10 * ONE_KVNC;
@@ -91,7 +95,7 @@ pub const EPOCH_ROUNDS: u64 = SUBSIDY_ERA_BLOCKS; // 2_050_000
 /// Returns the block reward (in base units) for a given **committed leader height**.
 ///
 /// In the DAG model the “height” is the sequential number of committed leader
-/// blocks (not the raw round number). Reward starts at 10 KVNC and is
+/// blocks (not the raw round number). Reward starts at 10 KUNA and is
 /// multiplied by 3/4 every SUBSIDY_ERA_BLOCKS committed leaders.
 pub fn block_reward(committed_leader_height: u64) -> u64 {
     let era = committed_leader_height / SUBSIDY_ERA_BLOCKS;
@@ -127,7 +131,7 @@ pub fn cumulative_mining_issuance(committed_leader_height: u64) -> u64 {
 
 /// Treasury vesting state.
 ///
-/// 8 000 000 KVNC are released linearly over 8 years (1 000 000 KVNC per year).
+/// 8 000 000 KUNA are released linearly over 8 years (1 000 000 KUNA per year).
 /// Vesting is driven by committed-leader height (using BLOCKS_PER_YEAR as the
 /// conversion factor). The treasury address is fixed at genesis.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -858,7 +862,14 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn initial_reward_is_10_kvnc() {
+    fn ticker_is_kuna() {
+        assert_eq!(TICKER, "KUNA");
+        assert_eq!(DECIMALS, 9);
+        assert_eq!(ONE_KVNC, 1_000_000_000);
+    }
+
+    #[test]
+    fn initial_reward_is_10_kuna() {
         assert_eq!(block_reward(0), 10 * ONE_KVNC);
         assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS - 1), 10 * ONE_KVNC);
     }
@@ -866,7 +877,7 @@ mod tests {
     #[test]
     fn first_decay() {
         let r = block_reward(SUBSIDY_ERA_BLOCKS);
-        assert_eq!(r, 7_500_000_000); // 7.5 KVNC
+        assert_eq!(r, 7_500_000_000); // 7.5 KUNA
     }
 
     #[test]
@@ -931,7 +942,7 @@ mod tests {
     }
 
     /// Reference copy of the skeleton's `treasury_vested(h)`:
-    /// linear 1M KVNC/year over 8 years, measured from height 0.
+    /// linear 1M KUNA/year over 8 years, measured from height 0.
     fn skeleton_treasury_vested(committed_leader_height: u64) -> u64 {
         let years = committed_leader_height / BLOCKS_PER_YEAR;
         let vested = years.saturating_mul(TREASURY_ANNUAL);
@@ -1043,8 +1054,8 @@ mod tests {
 
     #[test]
     fn reward_schedule_matches_skeleton() {
-        // Era 0 → 10 KVNC, boundary of era 0 → 10 KVNC,
-        // era 1 → 7.5 KVNC after the 3/4 decay, plus later eras.
+        // Era 0 → 10 KUNA, boundary of era 0 → 10 KUNA,
+        // era 1 → 7.5 KUNA after the 3/4 decay, plus later eras.
         let heights = [
             0u64,
             SUBSIDY_ERA_BLOCKS - 1,
@@ -1056,7 +1067,7 @@ mod tests {
             assert_eq!(block_reward(h), skeleton_block_reward(h), "height {h}");
         }
         assert_eq!(block_reward(0), 10 * ONE_KVNC);
-        assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS), 7_500_000_000); // 7.5 KVNC
+        assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS), 7_500_000_000); // 7.5 KUNA
     }
 
     #[test]
@@ -1091,8 +1102,8 @@ mod tests {
         assert!(naive <= MINING_SUBSIDY_BUDGET);
 
         // Full schedule: sum each era's reward until it decays to zero.
-        // The geometric series 10 KVNC × 2_050_000 × 1/(1 − 3/4) equals
-        // exactly 82M KVNC; floor-truncation keeps the real sum just below.
+        // The geometric series 10 KUNA × 2_050_000 × 1/(1 − 3/4) equals
+        // exactly 82M KUNA; floor-truncation keeps the real sum just below.
         let mut naive_full = 0u64;
         let mut era = 0u64;
         loop {
