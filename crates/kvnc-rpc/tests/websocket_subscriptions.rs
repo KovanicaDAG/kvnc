@@ -219,6 +219,7 @@ async fn websocket_receives_committed_leader_notification() {
         leader,
         leader_round: 4,
         leader_author: 0,
+        non_blue: Vec::new(),
     };
     events.publish_committed_leader(&subdag);
 
