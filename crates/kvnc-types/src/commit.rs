@@ -1,4 +1,4 @@
-//! Commit-related types for KVNC.
+//! Commit-related types for Kovanica.
 //!
 #![allow(missing_docs)]
 //! Contains types related to committed sub-DAGs and leader blocks.

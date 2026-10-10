@@ -1,6 +1,6 @@
-//! KVNC Faucet Service
+//! Kovanica (KUNA) Faucet Service
 //!
-//! Rate-limited faucet that dispenses test KVNC to addresses.
+//! Rate-limited faucet that dispenses test KUNA to addresses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,7 +89,7 @@ struct FaucetResponse {
 
 #[derive(Parser)]
 #[command(name = "kvnc-faucet")]
-#[command(about = "KVNC Faucet Service")]
+#[command(about = "Kovanica (KUNA) Faucet Service")]
 struct Cli {
     /// Faucet keystore path
     #[arg(long, default_value = "faucet.keystore")]
@@ -97,7 +97,7 @@ struct Cli {
     /// Faucet keystore passphrase
     #[arg(long, default_value = "faucet-passphrase")]
     passphrase: String,
-    /// Amount to dispense per request (in KVNC)
+    /// Amount to dispense per request (in KUNA)
     #[arg(long, default_value = "10")]
     dispense_kvnc: u64,
     /// Rate limit window (seconds)
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     info!(faucet_address = %faucet_address, "faucet identity loaded");
 
     let config = FaucetConfig {
-        dispense_amount: cli.dispense_kvnc * 1_000_000_000, // KVNC to atoms
+        dispense_amount: cli.dispense_kvnc * 1_000_000_000, // KUNA to atoms
         rate_limit_window: cli.rate_limit_window,
         max_requests_per_window: cli.max_requests,
         rpc_url: cli.rpc_url.clone(),
@@ -248,7 +248,7 @@ async fn faucet_handler(
     let tx = Transaction {
         sender: state.faucet_address,
         nonce,
-        fee: 1_000_000, // 0.001 KVNC fee
+        fee: 1_000_000, // 0.001 KUNA fee
         kind: TransactionKind::Transfer {
             to: to_address,
             amount: state.config.dispense_amount,
@@ -283,7 +283,7 @@ async fn faucet_handler(
                 Json(FaucetResponse {
                     success: true,
                     message: format!(
-                        "Dispensed {} KVNC",
+                        "Dispensed {} KUNA",
                         state.config.dispense_amount / 1_000_000_000
                     ),
                     tx_hash: Some(tx_hash),
