@@ -7,7 +7,7 @@ use crate::{
     state_sync::{StateSyncRequest, StateSyncResponse},
     sync::SyncRequest,
     topics,
-    validation::{AuthorityKeys, GossipValidator, Rejection},
+    validation::{AuthorityKeys, GossipValidator, Rejection, VoteVerifier},
     NetworkConfig, NetworkEvent,
 };
 use futures::StreamExt;
@@ -370,6 +370,13 @@ impl NetworkService {
             "gossip validator committee keys set"
         );
         self.validator.set_keys(keys);
+    }
+
+    /// Inject the vote signature verifier used at the gossip edge.
+    ///
+    /// Defaults to [`crate::Ed25519VoteVerifier`]; the node sets it explicitly.
+    pub fn set_vote_verifier(&self, verifier: Arc<dyn VoteVerifier>) {
+        self.validator.set_vote_verifier(verifier);
     }
 
     /// Get connected peers.
@@ -957,7 +964,8 @@ impl NetworkService {
     ///
     /// Only transactions the mempool admits are forwarded. Transactions that
     /// are invalid on their own (bad signature, zero fee, oversized, ...) are
-    /// rejected and counted against the relaying peer; ones that fail only
+    /// (including hash mismatch and fee below the floor) are rejected and
+    /// counted against the relaying peer; ones that fail only
     /// because of local state (nonce, balance, full pool, duplicate) are
     /// ignored without penalty.
     fn on_transaction_message(&self, payload: &[u8]) -> Verdict {
@@ -984,6 +992,8 @@ impl NetworkService {
                 | MempoolError::ZeroFee
                 | MempoolError::GasLimitTooHigh
                 | MempoolError::TransactionTooLarge(_)
+                | MempoolError::HashMismatch
+                | MempoolError::FeeTooLow { .. }
                 | MempoolError::Crypto(_)
                 | MempoolError::Serialization(_)),
             ) => {
@@ -1328,6 +1338,64 @@ mod tests {
             .broadcast_block(&sample_block())
             .expect("broadcast with no peers");
         assert_eq!(service.peer_count(), 0);
+    }
+
+    fn test_service_with_mempool(config: MempoolConfig) -> (tempfile::TempDir, NetworkService) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
+        let mempool_storage =
+            Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
+        let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
+        let mempool = Arc::new(Mempool::new(
+            config,
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
+        let (service, _events) =
+            NetworkService::new(NetworkConfig::default(), dag_store, mempool).expect("service");
+        (dir, service)
+    }
+
+    fn signed_transfer(fee: u64) -> Transaction {
+        let signer = kvnc_types::SigningKey::from_bytes(&[9; 32]);
+        let mut tx = Transaction {
+            sender: kvnc_types::Address([1; 32]),
+            nonce: 0,
+            kind: kvnc_types::transaction::TransactionKind::Transfer {
+                to: kvnc_types::Address([7; 32]),
+                amount: 1,
+            },
+            fee,
+            signature: Signature([0; 64]),
+            hash: Hash::zero(),
+        };
+        tx.hash = tx.signing_hash(&test_support::TEST_CTX);
+        tx.signature = kvnc_crypto::sign(&signer, tx.hash.as_ref());
+        tx
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_and_fee_too_low_are_rejected_at_gossip_edge() {
+        // HashMismatch: cached hash is not the signing hash.
+        let (_dir, service) = test_service();
+        let mut tx = signed_transfer(1_000);
+        tx.hash = Hash::new(b"not the signing hash");
+        let payload = bincode::serialize(&tx).expect("serialize");
+        match service.on_transaction_message(&payload) {
+            Verdict::Reject(reason) => assert!(reason.contains("hash"), "{reason}"),
+            other => panic!("HashMismatch must be Reject, got {other:?}"),
+        }
+
+        // FeeTooLow: fee rate below the configured floor.
+        let (_dir, service) = test_service_with_mempool(MempoolConfig {
+            min_fee_rate: 1_000_000,
+            ..MempoolConfig::default()
+        });
+        let payload = bincode::serialize(&signed_transfer(1)).expect("serialize");
+        match service.on_transaction_message(&payload) {
+            Verdict::Reject(reason) => assert!(reason.contains("Fee rate"), "{reason}"),
+            other => panic!("FeeTooLow must be Reject, got {other:?}"),
+        }
     }
 
     #[tokio::test]

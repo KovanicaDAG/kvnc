@@ -1,4 +1,4 @@
-# KVNC Contract Layer (Lane 3b)
+# KUNA Contract Layer (Lane 3b)
 
 The four contract crates — `kvnc-htlc`, `kvnc-vault`, `kvnc-multisig`,
 `kvnc-token` — are ordinary Rust libraries with a **typed API** and, on

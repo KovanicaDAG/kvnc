@@ -848,9 +848,11 @@ fn test_try_commit_direct_commit_end_to_end() {
     );
 }
 
-/// Rounds that never reach quorum are passed over; a later certified round
-/// commits. Threshold soundness: the un-certified round must never be marked
-/// Commit.
+/// A round that never reaches quorum is decided Skip once a later round
+/// reaches its own quorum (never passed over undecided), even though it is in
+/// the later leader's causal history; the later certified round then commits.
+/// Threshold soundness: every Commit requires the leader's OWN direct quorum,
+/// so the un-certified round must never be marked Commit.
 #[test]
 fn test_try_commit_passes_over_uncertified_round() {
     let g = genesis();
@@ -894,14 +896,16 @@ fn test_try_commit_passes_over_uncertified_round() {
         Some(LeaderStatus::Commit),
         "round 1 had only 1 of 4 votes"
     );
-    // And no round is ever both committed and skipped.
-    for (round, info) in &decided {
-        assert_ne!(
-            info.status,
-            LeaderStatus::Skip,
-            "round {round} committed without ever being skipped"
-        );
-    }
+    // Round 1 is passed over only via an explicit indirect Skip decision.
+    assert_eq!(
+        decided.get(&1).map(|l| l.status),
+        Some(LeaderStatus::Skip),
+        "round 1 must be explicitly skipped (no own quorum), not silently passed over"
+    );
+    assert_eq!(
+        decided.get(&3).map(|l| l.status),
+        Some(LeaderStatus::Commit)
+    );
 }
 
 /// Round 0 is exempt from commits even with full quorum (genesis handling).
@@ -1103,13 +1107,13 @@ fn test_try_commit_committed_rounds_strictly_increase() {
 // BUG (disabled): indirect commit rule is unreachable from `try_commit`
 // ---------------------------------------------------------------------------
 
-/// Regression: `UniversalCommitter` must apply the indirect commit rule for
-/// earlier leaders of a wave when a later leader of the same wave commits.
+/// Regression: `UniversalCommitter` must decide (as Skip, see PR #18) the
+/// no-quorum earlier leaders of a wave when a later leader of that wave commits.
 ///
 /// `try_commit` only walks rounds *after* the last decided round, so the
 /// indirect rule (which needs a *later* decided leader in the same wave) is
 /// applied by `decide_earlier_in_wave` at commit time: when round 5 commits,
-/// round 3 (same wave, causally connected) is decided Commit. Without the
+/// round 3 (same wave, causally connected, no own quorum) is decided Skip. Without the
 /// sweep this round never entered `decided_leaders` (the historical BUG).
 ///
 /// Note: round 3's *block* is also committed as part of round 5's causal
@@ -1155,10 +1159,13 @@ fn test_try_commit_indirect_commit_through_later_committed_leader() {
          indirect rule unreachable, got decided rounds {:?}",
         decided.keys().collect::<Vec<_>>()
     );
+    // Owner decision (PR #18 review): a leader without its OWN direct quorum
+    // is never Commit; causal connection to a committed leader is not
+    // certificate proof, so round 3 is an explicit Skip.
     assert_eq!(
         round3.map(|l| l.status),
-        Some(LeaderStatus::Commit),
-        "connected to the committed round-5 leader => indirect Commit"
+        Some(LeaderStatus::Skip),
+        "no own quorum => Skip even when connected to the committed round-5 leader"
     );
 }
 
@@ -1413,4 +1420,52 @@ fn test_mysticghost_fallback_on_large_mergeset() {
             panic!("Should have fallen back due to large mergeset");
         }
     }
+}
+
+/// Task #11: a committed batch contains only not-yet-committed blocks, so no
+/// block is delivered twice across several consecutive commits.
+#[test]
+fn test_no_block_delivered_twice_across_consecutive_commits() {
+    let g = genesis();
+    let b1 = make_block(0, 1, vec![block_ref(&g)], "b1");
+    let l3 = make_block(1, 3, vec![block_ref(&b1)], "l3");
+    let b4 = make_block(2, 4, vec![block_ref(&l3)], "b4");
+    let l6 = make_block(3, 6, vec![block_ref(&b4)], "l6");
+    let b7 = make_block(0, 7, vec![block_ref(&l6)], "b7");
+    let l9 = make_block(1, 9, vec![block_ref(&b7)], "l9");
+    let dag = MockDag::with_blocks([g.clone(), b1, l3.clone(), b4, l6.clone(), b7, l9.clone()]);
+
+    let committer = UniversalCommitter::new(committee(4), false, 100);
+    let mut delivered: Vec<Hash> = Vec::new();
+    let mut leaders = Vec::new();
+    for (round, author, block) in [(3, 1, &l3), (6, 3, &l6), (9, 1, &l9)] {
+        committer.update_leader(leader_info(
+            round,
+            author,
+            Some(block.digest),
+            LeaderStatus::Undecided,
+            &[],
+        ));
+        for voter in [0u16, 1, 2] {
+            committer.add_vote(round, voter, block.digest);
+        }
+        let subdag = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("persist commit")
+            .expect("quorum leader commits");
+        assert_eq!(subdag.leader_round, round);
+        leaders.push(subdag.leader_round);
+        delivered.extend(subdag.blocks.iter().map(|b| b.digest));
+    }
+    assert_eq!(leaders, vec![3, 6, 9]);
+
+    let mut seen = std::collections::HashSet::new();
+    for digest in &delivered {
+        assert!(
+            seen.insert(*digest),
+            "block {digest} delivered more than once across commits: {delivered:?}"
+        );
+    }
+    // Totality: every block was delivered exactly once.
+    assert_eq!(seen.len(), 7, "every block delivered once: {delivered:?}");
 }

@@ -1,4 +1,4 @@
-//! Light client types for KVNC.
+//! Light client types for Kovanica.
 //!
 //! Provides certificate structures for light clients to verify chain state
 //! without running a full node. Supports wave commit certificates and

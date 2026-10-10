@@ -1,10 +1,10 @@
 # Phase 25 — Governance (post-mainnet, kvnc) — finalized f2b05bf
 
 ## Active rules (hard, per AGENTS.md + tokenomics)
-- Validators: 15–21 active, min stake 50 000 KVNC (`MIN_VALIDATOR_STAKE`)
+- Validators: 15–21 active, min stake 50 000 KUNA (`MIN_VALIDATOR_STAKE`)
 - Consensus: Mysticeti-style uncertified DAG, wave = 3, k = 3
-- Reward: mint only on committed `CommittedSubDag → StakingState::on_leader_committed`; initial 10 KVNC, decay ×¾ per 2 050 000 leader blocks; era budget ≈82 M KVNC within 90.2 M cap
-- Treasury: 8 M KVNC (8 × 1 M linear, RFC-005 vaults via `StakingState`)
+- Reward: mint only on committed `CommittedSubDag → StakingState::on_leader_committed`; initial 10 KUNA, decay ×¾ per 2 050 000 leader blocks; era budget ≈82 M KUNA within 90.2 M cap
+- Treasury: 8 M KUNA (8 × 1 M linear, RFC-005 vaults via `StakingState`)
 - Fee split: 75% burned / 25% producer; fee floor `max(1, subsidy / 500_000)`
 - Maturity: 100 blocks
 
@@ -35,4 +35,4 @@
 - `docs/A8.2-DELEGATION-SKELETON.md` (deferred Phase 18)
 - `docs/A8.2-DELEGATION-FULL.md` (full spec, Phase 18+)
 - `crates/kvnc-staking/src/lib.rs` (staking skeleton pushed `76e52db`)
-- Tokenomics locked: total 90 200 000 KVNC, 9 decimals
+- Tokenomics locked: total 90 200 000 KUNA, 9 decimals
