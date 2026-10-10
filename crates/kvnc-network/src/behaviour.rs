@@ -102,7 +102,12 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
     // timeout (5s) would otherwise drop peers between pings.
     let idle_timeout = std::cmp::max(ping_interval * 4, Duration::from_secs(60));
 
-    let swarm = SwarmBuilder::with_new_identity()
+    let identity = match &config.node_key_path {
+        Some(path) => crate::identity::load_or_create_node_identity(path)?,
+        None => libp2p::identity::Keypair::generate_ed25519(),
+    };
+
+    let swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -228,5 +233,22 @@ mod tests {
             );
         }
         assert!(!swarm.local_peer_id().to_string().is_empty());
+    }
+
+    #[test]
+    fn build_swarm_reuses_persistent_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NetworkConfig {
+            node_key_path: Some(dir.path().join("p2p_node.key")),
+            ..NetworkConfig::default()
+        };
+        let first = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        let second = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        assert_eq!(first, second, "peer id must survive restarts");
+
+        let ephemeral = *build_swarm(&NetworkConfig::default())
+            .expect("swarm builds")
+            .local_peer_id();
+        assert_ne!(first, ephemeral);
     }
 }

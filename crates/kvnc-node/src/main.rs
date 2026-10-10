@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 use config::NodeConfig;
 
@@ -389,6 +390,8 @@ async fn run_node<F>(config: NodeConfig, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    config.validate()?;
+
     // ------------------------------------------------------------------
     // 1. Data directory + storage
     // ------------------------------------------------------------------
@@ -415,7 +418,8 @@ where
         MempoolConfig::default(),
         state_storage.clone(),
     ));
-    let (signing_key, public_key) = load_validator_key(config.validator_key.as_deref());
+    let (signing_key, public_key) =
+        load_validator_key(config.validator_key.as_deref(), config.run_validator)?;
     let validator_address = Address::from_public_key(&public_key);
     info!(validator = %validator_address, "validator identity ready");
 
@@ -1489,6 +1493,7 @@ fn build_network_config(config: &NodeConfig) -> Result<NetworkConfig> {
         bootstrap_nodes,
         max_peers: config.max_peers,
         ping_interval: Duration::from_secs(10),
+        node_key_path: Some(config.data_dir.join(NODE_IDENTITY_FILE)),
     })
 }
 
@@ -1547,42 +1552,59 @@ fn to_multiaddr(value: &str) -> Result<Multiaddr> {
         .with_context(|| format!("invalid address `{value}`"))
 }
 
-/// Load a validator signing key from a hex-seed file, or generate an ephemeral
-/// key when none is configured.
-fn load_validator_key(path: Option<&str>) -> (SigningKey, PublicKey) {
-    if let Some(path) = path {
-        match read_signing_key(path) {
-            Ok(signing_key) => {
-                let public_key = PublicKey::from(signing_key.verifying_key());
-                info!(path, "loaded validator key");
-                return (signing_key, public_key);
-            }
-            Err(e) => warn!(
-                path,
-                error = %e,
-                "failed to load validator key; generating an ephemeral key"
-            ),
-        }
-    } else {
-        info!("no validator key configured; generating an ephemeral key");
-    }
+/// File name (inside `data_dir`) of the persistent libp2p node identity. This
+/// is a transport key, distinct from the validator signing key.
+const NODE_IDENTITY_FILE: &str = "p2p_node.key";
 
-    // TODO: support encrypted keystores / OS keychains instead of a raw hex
-    // seed file. Keys must never be logged or transmitted to peers.
-    kvnc_crypto::generate_keypair()
+/// Load the validator signing key.
+///
+/// A configured key that cannot be loaded is a hard error: the node never
+/// substitutes a different key, because signing with an unexpected identity
+/// is worse than not starting. Only a non-validator node with no key
+/// configured gets an ephemeral identity (it never signs consensus messages).
+///
+/// TODO(remote signer): the seed should live in an external signer; the
+/// `Signer` abstraction is owned by consensus. Until then the seed file must
+/// be `0600` and is zeroized after parsing.
+fn load_validator_key(path: Option<&str>, run_validator: bool) -> Result<(SigningKey, PublicKey)> {
+    match path {
+        Some(path) => {
+            let signing_key = read_signing_key(path).with_context(|| {
+                format!("failed to load validator key from {path}; refusing to start with a substitute key")
+            })?;
+            let public_key = PublicKey::from(signing_key.verifying_key());
+            info!(path, "loaded validator key");
+            Ok((signing_key, public_key))
+        }
+        None if run_validator => anyhow::bail!(
+            "run_validator=true but no validator key is configured (set validator_key or KVNC_VALIDATOR_KEY)"
+        ),
+        None => {
+            info!("run_validator=false and no validator key configured; using an ephemeral non-signing identity");
+            Ok(kvnc_crypto::generate_keypair())
+        }
+    }
 }
 
 /// Read a 32-byte hex seed from `path` and build a signing key.
+///
+/// The file must not be accessible by group or others (unix). Intermediate
+/// buffers holding the seed are zeroized.
 fn read_signing_key(path: &str) -> Result<SigningKey> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading key file {path}"))?;
-    let bytes = hex::decode(raw.trim()).with_context(|| "key file must contain hex")?;
+    kvnc_network::identity::check_key_file_permissions(std::path::Path::new(path))?;
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(path).with_context(|| format!("reading key file {path}"))?,
+    );
+    let bytes = Zeroizing::new(
+        hex::decode(raw.trim()).map_err(|_| anyhow::anyhow!("key file must contain hex"))?,
+    );
     if bytes.len() != 32 {
         anyhow::bail!(
             "validator key must be a 32-byte hex seed, got {} bytes",
             bytes.len()
         );
     }
-    let mut seed = [0u8; 32];
+    let mut seed = Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&seed))
 }
@@ -1612,6 +1634,83 @@ mod tests {
     use std::collections::HashMap;
 
     const DAG_BLOCKS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("dag_blocks");
+
+    /// Write a hex seed file with the given unix mode and return its path.
+    fn write_seed_file(dir: &std::path::Path, seed: &[u8; 32], mode: u32) -> std::path::PathBuf {
+        let path = dir.join("validator.key");
+        std::fs::write(&path, hex::encode(seed)).expect("write seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod seed");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
+    }
+
+    #[test]
+    fn validator_key_loads_from_private_seed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_seed_file(dir.path(), &[7u8; 32], 0o600);
+        let (sk, pk) = load_validator_key(path.to_str(), true).expect("loads");
+        assert_eq!(sk.to_bytes(), [7u8; 32]);
+        assert_eq!(pk, PublicKey::from(sk.verifying_key()));
+    }
+
+    #[test]
+    fn validator_key_failure_is_fatal_not_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.key");
+        // Configured but unreadable: error for validators and non-validators alike.
+        assert!(load_validator_key(missing.to_str(), true).is_err());
+        assert!(load_validator_key(missing.to_str(), false).is_err());
+
+        // Wrong length / not hex.
+        let short = write_seed_file(dir.path(), &[1u8; 32], 0o600);
+        std::fs::write(&short, "abcd").unwrap();
+        assert!(load_validator_key(short.to_str(), true).is_err());
+        std::fs::write(&short, "zz".repeat(32)).unwrap();
+        assert!(load_validator_key(short.to_str(), true).is_err());
+
+        // No key at all: only a non-validator may proceed.
+        assert!(load_validator_key(None, true).is_err());
+        assert!(load_validator_key(None, false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validator_key_with_loose_permissions_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o644, 0o640, 0o666] {
+            let path = write_seed_file(dir.path(), &[9u8; 32], mode);
+            let err = load_validator_key(path.to_str(), true).expect_err("must refuse");
+            assert!(format!("{err:#}").contains("chmod 600"), "{err:#}");
+        }
+        let path = write_seed_file(dir.path(), &[9u8; 32], 0o400);
+        load_validator_key(path.to_str(), true).expect("0400 is fine");
+    }
+
+    #[test]
+    fn network_config_uses_persistent_identity_in_data_dir() {
+        let config = NodeConfig {
+            data_dir: std::path::PathBuf::from("/var/lib/kvnc"),
+            listen_addr: "127.0.0.1:9000".into(),
+            bootnodes: Vec::new(),
+            ..Default::default()
+        };
+        let net = build_network_config(&config).unwrap();
+        assert_eq!(
+            net.node_key_path.as_deref(),
+            Some(std::path::Path::new("/var/lib/kvnc/p2p_node.key"))
+        );
+        assert_ne!(
+            net.node_key_path.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("validator.key")),
+            "transport identity must not reuse the validator seed file"
+        );
+    }
 
     #[test]
     fn host_port_converts_to_multiaddr() {
@@ -1976,9 +2075,11 @@ mod tests {
     async fn node_starts_and_shuts_down() {
         let rpc_port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = write_seed_file(dir.path(), &[7u8; 32], 0o600);
 
         let config = NodeConfig {
             data_dir: dir.path().to_path_buf(),
+            validator_key: Some(key_path.to_string_lossy().into_owned()),
             listen_addr: "127.0.0.1:0".to_string(),
             rpc_addr: "127.0.0.1".to_string(),
             rpc_port,
