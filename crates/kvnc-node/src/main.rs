@@ -20,6 +20,7 @@
 #![allow(clippy::large_enum_variant)]
 
 mod config;
+mod orphans;
 
 use std::future::Future;
 use std::sync::{atomic::Ordering, Arc};
@@ -121,6 +122,8 @@ enum NetworkCommand {
     BroadcastBlock(StatementBlock),
     /// Gossip a consensus vote.
     BroadcastVote(Vote),
+    /// Gossip a transaction accepted into the local mempool via RPC.
+    BroadcastTransaction(Transaction),
     /// Request a block sync from a specific peer.
     RequestSync(PeerId, BlockSyncRequest),
     /// Ask the network task to stop.
@@ -526,7 +529,23 @@ where
     // Liveness of the execution worker and consensus engine, surfaced on /health.
     let node_health = NodeHealth::new();
     let auth_config = rpc_auth_config_from_env();
+    // RPC-accepted transactions are forwarded to the network task.
+    let (rpc_tx_gossip, mut rpc_tx_gossip_rx) = mpsc::unbounded_channel::<Transaction>();
+    {
+        let cmd_tx = network_cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(tx) = rpc_tx_gossip_rx.recv().await {
+                if cmd_tx
+                    .send(NetworkCommand::BroadcastTransaction(tx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     let rpc_state = RpcState {
+        tx_gossip: Some(rpc_tx_gossip),
         health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -640,6 +659,7 @@ where
     let network_task = tokio::spawn(run_network(network, network_cmd_rx, shutdown_rx.clone()));
     let event_task = tokio::spawn(run_event_handler(
         network_events,
+        dag_store.clone(),
         mempool.clone(),
         engine.clone(),
         network_cmd_tx.clone(),
@@ -910,6 +930,11 @@ async fn run_network(
                         warn!(error = %e, "failed to broadcast vote");
                     }
                 }
+                Some(NetworkCommand::BroadcastTransaction(tx)) => {
+                    if let Err(e) = service.broadcast_transaction(&tx) {
+                        warn!(error = %e, "failed to broadcast transaction");
+                    }
+                }
                 Some(NetworkCommand::RequestSync(peer, request)) => {
                     if let Err(e) = service.request_block_sync(peer, request) {
                         warn!(%peer, error = %e, "failed to request block sync");
@@ -946,12 +971,14 @@ async fn run_network(
 /// Ingest events emitted by the network layer into the DAG store and mempool.
 async fn run_event_handler(
     mut network_events: mpsc::UnboundedReceiver<NetworkEvent>,
+    dag_store: Arc<DagStore>,
     mempool: Arc<Mempool>,
     engine: Arc<ConsensusEngine<NodeDagStore, NodeBlockManager>>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
     events: EventBus,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut orphans = orphans::OrphanBuffer::new(orphans::OrphanLimits::default());
     loop {
         tokio::select! {
             maybe = network_events.recv() => match maybe {
@@ -959,8 +986,12 @@ async fn run_event_handler(
                     event,
                     &mempool,
                     &engine,
-                    &network_cmd_tx,
-                    &events,
+                    &BlockIngest {
+                        dag_store: &dag_store,
+                        network_cmd_tx: &network_cmd_tx,
+                        events: &events,
+                    },
+                    &mut orphans,
                 ),
                 None => break,
             },
@@ -973,30 +1004,86 @@ async fn run_event_handler(
     }
 }
 
+/// Shared handles for block ingestion.
+struct BlockIngest<'a> {
+    dag_store: &'a DagStore,
+    network_cmd_tx: &'a mpsc::UnboundedSender<NetworkCommand>,
+    events: &'a EventBus,
+}
+
+/// Process a received block (gossip or sync). If it is rejected because
+/// parents are missing from the DAG, buffer it as an orphan and request the
+/// missing parents (deduplicated, bounded) from `peer`. Every accepted block
+/// releases buffered children, which are processed iteratively.
+fn ingest_block(
+    block: StatementBlock,
+    peer: PeerId,
+    engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
+    io: &BlockIngest<'_>,
+    orphans: &mut orphans::OrphanBuffer,
+) {
+    let mut work = std::collections::VecDeque::from([(block, peer)]);
+    while let Some((block, peer)) = work.pop_front() {
+        match engine.process_block(&block) {
+            Ok(()) => {
+                debug!(digest = %block.digest, "validated received block into consensus");
+                io.events.publish_new_head(&block);
+                let released = orphans.parent_accepted(&block.digest);
+                if !released.is_empty() {
+                    debug!(parent = %block.digest, count = released.len(), "re-processing orphans");
+                }
+                work.extend(released);
+            }
+            Err(e) => {
+                let missing: Vec<Hash> = block
+                    .parents
+                    .iter()
+                    .map(|p| p.digest)
+                    .filter(|d| !io.dag_store.has_block(d).unwrap_or(true))
+                    .collect();
+                if missing.is_empty() {
+                    warn!(digest = %block.digest, error = %e, "rejected received consensus block");
+                    continue;
+                }
+                let digest = block.digest;
+                let out = orphans.insert(block, peer, missing, std::time::Instant::now());
+                debug!(
+                    %digest, %peer, buffered = out.buffered, evicted = out.evicted,
+                    requests = out.requests.len(), orphans = orphans.len(),
+                    "block has missing parents"
+                );
+                for hash in out.requests {
+                    let request = BlockSyncRequest::ByHash(hash);
+                    if let Err(e) = io
+                        .network_cmd_tx
+                        .send(NetworkCommand::RequestSync(peer, request))
+                    {
+                        debug!(error = %e, "failed to queue missing-parent request");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Handle a single [`NetworkEvent`].
 fn handle_network_event(
     event: NetworkEvent,
     mempool: &Mempool,
     engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
-    network_cmd_tx: &mpsc::UnboundedSender<NetworkCommand>,
-    events: &EventBus,
+    io: &BlockIngest<'_>,
+    orphans: &mut orphans::OrphanBuffer,
 ) {
+    let (network_cmd_tx, events) = (io.network_cmd_tx, io.events);
+    orphans.expire(std::time::Instant::now());
     match event {
-        NetworkEvent::BlockReceived(block) => {
+        NetworkEvent::BlockReceived { peer, block } => {
             // Hot-path validation (audit 3.1): verify signature before engine.process_block
             if let Err(e) = kvnc_crypto::verify_batch(std::slice::from_ref(&block)) {
                 warn!(digest = %block.digest, error = %e, "rejected invalid block signature in main hot path");
                 return;
             }
-            match engine.process_block(&block) {
-                Ok(()) => {
-                    debug!(digest = %block.digest, "validated received block into consensus");
-                    events.publish_new_head(&block);
-                }
-                Err(e) => {
-                    warn!(digest = %block.digest, error = %e, "rejected received consensus block")
-                }
-            }
+            ingest_block(block, peer, engine, io, orphans);
         }
         NetworkEvent::TransactionReceived(tx) => {
             // The network layer already admitted this transaction into the
@@ -1044,12 +1131,9 @@ fn handle_network_event(
                     // that it is the block we asked for; the engine's block
                     // manager validates parents before anything is stored. A
                     // synced block is never written to the DAG directly.
-                    match engine.process_block(&block) {
-                        Ok(()) => debug!(digest = %block.digest, "synced block validated into DAG"),
-                        Err(e) => {
-                            warn!(digest = %block.digest, error = %e, "rejected synced block")
-                        }
-                    }
+                    // Missing parents are fetched recursively via the orphan
+                    // buffer.
+                    ingest_block(block, peer, engine, io, orphans);
                 }
                 BlockSyncResponse::NotFound => {
                     debug!(%peer, "requested block not found on peer");
@@ -1440,6 +1524,8 @@ fn recover_committed_subdag_mysticghost(
                 leader: leader_block.clone(),
                 leader_round,
                 leader_author: leader_block.author,
+                // TODO(#13 owner): fill with the red mergeset blocks (same helper live and on recovery).
+                non_blue: Vec::new(),
             })
         }
         MysticGhostOrder::Fallback => {
@@ -1557,6 +1643,7 @@ fn build_network_config(config: &NodeConfig) -> Result<NetworkConfig> {
         max_peers: config.max_peers,
         ping_interval: Duration::from_secs(10),
         node_key_path: Some(config.data_dir.join(NODE_IDENTITY_FILE)),
+        peer_scoring: config.peer_scoring.clone(),
     })
 }
 
@@ -2378,6 +2465,7 @@ mod tests {
                 leader,
                 leader_round: round,
                 leader_author: author,
+                non_blue: Vec::new(),
             }
         };
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();
