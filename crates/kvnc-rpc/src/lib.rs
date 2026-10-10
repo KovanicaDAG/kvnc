@@ -508,6 +508,7 @@ mod tests {
             mempool: Arc::new(Mempool::new(
                 kvnc_mempool::MempoolConfig::default(),
                 storage.clone(),
+                kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
             )),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
