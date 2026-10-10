@@ -19,11 +19,11 @@ Referiraj `AUDIT_REPORT.md` (§2, §3, §4) i `docs/AUDIT-CHECKLIST.md`.
 | Izvođenje (Wasmi, determinističko) | PASS (kostur) | `docs/EXECUTION-GAS-SKELETON.md`; `crates/kvnc-execution/src/lib.rs` — **potrebna dublja revizija plin/metrike** |
 | Staking / valjani skup | PASS | `docs/A8.2-DELEGATION-SKELETON.md`; `crates/kvnc-staking/src/lib.rs` (`bond`/`unbond`/`commission_bps`/`UNBONDING_ROUNDS`) |
 | Kripto (Ed25519, 64-byte sig, 128 hex) | PASS | `kvnc-crypto` — **potreban formalni audit kripto korektnosti** |
-| P2P / mreža (plaintext TCP, gossip) | PASS (struktura) | `crates/kvnc-network/src/service.rs` — **potrebna revizija otpornosti na Sybil/eclipse** |
+| P2P / mreža (libp2p TCP+Noise+Yamux, gossip) | PASS (struktura) | `crates/kvnc-network/src/behaviour.rs` + `service.rs` — **potrebna revizija otpornosti na Sybil/eclipse** |
 | CLI / novčanik / HTLC | PASS (kostur) | `crates/kvnc-cli/src/main.rs`; `docs/A8.2-DELEGATION-SKELETON.md` — delegate deferred Phase 18 |
 | Env / sigurnost | PASS | `docs/SETUP-OPENCODE-KVNC.md`; `AUDIT-CHECKLIST.md` (§3); `ALLOW_RESET=0`, `MINE=0`, `OPERATOR=0` |
-| Seed / DNS | **GAP — potvrđen** | `docs/SEED-DNS-AUDIT.md`; `/api/bootstrap` vratio `502` pri auditu; prethodni log pokazuje `listen 0.0.0.0:8000` (ne 9000); samo `seed.kovanica.online` |
-| Live endpoint | **GAP — blokiran** | `https://explorer.kovanica.online/api/bootstrap` — 502; mora se ponoviti kad je dostupan |
+| Seed / DNS | **GAP — otvoren** | `docs/SEED-DNS-AUDIT.md`; kod **nema** hardkodiranih seedova (`bootstrap_nodes: Vec::new()`); 3+ kvnc-native DNS imena još nisu registrirana |
+| Live endpoint | **N/A (jos nema javnog endpointa)** | `/api/bootstrap` se verificira protiv vlastitog kvnc nodea; tuđi endpointi se ne koriste |
 
 ---
 
@@ -36,8 +36,8 @@ Referiraj `AUDIT_REPORT.md` (§2, §3, §4) i `docs/AUDIT-CHECKLIST.md`.
 4. **Ed25519 kripto**: `kvnc-crypto` — formalni pregled (key derivation, address format, replay protection, signature verification). Ključevi moraju ostati isključivo klijentski (`node` ne prima `seed` ili `private_key`).
 
 ### P1 — P2P, mreža, otpornost (blokira testnet stabilnost)
-5. **P2P (plaintext TCP)**: `kvnc-network/src/service.rs`; potvrditi da nema `libp2p` ovisnosti koje bi uvele nepredvidljivo ponašanje; provjeriti `seed.kovanica.online:9000` (ili potvrđeni port) i dodati `3+` redundanciju.
-6. **Port 8000 vs 9000**: potvrditi živi port iz `/api/bootstrap`; uskladiti `docs/`, `env`, `AGENTS.md` i `operating` konfiguraciju (`ops/deploy/`).
+5. **P2P (libp2p: TCP + Noise + Yamux)**: `kvnc-network/src/behaviour.rs` + `service.rs`; provjeriti `bootstrap_nodes` (bez hardkodiranih tuđih hostova), PeerId podudaranje, gossip scoring/ban pravila i `3+` DNS redundanciju za vlastiti kvnc testnet.
+6. **P2P port**: kvnc koristi **8000** (vlastita odluka, potvrđeno u `config.rs`/`network/src/lib.rs`); uskladiti `docs/`, `env` i `ops/deploy/`. Tuđi endpointi se ne koriste.
 7. **Eclipse / Sybil otpornost**: provjeriti `peer` ograničenja, `ping` timeout, `ban` pravila (`service.rs` linije 33–40); preporuka: dodati eksplicitnu `Sybil` / `eclipse` simulaciju.
 
 ### P2 — staking, upravljanje, operacija (blokira Phase 18 / 25)
@@ -54,7 +54,7 @@ Referiraj `AUDIT_REPORT.md` (§2, §3, §4) i `docs/AUDIT-CHECKLIST.md`.
 - Potvrda da `tokenomics` (90.2 M cap, decay, maturity, fee split) ne može biti narušena kodom ili konfiguracijom.
 - Potvrda da `Wasmi` izvršavanje je determinističko za sve ugovore (`HTLC`, `Vault`, `Multisig`, `Token`).
 - Potvrda da `P2P` ne sadrži `libp2p` ovisnost koja bi mogla uvesti nepredvidljivo ponašanje; ako postoji — dokumentirati i opravdati.
-- Potvrda `DNS` / `seed` redundancije (`3+`) i usklađenosti porta (8000 / 9000 / potvrđeni).
+- Potvrda `DNS` / `seed` redundancije (`3+` kvnc-native imena) i kanonskog P2P porta **8000**.
 - Potpis i datum; preporuka za `mainnet readiness` (da / ne / uvjetno s popisom uvjeta).
 
 ---

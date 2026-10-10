@@ -107,7 +107,7 @@ Capped at `TOTAL_SUPPLY`.
 
 | Constant | Canonical value |
 |----------|-----------------|
-| `DECIMALS` / `ONE_KVNC` | 9 decimals, 1 KUNA = 1 000 000 000 base units |
+| `DECIMALS` / `ONE_KUNA` | 9 decimals, 1 KUNA = 1 000 000 000 base units |
 | `TOTAL_SUPPLY` | 90 200 000 KUNA (hard cap) |
 | `FOUNDER_PREMINE` | 200 000 KUNA |
 | `TREASURY_TOTAL` / `TREASURY_ANNUAL` / `TREASURY_YEARS` | 8 000 000 KUNA / 1 000 000 KUNA per year / 8 years (linear) |

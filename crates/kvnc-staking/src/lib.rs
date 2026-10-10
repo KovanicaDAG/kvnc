@@ -1,4 +1,4 @@
-//! Staking, delegation, validator set management, token emission and treasury for KVNC.
+//! Staking, delegation, validator set management, token emission and treasury for Kovanica (KUNA).
 //!
 //! Tokenomics (locked):
 //! - Total supply: 90_200_000 KUNA
@@ -29,17 +29,17 @@ pub const TICKER: &str = "KUNA";
 
 /// Number of base units in 1 KUNA.
 pub const DECIMALS: u32 = 9;
-pub const ONE_KVNC: u64 = 1_000_000_000; // 10^9
+pub const ONE_KUNA: u64 = 1_000_000_000; // 10^9
 
 /// Total maximum supply: 90.2 million KUNA.
-pub const TOTAL_SUPPLY: u64 = 90_200_000 * ONE_KVNC;
+pub const TOTAL_SUPPLY: u64 = 90_200_000 * ONE_KUNA;
 
 /// Founder premine: 200_000 KUNA.
-pub const FOUNDER_PREMINE: u64 = 200_000 * ONE_KVNC;
+pub const FOUNDER_PREMINE: u64 = 200_000 * ONE_KUNA;
 
 /// Treasury allocation: 8 × 1_000_000 KUNA over 8 years.
-pub const TREASURY_TOTAL: u64 = 8_000_000 * ONE_KVNC;
-pub const TREASURY_ANNUAL: u64 = 1_000_000 * ONE_KVNC;
+pub const TREASURY_TOTAL: u64 = 8_000_000 * ONE_KUNA;
+pub const TREASURY_ANNUAL: u64 = 1_000_000 * ONE_KUNA;
 pub const TREASURY_YEARS: u32 = 8;
 
 /// Approximate number of blocks that correspond to one year.
@@ -53,7 +53,7 @@ pub const MINING_SUBSIDY_BUDGET: u64 = TOTAL_SUPPLY - FOUNDER_PREMINE - TREASURY
 /// Initial block reward: 10 KUNA.
 ///
 /// (Skeleton name: `INITIAL_REWARD` — same value.)
-pub const INITIAL_BLOCK_REWARD: u64 = 10 * ONE_KVNC;
+pub const INITIAL_BLOCK_REWARD: u64 = 10 * ONE_KUNA;
 
 /// Subsidy era length in blocks (chosen so cumulative issuance ≈ 82M).
 ///
@@ -69,7 +69,7 @@ pub const DECAY_DEN: u64 = 4;
 // ============================================================
 
 /// Minimum stake required to become a validator (in base units).
-pub const MIN_VALIDATOR_STAKE: Stake = 50_000 * ONE_KVNC; // 50 000 KVNC
+pub const MIN_VALIDATOR_STAKE: Stake = 50_000 * ONE_KUNA; // 50 000 KUNA
 
 /// Minimum number of active validators (target range 15–21).
 ///
@@ -865,13 +865,13 @@ mod tests {
     fn ticker_is_kuna() {
         assert_eq!(TICKER, "KUNA");
         assert_eq!(DECIMALS, 9);
-        assert_eq!(ONE_KVNC, 1_000_000_000);
+        assert_eq!(ONE_KUNA, 1_000_000_000);
     }
 
     #[test]
     fn initial_reward_is_10_kuna() {
-        assert_eq!(block_reward(0), 10 * ONE_KVNC);
-        assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS - 1), 10 * ONE_KVNC);
+        assert_eq!(block_reward(0), 10 * ONE_KUNA);
+        assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS - 1), 10 * ONE_KUNA);
     }
 
     #[test]
@@ -1036,17 +1036,17 @@ mod tests {
     #[test]
     fn canonical_values_match_skeleton() {
         assert_eq!(DECIMALS, 9);
-        assert_eq!(ONE_KVNC, 1_000_000_000);
-        assert_eq!(TOTAL_SUPPLY, 90_200_000 * ONE_KVNC);
-        assert_eq!(FOUNDER_PREMINE, 200_000 * ONE_KVNC);
-        assert_eq!(TREASURY_TOTAL, 8_000_000 * ONE_KVNC);
-        assert_eq!(TREASURY_ANNUAL, 1_000_000 * ONE_KVNC);
-        assert_eq!(MINING_SUBSIDY_BUDGET, 82_000_000 * ONE_KVNC);
-        assert_eq!(INITIAL_BLOCK_REWARD, 10 * ONE_KVNC); // skeleton INITIAL_REWARD
+        assert_eq!(ONE_KUNA, 1_000_000_000);
+        assert_eq!(TOTAL_SUPPLY, 90_200_000 * ONE_KUNA);
+        assert_eq!(FOUNDER_PREMINE, 200_000 * ONE_KUNA);
+        assert_eq!(TREASURY_TOTAL, 8_000_000 * ONE_KUNA);
+        assert_eq!(TREASURY_ANNUAL, 1_000_000 * ONE_KUNA);
+        assert_eq!(MINING_SUBSIDY_BUDGET, 82_000_000 * ONE_KUNA);
+        assert_eq!(INITIAL_BLOCK_REWARD, 10 * ONE_KUNA); // skeleton INITIAL_REWARD
         assert_eq!(SUBSIDY_ERA_BLOCKS, 2_050_000); // skeleton ERA_LENGTH
         assert_eq!((DECAY_NUM, DECAY_DEN), (3, 4));
         assert_eq!(BLOCKS_PER_YEAR, 15_768_000);
-        assert_eq!(MIN_VALIDATOR_STAKE, 50_000 * ONE_KVNC);
+        assert_eq!(MIN_VALIDATOR_STAKE, 50_000 * ONE_KUNA);
         assert_eq!(MIN_ACTIVE_VALIDATORS, 15);
         assert_eq!(MAX_ACTIVE_VALIDATORS, 21);
         assert_eq!(UNBONDING_ROUNDS, 100_000); // skeleton UNBONDING_PERIOD
@@ -1066,7 +1066,7 @@ mod tests {
         for h in heights {
             assert_eq!(block_reward(h), skeleton_block_reward(h), "height {h}");
         }
-        assert_eq!(block_reward(0), 10 * ONE_KVNC);
+        assert_eq!(block_reward(0), 10 * ONE_KUNA);
         assert_eq!(block_reward(SUBSIDY_ERA_BLOCKS), 7_500_000_000); // 7.5 KUNA
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
         state
             .join_validator(validator, MIN_VALIDATOR_STAKE, 0, None, None)
             .unwrap();
-        let delegate_amount = 10_000 * ONE_KVNC;
+        let delegate_amount = 10_000 * ONE_KUNA;
         state
             .delegate(delegator, validator, delegate_amount)
             .unwrap();
@@ -1224,10 +1224,10 @@ mod tests {
             .join_validator(Address([1u8; 32]), MIN_VALIDATOR_STAKE, 0, None, None)
             .unwrap();
         state
-            .delegate(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC)
+            .delegate(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KUNA)
             .unwrap();
         state
-            .unbond(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KVNC)
+            .unbond(Address([2u8; 32]), Address([1u8; 32]), 5_000 * ONE_KUNA)
             .unwrap();
 
         // Before release → none ready.
@@ -1236,7 +1236,7 @@ mod tests {
         state.committed_leader_height = UNBONDING_ROUNDS;
         let ready = state.unbonding_ready();
         assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].amount, 5_000 * ONE_KVNC);
+        assert_eq!(ready[0].amount, 5_000 * ONE_KUNA);
     }
 
     #[test]
@@ -1330,21 +1330,21 @@ mod tests {
         let mut st = StakingState::new();
         st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
             .unwrap();
-        st.bond_validator(a(1), 10 * ONE_KVNC).unwrap();
-        assert_eq!(st.self_stake(a(1)), MIN_VALIDATOR_STAKE + 10 * ONE_KVNC);
+        st.bond_validator(a(1), 10 * ONE_KUNA).unwrap();
+        assert_eq!(st.self_stake(a(1)), MIN_VALIDATOR_STAKE + 10 * ONE_KUNA);
         // Leaving 1..MIN-1 of self-stake is rejected.
         assert!(matches!(
-            st.unbond_validator(a(1), 20 * ONE_KVNC),
+            st.unbond_validator(a(1), 20 * ONE_KUNA),
             Err(StakingError::BelowMinimumStake)
         ));
-        st.unbond_validator(a(1), 10 * ONE_KVNC).unwrap();
+        st.unbond_validator(a(1), 10 * ONE_KUNA).unwrap();
         assert_eq!(st.unbonding_queue[0].release_height, UNBONDING_ROUNDS);
         assert!(matches!(
             st.withdraw_unbonded(a(1), a(1)),
             Err(StakingError::UnbondNotComplete)
         ));
         st.committed_leader_height = UNBONDING_ROUNDS;
-        assert_eq!(st.withdraw_unbonded(a(1), a(1)).unwrap(), 10 * ONE_KVNC);
+        assert_eq!(st.withdraw_unbonded(a(1), a(1)).unwrap(), 10 * ONE_KUNA);
         // Full exit deactivates.
         st.unbond_validator(a(1), MIN_VALIDATOR_STAKE).unwrap();
         assert!(!st.validators[0].active);
@@ -1382,12 +1382,12 @@ mod tests {
         let mut st = StakingState::new();
         st.join_validator(a(1), MIN_VALIDATOR_STAKE, 1_000, None, None)
             .unwrap();
-        let alone = st.reward_share(a(1), 10 * ONE_KVNC, 1_000);
-        assert_eq!(alone, vec![(a(1), 10 * ONE_KVNC)]);
+        let alone = st.reward_share(a(1), 10 * ONE_KUNA, 1_000);
+        assert_eq!(alone, vec![(a(1), 10 * ONE_KUNA)]);
         st.delegate(a(5), a(1), MIN_VALIDATOR_STAKE).unwrap();
-        let shares = st.reward_share(a(1), 10 * ONE_KVNC, 1_000);
+        let shares = st.reward_share(a(1), 10 * ONE_KUNA, 1_000);
         let sum: u64 = shares.iter().map(|(_, x)| x).sum();
-        assert_eq!(sum, 10 * ONE_KVNC);
+        assert_eq!(sum, 10 * ONE_KUNA);
         // 10% commission, rest split 50/50.
         assert_eq!(shares, vec![(a(1), 5_500_000_000), (a(5), 4_500_000_000)]);
     }
@@ -1399,18 +1399,18 @@ mod tests {
         let mut st = StakingState::new();
         st.join_validator(a(1), MIN_VALIDATOR_STAKE, 0, None, None)
             .unwrap();
-        st.delegate(a(5), a(1), 10_000 * ONE_KVNC).unwrap();
+        st.delegate(a(5), a(1), 10_000 * ONE_KUNA).unwrap();
         let slashed = st
             .slash(DoubleSignEvidence {
                 validator: a(1),
                 height: 7,
             })
             .unwrap();
-        assert_eq!(slashed, 3_000 * ONE_KVNC); // 5% of 60k
-        assert_eq!(st.validators[0].stake, 57_000 * ONE_KVNC);
-        assert_eq!(st.total_staked, 57_000 * ONE_KVNC);
-        assert_eq!(st.self_stake(a(1)), 47_500 * ONE_KVNC);
-        assert_eq!(st.delegations[0].amount, 9_500 * ONE_KVNC);
+        assert_eq!(slashed, 3_000 * ONE_KUNA); // 5% of 60k
+        assert_eq!(st.validators[0].stake, 57_000 * ONE_KUNA);
+        assert_eq!(st.total_staked, 57_000 * ONE_KUNA);
+        assert_eq!(st.self_stake(a(1)), 47_500 * ONE_KUNA);
+        assert_eq!(st.delegations[0].amount, 9_500 * ONE_KUNA);
     }
 
     #[derive(Debug, Clone)]
@@ -1453,12 +1453,12 @@ mod tests {
                         }
                     }
                     Op::Delegate(d, v, x) => {
-                        let x = x * ONE_KVNC;
+                        let x = x * ONE_KUNA;
                         if liquid >= u128::from(x) && st.delegate(a(d), a(v + 1), x).is_ok() {
                             liquid -= u128::from(x);
                         }
                     }
-                    Op::Unbond(d, v, x) => { let _ = st.unbond(a(d), a(v + 1), x * ONE_KVNC); }
+                    Op::Unbond(d, v, x) => { let _ = st.unbond(a(d), a(v + 1), x * ONE_KUNA); }
                     Op::Leader(i) => {
                         if let Some(v) = st.authority_validator(i).cloned() {
                             let before = st.total_mining_issued;

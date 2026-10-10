@@ -59,11 +59,9 @@ impl Default for NodeConfig {
             listen_addr: "0.0.0.0:8000".to_string(),
             rpc_addr: "127.0.0.1".to_string(),
             rpc_port: 8545,
-            bootnodes: vec![
-                "seed.kovanica.online:8000".to_string(),
-                "seed2.kovanica.online:8000".to_string(),
-                "seed3.kovanica.online:8000".to_string(),
-            ],
+            // No hard-coded seeds: kvnc must never dial another project's
+            // infrastructure. Populate via `KVNC_BOOTNODES` or `[node] bootnodes`.
+            bootnodes: Vec::new(),
             validator_key: None,
             round_duration_ms: 2000,
             max_peers: 50,
@@ -256,7 +254,7 @@ data_dir = "/tmp/kvnc-test-data"
 listen_addr = "127.0.0.1:7000"
 rpc_addr = "0.0.0.0"
 rpc_port = 9999
-bootnodes = ["seed.kovanica.online:8000", "seed2.kovanica.online:8000", "127.0.0.1:7001"]
+bootnodes = ["seed1.kvnc.invalid:8000", "seed2.kvnc.invalid:8000", "127.0.0.1:7001"]
 round_duration_ms = 500
 max_peers = 7
 treasury_address = "treasury-address-placeholder"
@@ -289,6 +287,10 @@ treasury_address = "treasury-address-placeholder"
         assert_eq!(config.rpc_port, 8545);
         assert_eq!(config.max_peers, 50);
         assert_eq!(config.round_duration_ms, 2000);
+        assert!(
+            config.bootnodes.is_empty(),
+            "defaults must not hard-code third-party seed hosts"
+        );
     }
 
     #[test]

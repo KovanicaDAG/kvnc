@@ -117,26 +117,16 @@ pub struct NetworkConfig {
 
 impl Default for NetworkConfig {
     fn default() -> Self {
-        // NOTE: the `/p2p/` component must carry the seed's real libp2p peer id.
-        // The values below are syntactically valid placeholders until the seeds
-        // publish their peer ids; a mismatching peer id only fails the dial, which the
-        // event loop tolerates.
-        // Port 8000 matches the live network's advertised P2P port (per /api/bootstrap).
+        // No bootstrap nodes are hard-coded: kvnc must never reference another
+        // project's infrastructure. Seeds are supplied at deploy time from
+        // kvnc-native DNS names (TBD before the public testnet launch) via
+        // `NetworkConfig::bootstrap_nodes` / `KVNC_BOOTNODES`, together with the
+        // seed's real libp2p peer id in the `/p2p/` component.
         Self {
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/8000"
                 .parse()
                 .expect("valid listen multiaddr")],
-            bootstrap_nodes: vec![
-                "/dns4/seed.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-                    .parse()
-                    .expect("valid bootstrap multiaddr"),
-                "/dns4/seed2.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-                    .parse()
-                    .expect("valid bootstrap multiaddr"),
-                "/dns4/seed3.kovanica.online/tcp/8000/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-                    .parse()
-                    .expect("valid bootstrap multiaddr"),
-            ],
+            bootstrap_nodes: Vec::new(),
             max_peers: 50,
             ping_interval: Duration::from_secs(10),
             node_key_path: None,
@@ -154,15 +144,7 @@ mod tests {
         let config = NetworkConfig::default();
         assert_eq!(config.listen_addrs.len(), 1);
         assert_eq!(config.listen_addrs[0].to_string(), "/ip4/0.0.0.0/tcp/8000");
-        assert_eq!(config.bootstrap_nodes.len(), 3);
-        for node in &config.bootstrap_nodes {
-            assert!(
-                node.to_string().contains("/dns4/seed")
-                    && node.to_string().contains("/tcp/8000/p2p/"),
-                "unexpected default bootstrap: {}",
-                node
-            );
-        }
+        assert_eq!(config.bootstrap_nodes.len(), 0);
         assert_eq!(config.max_peers, 50);
         assert_eq!(config.ping_interval, Duration::from_secs(10));
     }

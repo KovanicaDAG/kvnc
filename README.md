@@ -1,4 +1,4 @@
-# KVNC
+# Kovanica (kvnc)
 
 > A DAG-based Layer 1 blockchain written in Rust, with staking, smart contracts and a fixed, era-based emission schedule.
 
@@ -9,7 +9,10 @@
 
 ## Overview
 
-KVNC (Kovanica) is a Rust workspace implementing a DAG ledger node. [TODO: 2-3 sentences: what problem it solves, how it differs from other chains, what the consensus approach is.]
+Kovanica (kvnc) is a Rust workspace implementing a DAG ledger node: Mysticeti-style
+uncertified DAG consensus (wave = 3), a UTXO-free account + staking model, and Wasmi-based
+deterministic contract execution. The chain is **Kovanica**; the native coin ticker is **KUNA**
+(9 decimals); all code, crates and env vars use the `kvnc` prefix.
 
 ## Features
 
@@ -79,13 +82,13 @@ Burst capacity is derived from the configured rate as `max(1, rate / 6)`.
 
 | Parameter | Value |
 | --- | --- |
-| Maximum supply | 90,200,000 KVNC |
-| Founder premine | 200,000 KVNC |
-| Treasury | 8,000,000 KVNC |
-| Initial block reward | 10 KVNC |
+| Maximum supply | 90,200,000 KUNA |
+| Founder premine | 200,000 KUNA |
+| Treasury | 8,000,000 KUNA |
+| Initial block reward | 10 KUNA |
 | Era length | 2,050,000 blocks |
 | Reward decay | x 3/4 per era |
-| Emitted through rewards | ~82,000,000 KVNC |
+| Emitted through rewards | ~82,000,000 KUNA |
 
 Emission per era is `era length x current reward`. Because the reward shrinks by a factor of 3/4 each era, total emission converges to 82M, and together with premine and treasury this gives the 90.2M cap.
 

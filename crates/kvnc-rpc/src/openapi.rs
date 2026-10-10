@@ -76,7 +76,7 @@ pub fn generate_openapi_spec() -> OpenApiSpec {
         info: OpenApiInfo {
             title: "KVNC JSON-RPC API".to_string(),
             version: "0.1.0".to_string(),
-            description: "JSON-RPC API for KVNC blockchain node. All methods use JSON-RPC 2.0 over HTTP POST to /rpc endpoint.".to_string(),
+            description: "JSON-RPC API for Kovanica (kvnc) node. All methods use JSON-RPC 2.0 over HTTP POST to /rpc endpoint.".to_string(),
         },
         servers: vec![
             OpenApiServer {
@@ -84,8 +84,8 @@ pub fn generate_openapi_spec() -> OpenApiSpec {
                 description: "Local development node".to_string(),
             },
             OpenApiServer {
-                url: "https://api.kovanica.online/rpc".to_string(),
-                description: "Public mainnet node".to_string(),
+                url: "https://rpc.kvnc.example/rpc".to_string(),
+                description: "Public testnet node (placeholder — replaced at launch)".to_string(),
             },
         ],
         paths: BTreeMap::new(),

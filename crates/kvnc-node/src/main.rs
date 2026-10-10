@@ -61,7 +61,7 @@ impl LogPublisher for EventLogPublisher {
     }
 }
 use kvnc_staking::{
-    StakingState, FOUNDER_PREMINE, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC,
+    StakingState, FOUNDER_PREMINE, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KUNA,
 };
 use kvnc_storage::{StateStoreError, Storage};
 use kvnc_types::{
@@ -233,8 +233,8 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             "founder_address_hex": args.founder_address,
             "founder_address_bytes": hex::encode(founder.0),
             "founder_premine_atoms": FOUNDER_PREMINE,
-            "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
-            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KVNC,
+            "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KUNA,
+            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KUNA,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
@@ -1990,7 +1990,7 @@ mod tests {
             "no storage opened before the chain id check"
         );
     }
-    use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC};
+    use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KUNA};
     use kvnc_storage::BincodeSerialize;
     use redb::{Database, TableDefinition};
     use std::collections::HashMap;
@@ -2077,18 +2077,16 @@ mod tests {
     #[test]
     fn host_port_converts_to_multiaddr() {
         assert_eq!(
-            to_multiaddr("127.0.0.1:9000").unwrap().to_string(),
-            "/ip4/127.0.0.1/tcp/9000"
+            to_multiaddr("127.0.0.1:8000").unwrap().to_string(),
+            "/ip4/127.0.0.1/tcp/8000"
         );
         assert_eq!(
-            to_multiaddr("seed.kovanica.online:9000")
-                .unwrap()
-                .to_string(),
-            "/dns4/seed.kovanica.online/tcp/9000"
+            to_multiaddr("seed1.kvnc.invalid:8000").unwrap().to_string(),
+            "/dns4/seed1.kvnc.invalid/tcp/8000"
         );
         assert_eq!(
-            to_multiaddr("/ip4/0.0.0.0/tcp/9000").unwrap().to_string(),
-            "/ip4/0.0.0.0/tcp/9000"
+            to_multiaddr("/ip4/0.0.0.0/tcp/8000").unwrap().to_string(),
+            "/ip4/0.0.0.0/tcp/8000"
         );
         assert!(to_multiaddr("not-an-address").is_err());
     }
@@ -2586,16 +2584,16 @@ mod tests {
 
         // Validator stakes: 100K, 80K, 120K, 60K KUNA (all above MIN_VALIDATOR_STAKE = 50K)
         staking
-            .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
+            .join_validator(addr1, 100_000 * ONE_KUNA, 0, Some(addr1), Some(pk1))
             .unwrap();
         staking
-            .join_validator(addr2, 80_000 * ONE_KVNC, 0, Some(addr2), Some(pk2))
+            .join_validator(addr2, 80_000 * ONE_KUNA, 0, Some(addr2), Some(pk2))
             .unwrap();
         staking
-            .join_validator(addr3, 120_000 * ONE_KVNC, 0, Some(addr3), Some(pk3))
+            .join_validator(addr3, 120_000 * ONE_KUNA, 0, Some(addr3), Some(pk3))
             .unwrap();
         staking
-            .join_validator(addr4, 60_000 * ONE_KVNC, 0, Some(addr4), Some(pk4))
+            .join_validator(addr4, 60_000 * ONE_KUNA, 0, Some(addr4), Some(pk4))
             .unwrap();
 
         // Save to storage
@@ -2643,10 +2641,10 @@ mod tests {
 
         // Verify stakes match
         let addr_to_stake = vec![
-            (addr1, 100_000 * ONE_KVNC),
-            (addr2, 80_000 * ONE_KVNC),
-            (addr3, 120_000 * ONE_KVNC),
-            (addr4, 60_000 * ONE_KVNC),
+            (addr1, 100_000 * ONE_KUNA),
+            (addr2, 80_000 * ONE_KUNA),
+            (addr3, 120_000 * ONE_KUNA),
+            (addr4, 60_000 * ONE_KUNA),
         ];
         for (addr, expected_stake) in addr_to_stake {
             let auth = committee
@@ -2689,11 +2687,11 @@ mod tests {
 
         // Active, sufficient stake
         staking
-            .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
+            .join_validator(addr1, 100_000 * ONE_KUNA, 0, Some(addr1), Some(pk1))
             .unwrap();
         // Inactive - should be skipped
         staking
-            .join_validator(addr2, 100_000 * ONE_KVNC, 0, Some(addr2), Some(pk2))
+            .join_validator(addr2, 100_000 * ONE_KUNA, 0, Some(addr2), Some(pk2))
             .unwrap();
         staking
             .validators
@@ -2704,13 +2702,13 @@ mod tests {
         // Below MIN_VALIDATOR_STAKE - manually add (bypassing join_validator check)
         staking.validators.push(kvnc_staking::ValidatorInfo {
             address: addr3,
-            stake: 10_000 * ONE_KVNC,
+            stake: 10_000 * ONE_KUNA,
             commission_bps: 0,
             active: true,
             payout_address: addr3,
             public_key: Some(pk3),
         });
-        staking.total_staked += 10_000 * ONE_KVNC;
+        staking.total_staked += 10_000 * ONE_KUNA;
 
         let txn = state_storage.begin_write().unwrap();
         state_storage
@@ -2746,13 +2744,13 @@ mod tests {
             validators.push((addr, pk));
             staking.validators.push(kvnc_staking::ValidatorInfo {
                 address: addr,
-                stake: 100_000 * ONE_KVNC,
+                stake: 100_000 * ONE_KUNA,
                 commission_bps: 0,
                 active: true,
                 payout_address: addr,
                 public_key: Some(pk),
             });
-            staking.total_staked += 100_000 * ONE_KVNC;
+            staking.total_staked += 100_000 * ONE_KUNA;
         }
 
         let txn = state_storage.begin_write().unwrap();
