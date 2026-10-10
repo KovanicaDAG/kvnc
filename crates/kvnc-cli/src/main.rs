@@ -32,6 +32,11 @@ struct Cli {
     #[arg(long, global = true, default_value = "http://127.0.0.1:8545")]
     rpc_url: String,
 
+    /// Network `chain_id` committed to by every transaction signature (1 mainnet, 2 testnet, 3 devnet, 1337 local); falls back to the `KVNC_CHAIN_ID` environment variable.
+    /// Required by commands that sign transactions; there is deliberately no default.
+    #[arg(long, global = true)]
+    chain_id: Option<u64>,
+
     /// Emit machine-readable JSON instead of human-readable tables
     #[arg(long, global = true)]
     json: bool,
@@ -269,6 +274,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
     let client = RpcClient::new(cli.rpc_url);
+    let chain_id = match cli.chain_id {
+        Some(id) => Some(id),
+        None => match std::env::var("KVNC_CHAIN_ID") {
+            Ok(v) => Some(
+                v.trim()
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("KVNC_CHAIN_ID must be an unsigned integer"))?,
+            ),
+            Err(_) => None,
+        },
+    };
 
     match cli.command {
         Commands::Keygen(args) => cmd_keygen(args, json),
@@ -278,13 +294,13 @@ async fn main() -> Result<()> {
         Commands::Migrate(args) => cmd_migrate(args, json),
         Commands::Address(args) => cmd_address(args, json),
         Commands::Sign(args) => cmd_sign(args, json),
-        Commands::Transfer(args) => cmd_transfer(&client, args, json).await,
+        Commands::Transfer(args) => cmd_transfer(&client, chain_id, args, json).await,
         Commands::Status | Commands::Info => node::status(&client, json).await,
         Commands::Balance { address } => node::balance(&client, &address, json).await,
-        Commands::Stake(args) => cmd_stake(&client, args, json).await,
-        Commands::Unstake(args) => cmd_unstake(&client, args, json).await,
-        Commands::Delegate(args) => cmd_delegate(&client, args, json).await,
-        Commands::ClaimRewards(args) => cmd_claim_rewards(&client, args, json).await,
+        Commands::Stake(args) => cmd_stake(&client, chain_id, args, json).await,
+        Commands::Unstake(args) => cmd_unstake(&client, chain_id, args, json).await,
+        Commands::Delegate(args) => cmd_delegate(&client, chain_id, args, json).await,
+        Commands::ClaimRewards(args) => cmd_claim_rewards(&client, chain_id, args, json).await,
         Commands::Propose(args) => node::not_implemented(
             "propose",
             "kvnc_propose",
@@ -430,7 +446,13 @@ fn cmd_sign(args: SignArgs, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool) -> Result<()> {
+async fn cmd_transfer(
+    client: &RpcClient,
+    chain_id: Option<u64>,
+    args: TransferArgs,
+    json_output: bool,
+) -> Result<()> {
+    let ctx = tx::signing_context(chain_id)?;
     let keystore = wallet::load(&args.keystore)?;
     let password = prompt_keystore_password(&keystore)?;
     let signing_key = wallet::signing_key(&keystore, password.as_ref().map(|p| p.as_str()))?;
@@ -447,7 +469,7 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
         to: recipient,
         amount: args.amount,
     };
-    let transaction = tx::build_signed(sender, nonce, kind, args.fee, &signing_key)?;
+    let transaction = tx::build_signed(&ctx, sender, nonce, kind, args.fee, &signing_key)?;
     let raw = tx::encode_raw(&transaction)?;
 
     let result = client.call("kvnc_sendRawTransaction", json!([raw])).await?;
@@ -481,10 +503,12 @@ async fn cmd_transfer(client: &RpcClient, args: TransferArgs, json_output: bool)
 /// never leaves the machine and no staking-specific node RPC is introduced.
 async fn sign_and_submit_self(
     client: &RpcClient,
+    chain_id: Option<u64>,
     keystore_path: &std::path::Path,
     kind: TransactionKind,
     fee: u64,
 ) -> Result<(String, kvnc_types::Address, u64)> {
+    let ctx = tx::signing_context(chain_id)?;
     let keystore = wallet::load(keystore_path)?;
     let password = prompt_keystore_password(&keystore)?;
     let signing_key = wallet::signing_key(&keystore, password.as_ref().map(|p| p.as_str()))?;
@@ -496,7 +520,7 @@ async fn sign_and_submit_self(
         .await?;
     let nonce = rpc::parse_quantity(&nonce_value)?;
 
-    let transaction = tx::build_signed(sender, nonce, kind, fee, &signing_key)?;
+    let transaction = tx::build_signed(&ctx, sender, nonce, kind, fee, &signing_key)?;
     let raw = tx::encode_raw(&transaction)?;
 
     let result = client.call("kvnc_sendRawTransaction", json!([raw])).await?;
@@ -504,9 +528,15 @@ async fn sign_and_submit_self(
     Ok((tx_hash, sender, nonce))
 }
 
-async fn cmd_stake(client: &RpcClient, args: AmountArgs, json_output: bool) -> Result<()> {
+async fn cmd_stake(
+    client: &RpcClient,
+    chain_id: Option<u64>,
+    args: AmountArgs,
+    json_output: bool,
+) -> Result<()> {
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
+        chain_id,
         &args.keystore,
         TransactionKind::Stake {
             amount: args.amount,
@@ -533,9 +563,15 @@ async fn cmd_stake(client: &RpcClient, args: AmountArgs, json_output: bool) -> R
     Ok(())
 }
 
-async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) -> Result<()> {
+async fn cmd_unstake(
+    client: &RpcClient,
+    chain_id: Option<u64>,
+    args: AmountArgs,
+    json_output: bool,
+) -> Result<()> {
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
+        chain_id,
         &args.keystore,
         TransactionKind::Unstake {
             amount: args.amount,
@@ -562,10 +598,16 @@ async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) ->
     Ok(())
 }
 
-async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool) -> Result<()> {
+async fn cmd_delegate(
+    client: &RpcClient,
+    chain_id: Option<u64>,
+    args: DelegateArgs,
+    json_output: bool,
+) -> Result<()> {
     let validator = args.validator.parse::<kvnc_types::Address>()?;
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
+        chain_id,
         &args.keystore,
         TransactionKind::Delegate {
             validator,
@@ -597,6 +639,7 @@ async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool)
 
 async fn cmd_claim_rewards(
     client: &RpcClient,
+    chain_id: Option<u64>,
     args: ClaimRewardsArgs,
     json_output: bool,
 ) -> Result<()> {
@@ -606,6 +649,7 @@ async fn cmd_claim_rewards(
         .transpose()?;
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
+        chain_id,
         &args.keystore,
         TransactionKind::ClaimRewards { validator },
         args.fee,

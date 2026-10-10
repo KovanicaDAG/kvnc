@@ -508,6 +508,7 @@ mod tests {
             mempool: Arc::new(Mempool::new(
                 kvnc_mempool::MempoolConfig::default(),
                 storage.clone(),
+                kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
             )),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
@@ -592,7 +593,11 @@ mod tests {
         };
         RpcState {
             consensus_store: Arc::new(kvnc_dag::DagStore::from_storage(storage.clone())),
-            mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
+            mempool: Arc::new(Mempool::new(
+                MempoolConfig::default(),
+                storage.clone(),
+                kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
+            )),
             storage,
             staking: Arc::new(RwLock::new(StakingState::new())),
             committee: CommitteeInfo::try_new(0, vec![authority]).expect("committee"),

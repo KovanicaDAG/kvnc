@@ -53,11 +53,14 @@ pub struct BlockManager {
     authority_stakes: RwLock<HashMap<AuthorityIndex, u64>>,
     /// Optional round watch receiver from consensus engine for current round tracking.
     round_receiver: RwLock<Option<watch::Receiver<Round>>>,
+    /// Signing context (chain_id/epoch) for tx signing-hash checks.
+    signing_ctx: kvnc_types::SigningContext,
 }
 
 impl BlockManager {
     /// Create a new block manager.
-    pub fn new(dag_store: Arc<DagStore>) -> Self {
+    // TODO(owner): source chain_id/epoch from node config
+    pub fn new(dag_store: Arc<DagStore>, signing_ctx: kvnc_types::SigningContext) -> Self {
         Self {
             dag_store,
             pending_txs: Arc::new(RwLock::new(VecDeque::new())),
@@ -66,6 +69,7 @@ impl BlockManager {
             authority_keys: RwLock::new(HashMap::new()),
             authority_stakes: RwLock::new(HashMap::new()),
             round_receiver: RwLock::new(None),
+            signing_ctx,
         }
     }
 
@@ -344,7 +348,7 @@ impl BlockManager {
     /// Full signature verification requires state access and is done in the mempool/execution layer.
     fn validate_transaction(&self, tx: &kvnc_types::Transaction) -> Result<(), BlockManagerError> {
         // Verify cached hash matches domain-tagged signing hash (DOMAIN_TX)
-        if tx.hash != tx.signing_hash() {
+        if tx.hash != tx.signing_hash(&self.signing_ctx) {
             return Err(BlockManagerError::InvalidBlock(
                 "Transaction hash mismatch (DOMAIN_TX)".to_string(),
             ));
@@ -502,12 +506,14 @@ impl BlockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const TEST_CTX: kvnc_types::SigningContext =
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
     #[test]
     fn received_block_requires_committee_signature_and_matching_digest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store);
+        let manager = BlockManager::new(store, TEST_CTX);
         let (key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
 
@@ -543,7 +549,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
 
@@ -587,7 +593,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
 
@@ -632,7 +638,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
 
@@ -714,7 +720,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key0, pk0) = crypto::generate_keypair();
         let (key1, pk1) = crypto::generate_keypair();
         let (key2, pk2) = crypto::generate_keypair();
@@ -806,7 +812,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
 
         // Set up committee with 2 authorities
         let (key0, pk0) = crypto::generate_keypair();
@@ -864,7 +870,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
 
         // Set up committee with only authority 0
         let (key0, pk0) = crypto::generate_keypair();
@@ -936,7 +942,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, public_key) = crypto::generate_keypair();
         manager.set_authority(0);
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
@@ -1003,7 +1009,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (_key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
         manager.set_authority_stakes(HashMap::from([(0, 100)]));
@@ -1025,7 +1031,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (_key, public_key) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, public_key)]));
         manager.set_authority_stakes(HashMap::from([(0, 100)]));
@@ -1057,7 +1063,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
 
         let genesis = make_block(0, 0, vec![], "genesis");
         store.put_block(&genesis).unwrap();
@@ -1185,7 +1191,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, pk) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, pk)]));
 
@@ -1214,7 +1220,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, pk) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, pk)]));
 
@@ -1241,7 +1247,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         let (key, pk) = crypto::generate_keypair();
         manager.set_authority_keys(HashMap::from([(0, pk)]));
 
@@ -1265,7 +1271,7 @@ mod tests {
         let chain = {
             let storage = kvnc_storage::Storage::new(&path).unwrap();
             let store = Arc::new(DagStore::new(storage).unwrap());
-            let manager = BlockManager::new(store.clone());
+            let manager = BlockManager::new(store.clone(), TEST_CTX);
             manager.set_authority_keys(HashMap::from([(0, pk)]));
             let chain = build_chain(&manager, &store, &key, 9);
             store.prune_waves_before(3, 1).unwrap();
@@ -1276,7 +1282,7 @@ mod tests {
         let storage = kvnc_storage::Storage::new(&path).unwrap();
         let store = Arc::new(DagStore::new(storage).unwrap());
         assert_eq!(store.prune_boundary().unwrap(), 6, "boundary is durable");
-        let manager = BlockManager::new(store.clone());
+        let manager = BlockManager::new(store.clone(), TEST_CTX);
         manager.set_authority_keys(HashMap::from([(0, pk)]));
         let child = signed(&key, 0, 10, vec![bref(&chain[9]), bref(&chain[3])]);
         manager

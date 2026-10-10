@@ -41,7 +41,11 @@ fn test_state(storage: Arc<Storage>, events: EventBus) -> RpcState {
     RpcState {
         health: kvnc_rpc::NodeHealth::new(),
         consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
-        mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
+        mempool: Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            storage.clone(),
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
+        )),
         storage,
         staking: Arc::new(RwLock::new(StakingState::new())),
         committee: CommitteeInfo::try_new(0, vec![authority]).expect("valid committee"),

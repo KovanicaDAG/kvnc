@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod error;
 pub mod hash;
 pub mod light_client;
+pub mod signing;
 pub mod transaction;
 pub mod vote;
 
@@ -27,6 +28,7 @@ pub use hash::Hash;
 pub use light_client::{
     ColouringCertificate, LightClientCheckpoint, StateProof, WaveCommitCertificate,
 };
+pub use signing::SigningContext;
 pub use transaction::{Transaction, TransactionKind};
 pub use vote::Vote;
 

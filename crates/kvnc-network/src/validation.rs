@@ -81,7 +81,12 @@ impl std::error::Error for SigError {}
 /// (done by [`verify_vote_with`]); the verifier only checks the signature.
 pub trait VoteVerifier: Send + Sync {
     /// Verify `vote.signature` over [`Vote::signature_data`] under `pubkey`.
-    fn verify_vote_signature(&self, vote: &Vote, pubkey: &PublicKey) -> Result<(), SigError>;
+    fn verify_vote_signature(
+        &self,
+        ctx: &kvnc_types::SigningContext,
+        vote: &Vote,
+        pubkey: &PublicKey,
+    ) -> Result<(), SigError>;
 }
 
 /// Stub verifier: existing `kvnc_crypto::verify` over [`Vote::signature_data`].
@@ -92,8 +97,14 @@ pub trait VoteVerifier: Send + Sync {
 pub struct Ed25519VoteVerifier;
 
 impl VoteVerifier for Ed25519VoteVerifier {
-    fn verify_vote_signature(&self, vote: &Vote, pubkey: &PublicKey) -> Result<(), SigError> {
-        kvnc_crypto::verify(pubkey, &vote.signature_data(), &vote.signature).map_err(|e| match e {
+    fn verify_vote_signature(
+        &self,
+        ctx: &kvnc_types::SigningContext,
+        vote: &Vote,
+        pubkey: &PublicKey,
+    ) -> Result<(), SigError> {
+        kvnc_crypto::verify(pubkey, &vote.signature_data(ctx), &vote.signature).map_err(|e| match e
+        {
             kvnc_crypto::CryptoError::InvalidPublicKey => SigError::InvalidPublicKey,
             _ => SigError::VerificationFailed,
         })
@@ -106,19 +117,24 @@ pub fn verify_vote_with(
     verifier: &dyn VoteVerifier,
     keys: &AuthorityKeys,
     vote: &Vote,
+    ctx: &kvnc_types::SigningContext,
 ) -> Result<(), Rejection> {
     let key = keys
         .get(&vote.voter)
         .ok_or(Rejection::UnknownAuthority(vote.voter))?;
     verifier
-        .verify_vote_signature(vote, key)
+        .verify_vote_signature(ctx, vote, key)
         .map_err(|_| Rejection::BadSignature(vote.voter))
 }
 
 /// Verify that `vote` is signed by its claimed voter under `keys`
 /// (default [`Ed25519VoteVerifier`]).
-pub fn verify_vote(keys: &AuthorityKeys, vote: &Vote) -> Result<(), Rejection> {
-    verify_vote_with(&Ed25519VoteVerifier, keys, vote)
+pub fn verify_vote(
+    keys: &AuthorityKeys,
+    vote: &Vote,
+    ctx: &kvnc_types::SigningContext,
+) -> Result<(), Rejection> {
+    verify_vote_with(&Ed25519VoteVerifier, keys, vote, ctx)
 }
 
 /// Verify a block's digest, merkle root and author signature under `keys`.
@@ -186,7 +202,11 @@ impl GossipValidator {
             .is_empty()
     }
 
-    pub(crate) fn verify_vote(&self, vote: &Vote) -> Result<(), Rejection> {
+    pub(crate) fn verify_vote(
+        &self,
+        vote: &Vote,
+        ctx: &kvnc_types::SigningContext,
+    ) -> Result<(), Rejection> {
         let verifier = self
             .vote_verifier
             .read()
@@ -196,6 +216,7 @@ impl GossipValidator {
             verifier.as_ref(),
             &self.keys.read().unwrap_or_else(|e| e.into_inner()),
             vote,
+            ctx,
         )
     }
 
@@ -207,6 +228,8 @@ impl GossipValidator {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    pub(crate) const TEST_CTX: kvnc_types::SigningContext =
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
     use kvnc_types::{Hash, Signature};
 
     /// Deterministic committee of `n` keys (seed byte = index + 1).
@@ -228,7 +251,7 @@ pub(crate) mod test_support {
             voter,
             signature: Signature([0; 64]),
         };
-        vote.signature = kvnc_crypto::sign(signer, &vote.signature_data());
+        vote.signature = kvnc_crypto::sign(signer, &vote.signature_data(&TEST_CTX));
         vote
     }
 
@@ -256,7 +279,10 @@ mod tests {
     #[test]
     fn valid_vote_is_accepted() {
         let (signers, keys) = committee(4);
-        assert_eq!(verify_vote(&keys, &signed_vote(&signers[2], 2)), Ok(()));
+        assert_eq!(
+            verify_vote(&keys, &signed_vote(&signers[2], 2), &TEST_CTX),
+            Ok(())
+        );
     }
 
     #[test]
@@ -264,7 +290,10 @@ mod tests {
         let (signers, keys) = committee(4);
         let mut vote = signed_vote(&signers[1], 1);
         vote.signature = Signature([7; 64]);
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
     }
 
     #[test]
@@ -272,8 +301,11 @@ mod tests {
         let (signers, keys) = committee(4);
         // Validator 0 signs but claims to be validator 3.
         let mut vote = signed_vote(&signers[0], 3);
-        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data());
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(3)));
+        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data(&TEST_CTX));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(3))
+        );
     }
 
     #[test]
@@ -281,10 +313,16 @@ mod tests {
         let (signers, keys) = committee(4);
         let mut vote = signed_vote(&signers[1], 1);
         vote.leader_hash = Hash::new(b"other leader");
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
         let mut vote = signed_vote(&signers[1], 1);
         vote.leader_round += 1;
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
     }
 
     #[test]
@@ -292,7 +330,7 @@ mod tests {
         let (signers, keys) = committee(4);
         let vote = signed_vote(&signers[0], 9);
         assert_eq!(
-            verify_vote(&keys, &vote),
+            verify_vote(&keys, &vote, &TEST_CTX),
             Err(Rejection::UnknownAuthority(9))
         );
     }
@@ -343,7 +381,9 @@ mod tests {
         let (signers, _) = committee(1);
         let validator = GossipValidator::default();
         assert!(!validator.is_configured());
-        assert!(validator.verify_vote(&signed_vote(&signers[0], 0)).is_err());
+        assert!(validator
+            .verify_vote(&signed_vote(&signers[0], 0), &TEST_CTX)
+            .is_err());
         assert!(validator
             .verify_block(&signed_block(&signers[0], 0))
             .is_err());
@@ -356,10 +396,13 @@ mod tests {
         let (signers, keys) = committee(4);
         let vote = signed_vote(&signers[2], 2);
         assert_eq!(
-            Ed25519VoteVerifier.verify_vote_signature(&vote, &keys[&2]),
+            Ed25519VoteVerifier.verify_vote_signature(&TEST_CTX, &vote, &keys[&2]),
             Ok(())
         );
-        assert_eq!(verify_vote_with(&Ed25519VoteVerifier, &keys, &vote), Ok(()));
+        assert_eq!(
+            verify_vote_with(&Ed25519VoteVerifier, &keys, &vote, &TEST_CTX),
+            Ok(())
+        );
     }
 
     #[test]
@@ -368,11 +411,11 @@ mod tests {
         let mut vote = signed_vote(&signers[1], 1);
         vote.signature = Signature([7; 64]);
         assert_eq!(
-            Ed25519VoteVerifier.verify_vote_signature(&vote, &keys[&1]),
+            Ed25519VoteVerifier.verify_vote_signature(&TEST_CTX, &vote, &keys[&1]),
             Err(SigError::VerificationFailed)
         );
         assert_eq!(
-            verify_vote_with(&Ed25519VoteVerifier, &keys, &vote),
+            verify_vote_with(&Ed25519VoteVerifier, &keys, &vote, &TEST_CTX),
             Err(Rejection::BadSignature(1))
         );
     }
@@ -381,14 +424,19 @@ mod tests {
     fn trait_path_rejects_unknown_voter_without_calling_verifier() {
         struct Panicking;
         impl VoteVerifier for Panicking {
-            fn verify_vote_signature(&self, _: &Vote, _: &PublicKey) -> Result<(), SigError> {
+            fn verify_vote_signature(
+                &self,
+                _: &kvnc_types::SigningContext,
+                _: &Vote,
+                _: &PublicKey,
+            ) -> Result<(), SigError> {
                 panic!("verifier must not be called for unknown voters");
             }
         }
         let (signers, keys) = committee(4);
         let vote = signed_vote(&signers[0], 9);
         assert_eq!(
-            verify_vote_with(&Panicking, &keys, &vote),
+            verify_vote_with(&Panicking, &keys, &vote, &TEST_CTX),
             Err(Rejection::UnknownAuthority(9))
         );
     }
@@ -397,7 +445,12 @@ mod tests {
     fn gossip_validator_uses_injected_verifier() {
         struct RejectAll;
         impl VoteVerifier for RejectAll {
-            fn verify_vote_signature(&self, _: &Vote, _: &PublicKey) -> Result<(), SigError> {
+            fn verify_vote_signature(
+                &self,
+                _: &kvnc_types::SigningContext,
+                _: &Vote,
+                _: &PublicKey,
+            ) -> Result<(), SigError> {
                 Err(SigError::VerificationFailed)
             }
         }
@@ -405,10 +458,10 @@ mod tests {
         let validator = GossipValidator::default();
         validator.set_keys(keys);
         let vote = signed_vote(&signers[0], 0);
-        assert_eq!(validator.verify_vote(&vote), Ok(()));
+        assert_eq!(validator.verify_vote(&vote, &TEST_CTX), Ok(()));
         validator.set_vote_verifier(Arc::new(RejectAll));
         assert_eq!(
-            validator.verify_vote(&vote),
+            validator.verify_vote(&vote, &TEST_CTX),
             Err(Rejection::BadSignature(0))
         );
     }

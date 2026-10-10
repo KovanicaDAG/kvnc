@@ -29,7 +29,7 @@ impl Hash {
     /// Domain tag for block digests.
     pub const DOMAIN_BLOCK: &'static [u8] = b"KVNC-BLOCK-v1";
     /// Domain tag for transactions.
-    pub const DOMAIN_TX: &'static [u8] = b"KVNC-TX-v1";
+    pub const DOMAIN_TX: &'static [u8] = b"KUNA-TX-v1";
     /// Domain tag for digest/merkle pairing.
     pub const DOMAIN_DIGEST: &'static [u8] = b"KVNC-DIGEST-v1";
     /// Domain tag for merkle tree pairing.
