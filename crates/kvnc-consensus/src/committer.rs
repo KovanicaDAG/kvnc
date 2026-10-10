@@ -428,6 +428,10 @@ impl UniversalCommitter {
                 let mut decided_leader = leader_info.clone();
                 decided_leader.status = LeaderStatus::Skip;
                 self.mark_decided(round, decided_leader);
+                info!(
+                    "Leader round {} skipped indirectly (no own quorum, later leader round {} committed)",
+                    round, commit_round
+                );
             }
         }
     }
