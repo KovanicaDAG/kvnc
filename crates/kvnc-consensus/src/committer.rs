@@ -6,7 +6,7 @@
 
 use crate::engine::{DagStoreTrait, VoteRejection};
 use crate::ghostdag_scoped::ColouringResult;
-use crate::metrics::{record_pruned_blocks, record_pruned_waves};
+use crate::metrics::record_pruned_waves;
 use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
 use crate::types::{CommitResult, CommitteeInfo, LeaderInfo, LeaderStatus};
 use kvnc_types::{block::StatementBlock, hash::Hash, AuthorityIndex, CommittedSubDag, Round};
@@ -428,6 +428,10 @@ impl UniversalCommitter {
                 let mut decided_leader = leader_info.clone();
                 decided_leader.status = LeaderStatus::Skip;
                 self.mark_decided(round, decided_leader);
+                info!(
+                    "Leader round {} skipped indirectly (no own quorum, later leader round {} committed)",
+                    round, commit_round
+                );
             }
         }
     }
@@ -598,30 +602,13 @@ impl UniversalCommitter {
         // Pruning after successful commit
         let leader_wave = subdag.leader_round / kvnc_types::WAVE_LENGTH;
 
-        // Prune non-blue blocks from the committed wave (only for MysticGhost).
-        //
-        // The blue set is the one produced while building the committed
-        // sub-DAG: never recompute it here, so pruning can never diverge from
-        // the colouring that produced the committed sub-DAG (and, in
-        // particular, can never prune the just-committed leader).
+        // #13 (variant A): red mergeset blocks are NOT pruned here any more.
+        // They are reported in `subdag.non_blue` (their transactions go back
+        // to the mempool via `non_blue_transactions`) and are removed only by
+        // the round-based pruning below.
         if self.use_mysticghost {
             if let Some(c) = colouring.as_ref() {
-                if !c.blue.is_empty() {
-                    crate::metrics::record_mergeset_size(c.blue.len());
-                    let blue_hashes: Vec<Hash> = c.blue.clone();
-                    match dag_store.prune_non_blue(&blue_hashes, leader_wave) {
-                        Ok(pruned) => {
-                            info!(
-                                "Pruned {} non-blue blocks from wave {}",
-                                pruned, leader_wave
-                            );
-                            record_pruned_blocks(pruned);
-                        }
-                        Err(e) => {
-                            warn!("Failed to prune non-blue blocks: {}", e);
-                        }
-                    }
-                }
+                crate::metrics::record_mergeset_size(c.blue.len());
             }
         }
 
@@ -720,6 +707,13 @@ impl UniversalCommitter {
                 // Use the blue-set order from GHOSTDAG
                 let blue_ordered = colouring.blue_ordered();
 
+                // Red mergeset blocks: reported, never executed as blocks.
+                let non_blue = crate::non_blue::non_blue_refs(
+                    &mergeset_blocks,
+                    &colouring.blue,
+                    &leader_block.digest,
+                );
+
                 // Build blocks in blue order, filtering to only those in mergeset
                 let block_map: std::collections::HashMap<Hash, StatementBlock> =
                     mergeset_blocks.into_iter().map(|b| (b.digest, b)).collect();
@@ -745,6 +739,7 @@ impl UniversalCommitter {
                         leader: leader_block.clone(),
                         leader_round,
                         leader_author: leader_block.author,
+                        non_blue,
                     },
                     Some(colouring),
                 ))
@@ -1036,7 +1031,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn mysticghost_build_returns_colouring_with_leader_blue_and_prunes_it() {
+    fn mysticghost_build_returns_colouring_with_leader_blue_and_does_not_prune() {
         let genesis = make_block(0, 0, vec![], "genesis");
         let leader_block = make_block(0, 3, vec![block_ref(&genesis)], "leader-3");
         let mut dag = RecordingDag::default();
@@ -1073,13 +1068,12 @@ mod tests {
             .expect("quorum + present leader commits");
         assert_eq!(committed.leader_round, 3);
 
-        let calls = dag.prune_calls();
-        assert_eq!(calls.len(), 1, "prune_non_blue called exactly once");
+        // #13 variant A: red blocks are reported in `non_blue`, never pruned
+        // by the committer (only round pruning removes them).
         assert!(
-            calls[0].0.contains(&leader_block.digest),
-            "leader digest present in the blue set handed to prune_non_blue"
+            dag.prune_calls().is_empty(),
+            "mysticghost path must no longer call prune_non_blue"
         );
-        assert_eq!(calls[0].1, 1, "committed wave for round 3 is wave 1");
     }
 
     #[test]

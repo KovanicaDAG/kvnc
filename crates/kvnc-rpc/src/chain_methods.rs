@@ -290,6 +290,12 @@ pub async fn handle_send_raw_transaction(
         .mempool
         .add_transaction(tx)
         .map_err(|e| RpcError::ExecutionError(e.to_string()))?;
+    // Only transactions the mempool accepted reach this point; publish them
+    // on gossip so other validators can include them. A closed channel
+    // (node shutting down) is not an RPC error: the tx is already pooled.
+    if let Some(gossip) = &state.tx_gossip {
+        let _ = gossip.send(event_tx.clone());
+    }
     state.events.publish_pending_transaction(&event_tx);
 
     Ok(json!(to_hex(&hash.0)))
@@ -633,6 +639,7 @@ mod tests {
                 crate::RateLimitConfig::default(),
             )),
             auth_config: Arc::new(crate::AuthConfig::default()),
+            tx_gossip: None,
         }
     }
 
@@ -846,6 +853,79 @@ mod tests {
             handle_estimate_fee(Value::Null, state).await.unwrap(),
             json!("0x1"),
             "the minimum observed zero rate is advisory and floored at 1 atom/byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_gossips_only_accepted_transactions() {
+        use kvnc_storage::state_store::Account;
+        use kvnc_types::crypto::Signature;
+
+        let (_dir, storage) = open_storage();
+        let mut state = test_state(storage.clone());
+        let (gossip_tx, mut gossip_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.tx_gossip = Some(gossip_tx);
+
+        let (sk, pk) = kvnc_crypto::generate_keypair();
+        let sender = Address::from_public_key(&pk);
+        let txn = storage.begin_write().unwrap();
+        {
+            let account = Account {
+                balance: 1_000_000,
+                nonce: 0,
+                code_hash: [0; 32],
+                code: Vec::new(),
+            };
+            storage
+                .state()
+                .set_account(&txn, &sender, &account)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Transfer {
+                to: Address([3u8; 32]),
+                amount: 1,
+            },
+            fee: 10_000,
+            signature: Signature([0; 64]),
+            hash: Hash::zero(),
+        };
+        let signing_hash = tx.signing_hash(&state.mempool.signing_context());
+        tx.signature = kvnc_crypto::sign(&sk, signing_hash.as_ref());
+        tx.hash = signing_hash;
+        let raw = |tx: &Transaction| json!([to_hex(&bincode::serialize(tx).unwrap())]);
+
+        // Rejected (bad signature): error, nothing gossiped.
+        let mut forged = tx.clone();
+        forged.signature = Signature([1; 64]);
+        assert!(handle_send_raw_transaction(raw(&forged), state.clone())
+            .await
+            .is_err());
+        assert!(
+            gossip_rx.try_recv().is_err(),
+            "rejected tx must not be gossiped"
+        );
+
+        // Accepted: gossiped exactly once.
+        handle_send_raw_transaction(raw(&tx), state.clone())
+            .await
+            .expect("valid tx is accepted");
+        assert_eq!(
+            gossip_rx.try_recv().expect("accepted tx gossiped").hash,
+            tx.hash
+        );
+
+        // Duplicate: mempool rejects (AlreadyExists), no second gossip.
+        assert!(handle_send_raw_transaction(raw(&tx), state.clone())
+            .await
+            .is_err());
+        assert!(
+            gossip_rx.try_recv().is_err(),
+            "duplicate must not be re-gossiped"
         );
     }
 }

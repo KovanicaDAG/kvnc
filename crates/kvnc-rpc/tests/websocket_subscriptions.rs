@@ -53,6 +53,7 @@ fn test_state(storage: Arc<Storage>, events: EventBus) -> RpcState {
         events,
         rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
         auth_config: Arc::new(AuthConfig::default()),
+        tx_gossip: None,
     }
 }
 
@@ -219,6 +220,7 @@ async fn websocket_receives_committed_leader_notification() {
         leader,
         leader_round: 4,
         leader_author: 0,
+        non_blue: Vec::new(),
     };
     events.publish_committed_leader(&subdag);
 

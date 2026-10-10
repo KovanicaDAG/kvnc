@@ -47,6 +47,9 @@ pub struct NodeConfig {
     /// `genesis_validators.toml` must declare `chain_id` explicitly; for
     /// devnet and local it is optional. Overridable with `KVNC_CHAIN_ID`.
     pub chain_id: u64,
+    /// Gossipsub peer scoring (`[peer_scoring]` table). Defaults are safe for
+    /// a small validator network; see `kvnc_network::PeerScoringConfig`.
+    pub peer_scoring: kvnc_network::PeerScoringConfig,
 }
 
 impl Default for NodeConfig {
@@ -68,6 +71,7 @@ impl Default for NodeConfig {
             use_mysticghost: false,
             run_validator: true,
             rpc_rate_limit_per_min: 60,
+            peer_scoring: kvnc_network::PeerScoringConfig::default(),
             chain_id: kvnc_types::signing::chain_id::LOCAL,
         }
     }
@@ -196,6 +200,9 @@ impl NodeConfig {
         if self.max_peers == 0 {
             anyhow::bail!("max_peers must be greater than 0");
         }
+        self.peer_scoring
+            .validate()
+            .map_err(|e| anyhow::anyhow!("peer_scoring: {e}"))?;
         if !kvnc_types::signing::chain_id::is_registered(self.chain_id) {
             anyhow::bail!(
                 "chain_id {} is not registered (expected 1 mainnet, 2 testnet, 3 devnet or 1337 local)",
@@ -365,5 +372,23 @@ treasury_address = "treasury-address-placeholder"
             };
             assert!(c.validate().is_err(), "chain id {id} must be rejected");
         }
+    }
+
+    #[test]
+    fn peer_scoring_section_overrides_defaults_and_is_validated() {
+        let config: NodeConfig =
+            toml::from_str("run_validator = false\n[peer_scoring]\nban_threshold = -500.0\ngraylist_threshold = -200.0\n")
+                .expect("parse");
+        assert!(config.peer_scoring.enabled);
+        assert_eq!(config.peer_scoring.ban_threshold, -500.0);
+        assert_eq!(config.peer_scoring.graylist_threshold, -200.0);
+        assert_eq!(config.peer_scoring.gossip_threshold, -10.0);
+        config.validate().expect("valid");
+
+        let bad: NodeConfig =
+            toml::from_str("run_validator = false\n[peer_scoring]\nban_threshold = 5.0\n")
+                .expect("parse");
+        let err = bad.validate().expect_err("positive ban threshold");
+        assert!(err.to_string().contains("peer_scoring"), "{err}");
     }
 }

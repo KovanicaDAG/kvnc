@@ -1066,6 +1066,7 @@ mod tests {
             leader,
             leader_round: round,
             leader_author: author,
+            non_blue: Vec::new(),
         }
     }
 
@@ -1200,6 +1201,7 @@ mod tests {
             blocks: vec![sample_block(0)],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
 
         let first = ctx
@@ -1250,6 +1252,7 @@ mod tests {
             blocks: vec![sample_block(7)],
             leader_round: 2,
             leader_author: 7,
+            non_blue: Vec::new(),
         };
         let err = ctx
             .execute_committed_subdag(&bad, &storage)
@@ -1623,6 +1626,7 @@ mod tests {
             blocks: vec![sample_block_with_txs(0, vec![tx.clone()])],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
 
         let result = ctx
@@ -1693,6 +1697,7 @@ mod tests {
             blocks: vec![sample_block_with_txs(0, vec![tx.clone()])],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
 
         let result = ctx
@@ -1760,6 +1765,7 @@ mod tests {
             blocks: vec![sample_block_with_txs(0, vec![tx])],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
         ctx.execute_committed_subdag(&subdag, storage)
             .expect("execute")
@@ -1923,6 +1929,7 @@ mod tests {
             blocks: vec![sample_block_with_txs(0, txs)],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
         let result = ctx
             .execute_committed_subdag(&subdag, &storage)
@@ -1960,6 +1967,7 @@ mod tests {
             blocks: vec![sample_block_with_txs(0, vec![tx])],
             leader_round: 1,
             leader_author: 0,
+            non_blue: Vec::new(),
         };
         ctx.execute_committed_subdag_with_commit(&subdag, &storage, |_| {
             Err(ExecutionError::Other("injected commit failure".into()))
@@ -1989,6 +1997,7 @@ mod tests {
                 blocks: vec![sample_block_with_txs(0, txs)],
                 leader_round: 1,
                 leader_author: 0,
+                non_blue: Vec::new(),
             };
             let r = ctx
                 .execute_committed_subdag(&subdag, &storage)
@@ -2215,6 +2224,7 @@ mod tests {
                 blocks: vec![sample_block_with_txs(0, txs)],
                 leader_round: 1,
                 leader_author: 0,
+                non_blue: Vec::new(),
             };
             let r = ctx
                 .execute_committed_subdag(&subdag, &storage)
@@ -2274,6 +2284,7 @@ mod tests {
                     blocks: vec![sample_block_with_txs(0, txs)],
                     leader_round: 1,
                     leader_author: 0,
+                    non_blue: Vec::new(),
                 };
                 let r = ctx
                     .execute_committed_subdag(&subdag, &storage)
@@ -2304,6 +2315,7 @@ mod tests {
             leader,
             leader_round: round,
             leader_author: 0,
+            non_blue: Vec::new(),
         }
     }
 

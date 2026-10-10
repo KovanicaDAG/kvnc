@@ -3,8 +3,8 @@
 
 #![deny(unsafe_code)]
 
-use ed25519_dalek::{verify_batch as dalek_verify_batch, Signature as DalekSignature};
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::Signature as DalekSignature;
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use kvnc_types::crypto::{PublicKey, Signature};
 use kvnc_types::hash::Hash;
 use kvnc_types::SigningContext;
@@ -57,7 +57,10 @@ pub fn sign(signing_key: &SigningKey, message: &[u8]) -> Signature {
     Signature::from(sig)
 }
 
-/// Verify a signature.
+/// Verify a signature with Ed25519 **strict** verification
+/// (`VerifyingKey::verify_strict`): rejects small-order / weak public keys,
+/// non-canonical `R`/`A` encodings and non-canonical `S`. Signatures produced
+/// by [`sign`] always pass.
 pub fn verify(
     public_key: &PublicKey,
     message: &[u8],
@@ -65,7 +68,7 @@ pub fn verify(
 ) -> Result<(), CryptoError> {
     let vk = VerifyingKey::from_bytes(&public_key.0).map_err(|_| CryptoError::InvalidPublicKey)?;
     let sig = ed25519_dalek::Signature::from_bytes(&signature.0);
-    vk.verify(message, &sig)
+    vk.verify_strict(message, &sig)
         .map_err(|_| CryptoError::VerificationFailed)
 }
 
@@ -117,51 +120,25 @@ pub fn verify_vote_signature(
         .map_err(|_| SigError::VerificationFailed)
 }
 
-/// Batch verify block signatures, grouped by round (wave).
-/// Uses ed25519_dalek::verify_batch. Falls back to individual verify if batch fails.
-/// Deterministic — same input always yields same result.
+/// Verify a set of block signatures.
+///
+/// The only decisive check is per-item Ed25519 `verify_strict` (see
+/// `docs/BLOCK_SIGNATURE_V2.md`, "Strogo svugdje"). `ed25519_dalek::verify_batch`
+/// uses the cofactored equation and accepts signatures that `verify_strict`
+/// rejects (vectors N1, N3), so it is never used to accept. The result is
+/// always identical to `all(verify_strict(item))`. Blocks are processed in
+/// deterministic round order.
 ///
 /// Returns `Ok(true)` iff every signature is valid; an invalid signature is a
-/// hard error (`CryptoError::VerificationFailed`) so callers using `?`/`Err`
-/// matching reject the block.
+/// hard error (`CryptoError::VerificationFailed`).
 pub fn verify_batch(blocks: &[kvnc_types::block::StatementBlock]) -> Result<bool, CryptoError> {
-    use std::collections::BTreeMap;
-
-    if blocks.is_empty() {
-        return Ok(true);
-    }
-
-    // Group by round / wave for deterministic ordering.
-    let mut groups: BTreeMap<u64, Vec<&kvnc_types::block::StatementBlock>> = BTreeMap::new();
-    for b in blocks {
-        groups.entry(b.round).or_default().push(b);
-    }
-
-    for (_round, group) in groups {
-        let signatures: Vec<DalekSignature> = group
-            .iter()
-            .map(|b| DalekSignature::from_bytes(&b.signature.0))
-            .collect();
-        let verifying_keys: Vec<VerifyingKey> = group
-            .iter()
-            .map(|b| get_validator_key(b.author).ok_or(CryptoError::InvalidPublicKey))
-            .collect::<Result<Vec<_>, _>>()?;
-        let msg_refs: Vec<&[u8]> = group.iter().map(|b| b.digest.as_ref()).collect();
-        // Borrow signatures as slices for batch call; owned sigs kept for fallback.
-        let batch_result = dalek_verify_batch(&msg_refs, &signatures, &verifying_keys);
-
-        if batch_result.is_ok() {
-            continue;
-        }
-
-        // Fallback to single verification.
-        for b in group {
-            let vk = get_validator_key(b.author).ok_or(CryptoError::InvalidPublicKey)?;
-            let sig = DalekSignature::from_bytes(&b.signature.0);
-            if vk.verify(b.digest.as_ref(), &sig).is_err() {
-                return Err(CryptoError::VerificationFailed);
-            }
-        }
+    let mut ordered: Vec<&kvnc_types::block::StatementBlock> = blocks.iter().collect();
+    ordered.sort_by_key(|b| b.round);
+    for b in ordered {
+        let vk = get_validator_key(b.author).ok_or(CryptoError::InvalidPublicKey)?;
+        let sig = DalekSignature::from_bytes(&b.signature.0);
+        vk.verify_strict(b.digest.as_ref(), &sig)
+            .map_err(|_| CryptoError::VerificationFailed)?;
     }
     Ok(true)
 }

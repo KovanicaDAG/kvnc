@@ -108,6 +108,11 @@ pub trait DagStoreTrait: Send + Sync {
     /// Get all decided rounds up to a maximum.
     fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, kvnc_dag::DagStoreError>;
     /// Prune non-blue blocks from a committed wave.
+    ///
+    /// Deprecated (#13, variant A): the committer no longer calls this. Red
+    /// blocks are reported in `CommittedSubDag::non_blue` and removed only by
+    /// round pruning (`prune_waves_before`). Kept for compatibility; do not
+    /// add new callers.
     fn prune_non_blue(
         &self,
         blue_hashes: &[Hash],
@@ -222,6 +227,10 @@ where
     signing_ctx: kvnc_types::SigningContext,
     /// Timeout deadline for the current leader slot (round, instant).
     leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
+    /// Leader rounds this node has already cast its vote for. Shared by the
+    /// round-loop vote and the late vote from `process_block`, so a vote is
+    /// cast exactly once per leader round whichever path gets there first.
+    voted_rounds: Mutex<std::collections::BTreeSet<Round>>,
 }
 
 impl<D, B> ConsensusEngine<D, B>
@@ -286,6 +295,7 @@ where
             commit_trigger_lock: Mutex::new(()),
             mempool,
             leader_deadline: RwLock::new(None),
+            voted_rounds: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -487,37 +497,46 @@ where
     /// Produce a vote for the leader of the previous leader round.
     /// Called during vote rounds (offset 1).
     async fn produce_vote(&self, vote_round: Round) -> Result<(), ConsensusError> {
-        // The leader round is the previous leader round (vote_round - 1)
-        let leader_round = vote_round - 1;
+        self.vote_for_leader(vote_round - 1)?;
+        Ok(())
+    }
 
-        // Get the leader for that round
-        let Some(leader_author) = self.scheduled_leader_for_round(leader_round) else {
+    /// Cast this node's vote for the leader block of `leader_round`, at most
+    /// once per round.
+    ///
+    /// Called from the round loop at the vote round and again from
+    /// [`Self::process_block`] when the leader block arrives late (after the
+    /// vote round already passed). Returns `true` if a vote was cast now.
+    /// If the leader block is not known yet nothing is recorded, so a later
+    /// call can still vote.
+    fn vote_for_leader(&self, leader_round: Round) -> Result<bool, ConsensusError> {
+        if self.scheduled_leader_for_round(leader_round).is_none() {
             debug!("No leader scheduled for round {}", leader_round);
-            return Ok(());
-        };
+            return Ok(false);
+        }
 
-        // Get the leader block hash from the committer
         let Some(leader_info) = self.committer.get_leader(leader_round) else {
             debug!("No leader info for round {}", leader_round);
-            return Ok(());
+            return Ok(false);
         };
 
         let Some(leader_hash) = leader_info.block_hash else {
             debug!("Leader block for round {} not yet known", leader_round);
-            return Ok(());
+            return Ok(false);
         };
 
-        // Check if we already voted for this leader
-        if leader_info
-            .votes
-            .contains_key(&self.state.read().our_authority)
+        let our_authority = self.state.read().our_authority;
         {
-            debug!("Already voted for leader round {}", leader_round);
-            return Ok(());
+            // Check-and-mark under one lock: exactly one caller wins.
+            let mut voted = self.voted_rounds.lock();
+            if voted.contains(&leader_round) || leader_info.votes.contains_key(&our_authority) {
+                debug!("Already voted for leader round {}", leader_round);
+                return Ok(false);
+            }
+            voted.insert(leader_round);
         }
 
         // Create and sign the vote
-        let our_authority = self.state.read().our_authority;
         let mut vote = kvnc_types::Vote {
             leader_round,
             leader_hash,
@@ -545,6 +564,19 @@ where
         // Try to commit after voting
         self.try_commit_and_deliver()?;
 
+        Ok(true)
+    }
+
+    /// Late vote: the leader block of `round` arrived after our vote round
+    /// (`round + 1`) already passed, so the round loop could not vote for it.
+    fn vote_if_late(&self, round: Round) -> Result<(), ConsensusError> {
+        if *self.current_round.read() > round && self.vote_for_leader(round)? {
+            info!(
+                "Late vote for leader round {} (current round {})",
+                round,
+                *self.current_round.read()
+            );
+        }
         Ok(())
     }
 
@@ -592,6 +624,7 @@ where
                     }
                 }
                 self.try_commit_and_deliver()?;
+                self.vote_if_late(block.round)?;
                 return Ok(());
             }
         }
@@ -626,6 +659,10 @@ where
 
         // Try to commit after processing
         self.try_commit_and_deliver()?;
+
+        if self.scheduled_leader_for_round(block.round) == Some(block.author) {
+            self.vote_if_late(block.round)?;
+        }
 
         Ok(())
     }
@@ -712,6 +749,7 @@ where
         if current_round > max_pending {
             let cutoff = current_round - max_pending;
             self.committer.cleanup_old_leaders(cutoff);
+            self.voted_rounds.lock().retain(|&round| round >= cutoff);
         }
     }
 
@@ -1720,5 +1758,106 @@ mod tests {
     async fn sig_v1_own_vote_is_signed_with_committee_epoch() {
         let (engine, _key, _digest, _receiver) = engine_with_leader_at_epoch();
         assert_eq!(engine.vote_signing_ctx(), local_v1_ctx());
+    }
+
+    // CI run #118: early-start nodes are rounds ahead, so a slow node's
+    // leader block arrives after the fast node's vote round. The round loop
+    // votes only once, so the vote used to be dropped and the leader never
+    // reached quorum. The late vote must be cast (exactly once) on arrival.
+    #[test]
+    fn late_leader_block_gets_exactly_one_late_vote_and_commits() {
+        let (key, public_key) = kvnc_crypto::generate_keypair();
+        let others: Vec<_> = (1..4).map(|_| kvnc_crypto::generate_keypair()).collect();
+        let mut authorities = vec![AuthorityInfo {
+            index: 0,
+            stake: 1,
+            public_key,
+            address: Address::default(),
+            network_address: String::new(),
+        }];
+        for (i, (_, pk)) in others.iter().enumerate() {
+            authorities.push(AuthorityInfo {
+                index: (i + 1) as AuthorityIndex,
+                stake: 1,
+                public_key: *pk,
+                address: Address::default(),
+                network_address: String::new(),
+            });
+        }
+        let committee = CommitteeInfo::try_new(0, authorities).expect("committee");
+        let dag = Arc::new(TestDag::default());
+        let manager = Arc::new(RwLock::new(TestBlockManager {
+            dag: dag.clone(),
+            key: RwLock::new(key.clone()),
+            set_key_calls: AtomicUsize::new(0),
+        }));
+        let engine = ConsensusEngine::new(
+            ConsensusConfig::default(),
+            committee.clone(),
+            dag,
+            manager,
+            key.clone(),
+            None,
+            TEST_CTX,
+        );
+        let sent: Arc<Mutex<Vec<Round>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        engine.set_vote_broadcaster(Arc::new(move |v: &kvnc_types::Vote| {
+            sink.lock().push(v.leader_round)
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        engine.set_commit_sender(tx);
+
+        // Leader rounds 3, 6, 9 belong to authorities 3, 2, 1; we are 0.
+        for leader_round in [3u64, 6, 9] {
+            let author = committee.leader(leader_round);
+            assert_ne!(author, 0);
+            // The round loop ran its vote round with the leader still unknown.
+            *engine.current_round.write() = leader_round + 1;
+            assert!(!engine.vote_for_leader(leader_round).unwrap());
+            // We are now 3 rounds past the leader round when it arrives.
+            *engine.current_round.write() = leader_round + 3;
+
+            let digest = kvnc_types::StatementBlock::compute_digest(author, leader_round, &[], &[]);
+            let block = kvnc_types::StatementBlock {
+                author,
+                round: leader_round,
+                parents: Vec::new(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: kvnc_crypto::sign(&key, digest.as_ref()),
+                digest,
+                merkle_root: Default::default(),
+            };
+            engine.process_block(&block).expect("late leader block");
+            // Duplicate delivery and the round-loop path must not re-vote.
+            engine.process_block(&block).expect("duplicate block");
+            assert_eq!(
+                sent.lock().last().copied(),
+                Some(leader_round),
+                "late vote must be sent when the leader block arrives"
+            );
+            assert!(!engine.vote_for_leader(leader_round).unwrap());
+
+            // Two other validators' votes: with ours that is 3/4 = quorum.
+            let voters = [1u16, 2, 3]
+                .into_iter()
+                .filter(|v| *v != author)
+                .take(1)
+                .chain(std::iter::once(author));
+            for voter in voters {
+                let vkey = &others[(voter - 1) as usize].0;
+                engine
+                    .process_vote(&signed_vote(vkey, leader_round, voter, digest))
+                    .expect("valid vote");
+            }
+            let committed = rx.try_recv().expect("late leader must commit");
+            assert_eq!(committed.leader_round, leader_round);
+        }
+        assert_eq!(
+            *sent.lock(),
+            vec![3, 6, 9],
+            "exactly one (late) vote per leader round"
+        );
     }
 }

@@ -137,6 +137,7 @@ impl Linearizer {
             blocks: result_blocks,
             leader_round,
             leader_author,
+            non_blue: Vec::new(),
         }
     }
 }
