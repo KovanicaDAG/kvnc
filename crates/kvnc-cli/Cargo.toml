@@ -3,10 +3,11 @@ name = "kvnc-cli"
 version = "0.0.31"
 edition.workspace = true
 license.workspace = true
+autoexamples = false
 
 [lib]
 name = "kvnc_cli"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "kvnc"
