@@ -32,6 +32,7 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 use config::NodeConfig;
 
@@ -46,7 +47,9 @@ use kvnc_network::{
     BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
     StateSyncResponse,
 };
-use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
+use kvnc_rpc::{
+    AuthConfig, EventBus, NodeHealth, RateLimitConfig, RateLimiterState, RpcServer, RpcState,
+};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -387,6 +390,8 @@ async fn run_node<F>(config: NodeConfig, shutdown: F) -> Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    config.validate()?;
+
     // ------------------------------------------------------------------
     // 1. Data directory + storage
     // ------------------------------------------------------------------
@@ -413,7 +418,8 @@ where
         MempoolConfig::default(),
         state_storage.clone(),
     ));
-    let (signing_key, public_key) = load_validator_key(config.validator_key.as_deref());
+    let (signing_key, public_key) =
+        load_validator_key(config.validator_key.as_deref(), config.run_validator)?;
     let validator_address = Address::from_public_key(&public_key);
     info!(validator = %validator_address, "validator identity ready");
 
@@ -479,6 +485,8 @@ where
     // loop so broadcast commands never re-enter `start` or rebuild listeners.
     // Votes and blocks are authenticated against the committee at the network
     // edge before they are forwarded or handed to consensus.
+    // Vote signatures are checked through the injected VoteVerifier.
+    network.set_vote_verifier(Arc::new(kvnc_network::Ed25519VoteVerifier));
     network.set_authority_keys(
         committee
             .authorities()
@@ -505,7 +513,11 @@ where
     let events = EventBus::new();
     let rate_limit_config =
         RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    // Liveness of the execution worker and consensus engine, surfaced on /health.
+    let node_health = NodeHealth::new();
+    let auth_config = rpc_auth_config_from_env();
     let rpc_state = RpcState {
+        health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
         mempool: mempool.clone(),
@@ -514,31 +526,13 @@ where
         peer_count: peer_count_for_rpc,
         events: events.clone(),
         rate_limiter: Arc::new(RateLimiterState::new(rate_limit_config.clone())),
-        auth_config: Arc::new(
-            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-                AuthConfig {
-                    write_tokens: vec!["test".to_string()],
-                    require_auth_for_writes: false,
-                }
-            } else {
-                AuthConfig::default()
-            },
-        ),
+        auth_config: Arc::new(auth_config.clone()),
     };
     let rpc_server = RpcServer::new(
         rpc_socket,
         rpc_state,
         Some(rate_limit_config),
-        Some(
-            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-                AuthConfig {
-                    write_tokens: vec!["test".to_string()],
-                    require_auth_for_writes: false,
-                }
-            } else {
-                AuthConfig::default()
-            },
-        ),
+        Some(auth_config),
     )
     .await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
@@ -651,12 +645,19 @@ where
         events.clone(),
         Some(mempool.clone()),
         shutdown_rx.clone(),
+        node_health.clone(),
     ));
 
     let engine_for_task = engine.clone();
+    let engine_health = node_health.clone();
     let engine_task = tokio::spawn(async move {
-        if let Err(e) = engine_for_task.start().await {
-            error!(error = %e, "consensus engine stopped with an error");
+        engine_health.consensus_running();
+        match engine_for_task.start().await {
+            Ok(()) => engine_health.consensus_stopped(),
+            Err(e) => {
+                error!(error = %e, "consensus engine stopped with an error");
+                engine_health.consensus_failed(&e.to_string());
+            }
         }
     });
 
@@ -718,6 +719,38 @@ where
     // left to flush: dropping the handles closes the databases.
     info!("KVNC node stopped cleanly");
     Ok(())
+}
+
+/// RPC write authorisation from the environment.
+///
+/// * `KVNC_RPC_AUTH=disable` turns write authorisation off (tests, trusted
+///   local tooling).
+/// * `KVNC_RPC_WRITE_TOKENS=tok1,tok2` sets the accepted bearer tokens.
+///
+/// Without either, write methods (including `kvnc_sendRawTransaction`, see
+/// `docs/SECURITY.md`) are rejected: there is no token that could match.
+fn rpc_auth_config_from_env() -> AuthConfig {
+    let disabled = std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable");
+    let tokens = std::env::var("KVNC_RPC_WRITE_TOKENS").unwrap_or_default();
+    rpc_auth_config(disabled, &tokens)
+}
+
+fn rpc_auth_config(disabled: bool, tokens: &str) -> AuthConfig {
+    let write_tokens: Vec<String> = tokens
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if disabled {
+        warn!("KVNC_RPC_AUTH=disable: RPC write methods accept unauthenticated calls");
+    } else if write_tokens.is_empty() {
+        warn!("no KVNC_RPC_WRITE_TOKENS configured: RPC write methods are rejected");
+    }
+    AuthConfig {
+        write_tokens,
+        require_auth_for_writes: !disabled,
+    }
 }
 
 /// Initialise genesis state if the database is fresh.
@@ -965,8 +998,17 @@ fn handle_network_event(
         }
         NetworkEvent::VoteReceived { peer, vote } => {
             debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "processing received vote");
-            if let Err(e) = engine.process_vote(vote.leader_round, vote.voter, vote.leader_hash) {
-                warn!(%peer, %e, "failed to process received vote");
+            // `process_vote` authenticates the vote against the committee key.
+            match engine.process_vote(&vote) {
+                Ok(()) => {}
+                Err(kvnc_consensus::ConsensusError::VoteRejected(
+                    reason @ (kvnc_consensus::VoteRejection::Duplicate { .. }
+                    | kvnc_consensus::VoteRejection::UnknownLeaderRound(_)),
+                )) => {
+                    // Expected under gossip (re-delivery, vote before block).
+                    debug!(%peer, %reason, "ignored received vote");
+                }
+                Err(e) => warn!(%peer, %e, "rejected received vote"),
             }
         }
         NetworkEvent::PeerConnected(peer) => info!(%peer, "peer connected"),
@@ -1046,6 +1088,7 @@ async fn run_execution(
     events: EventBus,
     mempool: Option<Arc<Mempool>>,
     mut shutdown: watch::Receiver<bool>,
+    health: NodeHealth,
 ) {
     let mut ctx = ExecutionContext::new();
     ctx.log_publisher = Some(Box::new(EventLogPublisher(events.clone())));
@@ -1077,6 +1120,7 @@ async fn run_execution(
                             debug!(removed, "pruned committed transactions from mempool");
                         }
                         events.publish_committed_leader(&subdag);
+                        health.execution_progress(subdag.leader_round);
                     }
                     Err(e) => {
                         error!(
@@ -1084,10 +1128,14 @@ async fn run_execution(
                             round = subdag.leader_round,
                             "execution failed; stopping worker so committed decisions replay after restart"
                         );
+                        health.execution_failed(&format!("round {}: {e}", subdag.leader_round));
                         break;
                     }
                 },
-                None => break,
+                None => {
+                    warn!("committed sub-DAG channel closed; execution worker stopping");
+                    break;
+                }
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1096,6 +1144,7 @@ async fn run_execution(
             }
         }
     }
+    health.execution_stopped();
 }
 
 /// Adapter implementing [`DagStoreTrait`] over the concrete [`DagStore`].
@@ -1150,6 +1199,15 @@ impl DagStoreTrait for NodeDagStore {
 
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         self.inner.mark_round_decided(round, leader_hash)
+    }
+
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.inner
+            .mark_decided_and_commit_leader(round, leader_hash)
     }
 
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
@@ -1291,11 +1349,12 @@ fn recover_committed_subdags(
                 subdags.push(subdag);
             } else {
                 // Original linearizer path (bit-identical to current behaviour)
-                let history = dag_store
-                    .get_ancestors(&leader_hash, 0)?
-                    .into_iter()
-                    .map(|hash| dag_store.get_block(&hash))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // Same not-yet-committed history as the live committer, so
+                // replay never re-delivers a block from an earlier commit.
+                let node_store = NodeDagStore {
+                    inner: Arc::new(dag_store.clone()),
+                };
+                let history = kvnc_consensus::uncommitted_history(&node_store, &leader)?;
                 subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
             }
         }
@@ -1483,6 +1542,7 @@ fn build_network_config(config: &NodeConfig) -> Result<NetworkConfig> {
         bootstrap_nodes,
         max_peers: config.max_peers,
         ping_interval: Duration::from_secs(10),
+        node_key_path: Some(config.data_dir.join(NODE_IDENTITY_FILE)),
     })
 }
 
@@ -1541,42 +1601,59 @@ fn to_multiaddr(value: &str) -> Result<Multiaddr> {
         .with_context(|| format!("invalid address `{value}`"))
 }
 
-/// Load a validator signing key from a hex-seed file, or generate an ephemeral
-/// key when none is configured.
-fn load_validator_key(path: Option<&str>) -> (SigningKey, PublicKey) {
-    if let Some(path) = path {
-        match read_signing_key(path) {
-            Ok(signing_key) => {
-                let public_key = PublicKey::from(signing_key.verifying_key());
-                info!(path, "loaded validator key");
-                return (signing_key, public_key);
-            }
-            Err(e) => warn!(
-                path,
-                error = %e,
-                "failed to load validator key; generating an ephemeral key"
-            ),
-        }
-    } else {
-        info!("no validator key configured; generating an ephemeral key");
-    }
+/// File name (inside `data_dir`) of the persistent libp2p node identity. This
+/// is a transport key, distinct from the validator signing key.
+const NODE_IDENTITY_FILE: &str = "p2p_node.key";
 
-    // TODO: support encrypted keystores / OS keychains instead of a raw hex
-    // seed file. Keys must never be logged or transmitted to peers.
-    kvnc_crypto::generate_keypair()
+/// Load the validator signing key.
+///
+/// A configured key that cannot be loaded is a hard error: the node never
+/// substitutes a different key, because signing with an unexpected identity
+/// is worse than not starting. Only a non-validator node with no key
+/// configured gets an ephemeral identity (it never signs consensus messages).
+///
+/// TODO(remote signer): the seed should live in an external signer; the
+/// `Signer` abstraction is owned by consensus. Until then the seed file must
+/// be `0600` and is zeroized after parsing.
+fn load_validator_key(path: Option<&str>, run_validator: bool) -> Result<(SigningKey, PublicKey)> {
+    match path {
+        Some(path) => {
+            let signing_key = read_signing_key(path).with_context(|| {
+                format!("failed to load validator key from {path}; refusing to start with a substitute key")
+            })?;
+            let public_key = PublicKey::from(signing_key.verifying_key());
+            info!(path, "loaded validator key");
+            Ok((signing_key, public_key))
+        }
+        None if run_validator => anyhow::bail!(
+            "run_validator=true but no validator key is configured (set validator_key or KVNC_VALIDATOR_KEY)"
+        ),
+        None => {
+            info!("run_validator=false and no validator key configured; using an ephemeral non-signing identity");
+            Ok(kvnc_crypto::generate_keypair())
+        }
+    }
 }
 
 /// Read a 32-byte hex seed from `path` and build a signing key.
+///
+/// The file must not be accessible by group or others (unix). Intermediate
+/// buffers holding the seed are zeroized.
 fn read_signing_key(path: &str) -> Result<SigningKey> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading key file {path}"))?;
-    let bytes = hex::decode(raw.trim()).with_context(|| "key file must contain hex")?;
+    kvnc_network::identity::check_key_file_permissions(std::path::Path::new(path))?;
+    let raw = Zeroizing::new(
+        std::fs::read_to_string(path).with_context(|| format!("reading key file {path}"))?,
+    );
+    let bytes = Zeroizing::new(
+        hex::decode(raw.trim()).map_err(|_| anyhow::anyhow!("key file must contain hex"))?,
+    );
     if bytes.len() != 32 {
         anyhow::bail!(
             "validator key must be a 32-byte hex seed, got {} bytes",
             bytes.len()
         );
     }
-    let mut seed = [0u8; 32];
+    let mut seed = Zeroizing::new([0u8; 32]);
     seed.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&seed))
 }
@@ -1600,12 +1677,98 @@ fn parse_address_hex(value: Option<&str>) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_auth_config_parses_tokens_and_disable_switch() {
+        let auth = rpc_auth_config(false, " a , ,b ");
+        assert_eq!(auth.write_tokens, vec!["a".to_string(), "b".to_string()]);
+        assert!(auth.require_auth_for_writes);
+        assert!(rpc_auth_config(false, "").write_tokens.is_empty());
+        assert!(!rpc_auth_config(true, "").require_auth_for_writes);
+    }
     use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC};
     use kvnc_storage::BincodeSerialize;
     use redb::{Database, TableDefinition};
     use std::collections::HashMap;
 
     const DAG_BLOCKS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("dag_blocks");
+
+    /// Write a hex seed file with the given unix mode and return its path.
+    fn write_seed_file(dir: &std::path::Path, seed: &[u8; 32], mode: u32) -> std::path::PathBuf {
+        let path = dir.join("validator.key");
+        std::fs::write(&path, hex::encode(seed)).expect("write seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod seed");
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        path
+    }
+
+    #[test]
+    fn validator_key_loads_from_private_seed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_seed_file(dir.path(), &[7u8; 32], 0o600);
+        let (sk, pk) = load_validator_key(path.to_str(), true).expect("loads");
+        assert_eq!(sk.to_bytes(), [7u8; 32]);
+        assert_eq!(pk, PublicKey::from(sk.verifying_key()));
+    }
+
+    #[test]
+    fn validator_key_failure_is_fatal_not_ephemeral() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.key");
+        // Configured but unreadable: error for validators and non-validators alike.
+        assert!(load_validator_key(missing.to_str(), true).is_err());
+        assert!(load_validator_key(missing.to_str(), false).is_err());
+
+        // Wrong length / not hex.
+        let short = write_seed_file(dir.path(), &[1u8; 32], 0o600);
+        std::fs::write(&short, "abcd").unwrap();
+        assert!(load_validator_key(short.to_str(), true).is_err());
+        std::fs::write(&short, "zz".repeat(32)).unwrap();
+        assert!(load_validator_key(short.to_str(), true).is_err());
+
+        // No key at all: only a non-validator may proceed.
+        assert!(load_validator_key(None, true).is_err());
+        assert!(load_validator_key(None, false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validator_key_with_loose_permissions_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o644, 0o640, 0o666] {
+            let path = write_seed_file(dir.path(), &[9u8; 32], mode);
+            let err = load_validator_key(path.to_str(), true).expect_err("must refuse");
+            assert!(format!("{err:#}").contains("chmod 600"), "{err:#}");
+        }
+        let path = write_seed_file(dir.path(), &[9u8; 32], 0o400);
+        load_validator_key(path.to_str(), true).expect("0400 is fine");
+    }
+
+    #[test]
+    fn network_config_uses_persistent_identity_in_data_dir() {
+        let config = NodeConfig {
+            data_dir: std::path::PathBuf::from("/var/lib/kvnc"),
+            listen_addr: "127.0.0.1:9000".into(),
+            bootnodes: Vec::new(),
+            ..Default::default()
+        };
+        let net = build_network_config(&config).unwrap();
+        assert_eq!(
+            net.node_key_path.as_deref(),
+            Some(std::path::Path::new("/var/lib/kvnc/p2p_node.key"))
+        );
+        assert_ne!(
+            net.node_key_path.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("validator.key")),
+            "transport identity must not reuse the validator seed file"
+        );
+    }
 
     #[test]
     fn host_port_converts_to_multiaddr() {
@@ -1655,6 +1818,54 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].leader.digest, digest);
         assert_eq!(recovered[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn committed_subdag_recovery_never_replays_a_block_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let mut parents = Vec::new();
+        let mut chain = Vec::new();
+        for round in 1..=5u64 {
+            let digest = StatementBlock::compute_digest(0, round, &parents, &[]);
+            let block = StatementBlock {
+                author: 0,
+                round,
+                parents: parents.clone(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: Signature([0; 64]),
+                digest,
+                merkle_root: Default::default(),
+            };
+            dag.put_block(&block).unwrap();
+            parents = vec![kvnc_types::block::BlockReference {
+                author: 0,
+                round,
+                digest,
+            }];
+            chain.push(block);
+        }
+        // Leaders committed at rounds 1, 3 and 5.
+        for i in [0usize, 2, 4] {
+            dag.mark_round_decided(chain[i].round, &chain[i].digest)
+                .unwrap();
+        }
+
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
+        assert_eq!(recovered.len(), 3);
+        let delivered: Vec<Hash> = recovered
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.digest))
+            .collect();
+        let unique: std::collections::HashSet<Hash> = delivered.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            delivered.len(),
+            "replayed twice: {delivered:?}"
+        );
+        assert_eq!(unique.len(), 5);
     }
 
     #[test]
@@ -1847,6 +2058,7 @@ mod tests {
             EventBus::new(),
             None,
             shutdown_rx,
+            NodeHealth::new(),
         ));
 
         let leader_round = 3;
@@ -1862,7 +2074,14 @@ mod tests {
             merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
-        engine.process_vote(leader_round, 0, digest).unwrap();
+        let mut vote = kvnc_types::Vote {
+            leader_round,
+            leader_hash: digest,
+            voter: 0,
+            signature: kvnc_types::Signature([0; 64]),
+        };
+        vote.signature = kvnc_crypto::sign(&signing_key, &vote.signature_data());
+        engine.process_vote(&vote).unwrap();
 
         let mut committed_height = 0;
         for _ in 0..100 {
@@ -1940,14 +2159,18 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = NodeHealth::new();
         run_execution(
             exec_rx,
             state_storage.clone(),
             EventBus::new(),
             None,
             shutdown_rx,
+            health.clone(),
         )
         .await;
+        assert_eq!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+        assert!(!health.is_healthy());
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();
@@ -1971,9 +2194,11 @@ mod tests {
     async fn node_starts_and_shuts_down() {
         let rpc_port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = write_seed_file(dir.path(), &[7u8; 32], 0o600);
 
         let config = NodeConfig {
             data_dir: dir.path().to_path_buf(),
+            validator_key: Some(key_path.to_string_lossy().into_owned()),
             listen_addr: "127.0.0.1:0".to_string(),
             rpc_addr: "127.0.0.1".to_string(),
             rpc_port,

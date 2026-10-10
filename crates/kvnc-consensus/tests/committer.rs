@@ -1414,3 +1414,51 @@ fn test_mysticghost_fallback_on_large_mergeset() {
         }
     }
 }
+
+/// Task #11: a committed batch contains only not-yet-committed blocks, so no
+/// block is delivered twice across several consecutive commits.
+#[test]
+fn test_no_block_delivered_twice_across_consecutive_commits() {
+    let g = genesis();
+    let b1 = make_block(0, 1, vec![block_ref(&g)], "b1");
+    let l3 = make_block(1, 3, vec![block_ref(&b1)], "l3");
+    let b4 = make_block(2, 4, vec![block_ref(&l3)], "b4");
+    let l6 = make_block(3, 6, vec![block_ref(&b4)], "l6");
+    let b7 = make_block(0, 7, vec![block_ref(&l6)], "b7");
+    let l9 = make_block(1, 9, vec![block_ref(&b7)], "l9");
+    let dag = MockDag::with_blocks([g.clone(), b1, l3.clone(), b4, l6.clone(), b7, l9.clone()]);
+
+    let committer = UniversalCommitter::new(committee(4), false, 100);
+    let mut delivered: Vec<Hash> = Vec::new();
+    let mut leaders = Vec::new();
+    for (round, author, block) in [(3, 1, &l3), (6, 3, &l6), (9, 1, &l9)] {
+        committer.update_leader(leader_info(
+            round,
+            author,
+            Some(block.digest),
+            LeaderStatus::Undecided,
+            &[],
+        ));
+        for voter in [0u16, 1, 2] {
+            committer.add_vote(round, voter, block.digest);
+        }
+        let subdag = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("persist commit")
+            .expect("quorum leader commits");
+        assert_eq!(subdag.leader_round, round);
+        leaders.push(subdag.leader_round);
+        delivered.extend(subdag.blocks.iter().map(|b| b.digest));
+    }
+    assert_eq!(leaders, vec![3, 6, 9]);
+
+    let mut seen = std::collections::HashSet::new();
+    for digest in &delivered {
+        assert!(
+            seen.insert(*digest),
+            "block {digest} delivered more than once across commits: {delivered:?}"
+        );
+    }
+    // Totality: every block was delivered exactly once.
+    assert_eq!(seen.len(), 7, "every block delivered once: {delivered:?}");
+}

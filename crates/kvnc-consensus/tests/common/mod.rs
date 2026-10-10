@@ -31,12 +31,59 @@ pub fn committee_with_stakes(stakes: &[Stake]) -> CommitteeInfo {
         .map(|(i, &stake)| AuthorityInfo {
             index: i as AuthorityIndex,
             stake,
-            public_key: PublicKey([i as u8; 32]),
+            public_key: validator_public_key(i as AuthorityIndex),
             address: Address([i as u8; 32]),
             network_address: format!("/ip4/127.0.0.1/tcp/90{:02}", i),
         })
         .collect();
     CommitteeInfo::try_new(0, authorities).expect("test committee is valid")
+}
+
+/// Deterministic test signing key for authority `index`.
+///
+/// `committee`/`committee_with_stakes` register the matching public key, so
+/// votes signed with this key verify against the committee.
+pub fn validator_signing_key(index: AuthorityIndex) -> SigningKey {
+    let mut seed = [0u8; 32];
+    seed[..2].copy_from_slice(&index.to_le_bytes());
+    seed[31] = 0x6b; // keep every seed distinct from the all-zero key
+    SigningKey::from_bytes(&seed)
+}
+
+/// Public key matching [`validator_signing_key`].
+pub fn validator_public_key(index: AuthorityIndex) -> PublicKey {
+    PublicKey::from(validator_signing_key(index).verifying_key())
+}
+
+/// A vote for `leader_hash` at `leader_round` by `voter`, signed with `key`.
+pub fn vote_signed_with(
+    key: &SigningKey,
+    leader_round: Round,
+    voter: AuthorityIndex,
+    leader_hash: Hash,
+) -> kvnc_types::Vote {
+    let mut vote = kvnc_types::Vote {
+        leader_round,
+        leader_hash,
+        voter,
+        signature: Signature([0u8; 64]),
+    };
+    vote.signature = kvnc_crypto::sign(key, &vote.signature_data());
+    vote
+}
+
+/// A correctly signed vote from `voter` (using [`validator_signing_key`]).
+pub fn signed_vote(
+    leader_round: Round,
+    voter: AuthorityIndex,
+    leader_hash: Hash,
+) -> kvnc_types::Vote {
+    vote_signed_with(
+        &validator_signing_key(voter),
+        leader_round,
+        voter,
+        leader_hash,
+    )
 }
 
 /// Build a block. `tag` must be unique within a test; it determines the digest.
@@ -264,6 +311,15 @@ impl DagStoreTrait for MockDag {
         Ok(0)
     }
 
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.mark_round_decided(round, leader_hash)?;
+        self.commit_leader(leader_hash)
+    }
+
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         if let Some(observer) = self.decision_mark_observer.lock().as_ref() {
             observer();
@@ -460,7 +516,8 @@ pub fn make_engine(
     std::sync::Arc<MockDag>,
     std::sync::Arc<parking_lot::RwLock<MockBlockManager>>,
 ) {
-    let (signing_key, public_key) = kvnc_crypto::generate_keypair();
+    let signing_key = validator_signing_key(authority);
+    let public_key = validator_public_key(authority);
     let mut authorities = committee.authorities().to_vec();
     if let Some(info) = authorities.iter_mut().find(|info| info.index == authority) {
         info.public_key = public_key;

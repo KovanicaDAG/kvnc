@@ -14,7 +14,11 @@
 //!   signature must verify over the digest under the author's key.
 
 use kvnc_types::{block::StatementBlock, AuthorityIndex, PublicKey, Vote};
-use std::{collections::HashMap, fmt, sync::RwLock};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, RwLock},
+};
 
 /// Committee public keys indexed by authority index.
 pub type AuthorityKeys = HashMap<AuthorityIndex, PublicKey>;
@@ -45,13 +49,76 @@ impl fmt::Display for Rejection {
     }
 }
 
-/// Verify that `vote` is signed by its claimed voter under `keys`.
-pub fn verify_vote(keys: &AuthorityKeys, vote: &Vote) -> Result<(), Rejection> {
+/// Errors returned by a [`VoteVerifier`].
+///
+/// Mirrors `kvnc_crypto::SigError` (Foundation's vote signature API, PR #9)
+/// variant for variant, so switching the stub to the crypto crate later is a
+/// one-line change. Kept local so the network crate does not depend on it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigError {
+    /// The public key bytes are not a valid Ed25519 point.
+    InvalidPublicKey,
+    /// The signature does not verify over the vote's canonical bytes.
+    VerificationFailed,
+}
+
+impl fmt::Display for SigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SigError::InvalidPublicKey => write!(f, "invalid public key"),
+            SigError::VerificationFailed => write!(f, "vote signature verification failed"),
+        }
+    }
+}
+
+impl std::error::Error for SigError {}
+
+/// Vote signature verification used at the gossip edge.
+///
+/// The node injects the implementation via
+/// [`NetworkService::set_vote_verifier`](crate::NetworkService::set_vote_verifier).
+/// Mapping `vote.voter` to the right committee `pubkey` is the caller's job
+/// (done by [`verify_vote_with`]); the verifier only checks the signature.
+pub trait VoteVerifier: Send + Sync {
+    /// Verify `vote.signature` over [`Vote::signature_data`] under `pubkey`.
+    fn verify_vote_signature(&self, vote: &Vote, pubkey: &PublicKey) -> Result<(), SigError>;
+}
+
+/// Stub verifier: existing `kvnc_crypto::verify` over [`Vote::signature_data`].
+///
+/// Does not change the signature format. To be replaced by a thin wrapper
+/// around `kvnc_crypto::verify_vote_signature` (strict verification).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Ed25519VoteVerifier;
+
+impl VoteVerifier for Ed25519VoteVerifier {
+    fn verify_vote_signature(&self, vote: &Vote, pubkey: &PublicKey) -> Result<(), SigError> {
+        kvnc_crypto::verify(pubkey, &vote.signature_data(), &vote.signature).map_err(|e| match e {
+            kvnc_crypto::CryptoError::InvalidPublicKey => SigError::InvalidPublicKey,
+            _ => SigError::VerificationFailed,
+        })
+    }
+}
+
+/// Verify that `vote` is signed by its claimed voter under `keys`, using
+/// `verifier` for the signature check.
+pub fn verify_vote_with(
+    verifier: &dyn VoteVerifier,
+    keys: &AuthorityKeys,
+    vote: &Vote,
+) -> Result<(), Rejection> {
     let key = keys
         .get(&vote.voter)
         .ok_or(Rejection::UnknownAuthority(vote.voter))?;
-    kvnc_crypto::verify(key, &vote.signature_data(), &vote.signature)
+    verifier
+        .verify_vote_signature(vote, key)
         .map_err(|_| Rejection::BadSignature(vote.voter))
+}
+
+/// Verify that `vote` is signed by its claimed voter under `keys`
+/// (default [`Ed25519VoteVerifier`]).
+pub fn verify_vote(keys: &AuthorityKeys, vote: &Vote) -> Result<(), Rejection> {
+    verify_vote_with(&Ed25519VoteVerifier, keys, vote)
 }
 
 /// Verify a block's digest, merkle root and author signature under `keys`.
@@ -82,12 +149,29 @@ pub fn verify_block(keys: &AuthorityKeys, block: &StatementBlock) -> Result<(), 
 ///
 /// Until keys are configured nothing can be authenticated, so votes and
 /// blocks are neither delivered nor forwarded (fail closed).
-#[derive(Default)]
 pub(crate) struct GossipValidator {
     keys: RwLock<AuthorityKeys>,
+    vote_verifier: RwLock<Arc<dyn VoteVerifier>>,
+}
+
+impl Default for GossipValidator {
+    fn default() -> Self {
+        Self {
+            keys: RwLock::new(AuthorityKeys::new()),
+            vote_verifier: RwLock::new(Arc::new(Ed25519VoteVerifier)),
+        }
+    }
 }
 
 impl GossipValidator {
+    /// Replace the vote signature verifier.
+    pub(crate) fn set_vote_verifier(&self, verifier: Arc<dyn VoteVerifier>) {
+        *self
+            .vote_verifier
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = verifier;
+    }
+
     /// Replace the committee keys.
     pub(crate) fn set_keys(&self, keys: AuthorityKeys) {
         *self.keys.write().unwrap_or_else(|e| e.into_inner()) = keys;
@@ -103,7 +187,16 @@ impl GossipValidator {
     }
 
     pub(crate) fn verify_vote(&self, vote: &Vote) -> Result<(), Rejection> {
-        verify_vote(&self.keys.read().unwrap_or_else(|e| e.into_inner()), vote)
+        let verifier = self
+            .vote_verifier
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        verify_vote_with(
+            verifier.as_ref(),
+            &self.keys.read().unwrap_or_else(|e| e.into_inner()),
+            vote,
+        )
     }
 
     pub(crate) fn verify_block(&self, block: &StatementBlock) -> Result<(), Rejection> {
@@ -254,5 +347,69 @@ mod tests {
         assert!(validator
             .verify_block(&signed_block(&signers[0], 0))
             .is_err());
+    }
+
+    // --- VoteVerifier trait ---
+
+    #[test]
+    fn trait_accepts_valid_signature() {
+        let (signers, keys) = committee(4);
+        let vote = signed_vote(&signers[2], 2);
+        assert_eq!(
+            Ed25519VoteVerifier.verify_vote_signature(&vote, &keys[&2]),
+            Ok(())
+        );
+        assert_eq!(verify_vote_with(&Ed25519VoteVerifier, &keys, &vote), Ok(()));
+    }
+
+    #[test]
+    fn trait_rejects_bad_signature() {
+        let (signers, keys) = committee(4);
+        let mut vote = signed_vote(&signers[1], 1);
+        vote.signature = Signature([7; 64]);
+        assert_eq!(
+            Ed25519VoteVerifier.verify_vote_signature(&vote, &keys[&1]),
+            Err(SigError::VerificationFailed)
+        );
+        assert_eq!(
+            verify_vote_with(&Ed25519VoteVerifier, &keys, &vote),
+            Err(Rejection::BadSignature(1))
+        );
+    }
+
+    #[test]
+    fn trait_path_rejects_unknown_voter_without_calling_verifier() {
+        struct Panicking;
+        impl VoteVerifier for Panicking {
+            fn verify_vote_signature(&self, _: &Vote, _: &PublicKey) -> Result<(), SigError> {
+                panic!("verifier must not be called for unknown voters");
+            }
+        }
+        let (signers, keys) = committee(4);
+        let vote = signed_vote(&signers[0], 9);
+        assert_eq!(
+            verify_vote_with(&Panicking, &keys, &vote),
+            Err(Rejection::UnknownAuthority(9))
+        );
+    }
+
+    #[test]
+    fn gossip_validator_uses_injected_verifier() {
+        struct RejectAll;
+        impl VoteVerifier for RejectAll {
+            fn verify_vote_signature(&self, _: &Vote, _: &PublicKey) -> Result<(), SigError> {
+                Err(SigError::VerificationFailed)
+            }
+        }
+        let (signers, keys) = committee(4);
+        let validator = GossipValidator::default();
+        validator.set_keys(keys);
+        let vote = signed_vote(&signers[0], 0);
+        assert_eq!(validator.verify_vote(&vote), Ok(()));
+        validator.set_vote_verifier(Arc::new(RejectAll));
+        assert_eq!(
+            validator.verify_vote(&vote),
+            Err(Rejection::BadSignature(0))
+        );
     }
 }
