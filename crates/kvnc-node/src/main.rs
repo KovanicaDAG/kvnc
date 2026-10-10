@@ -1524,6 +1524,8 @@ fn recover_committed_subdag_mysticghost(
                 leader: leader_block.clone(),
                 leader_round,
                 leader_author: leader_block.author,
+                // TODO(#13 owner): fill with the red mergeset blocks (same helper live and on recovery).
+                non_blue: Vec::new(),
             })
         }
         MysticGhostOrder::Fallback => {
@@ -2463,6 +2465,7 @@ mod tests {
                 leader,
                 leader_round: round,
                 leader_author: author,
+                non_blue: Vec::new(),
             }
         };
         let (exec_tx, exec_rx) = mpsc::unbounded_channel();

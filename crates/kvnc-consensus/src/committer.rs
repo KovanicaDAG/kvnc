@@ -749,6 +749,8 @@ impl UniversalCommitter {
                         leader: leader_block.clone(),
                         leader_round,
                         leader_author: leader_block.author,
+                        // TODO(#13 owner): fill with the red mergeset blocks (same helper live and on recovery).
+                        non_blue: Vec::new(),
                     },
                     Some(colouring),
                 ))
