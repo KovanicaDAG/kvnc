@@ -14,6 +14,7 @@
 pub mod committer;
 pub mod committer_mysticghost;
 pub mod engine;
+pub mod genesis;
 pub mod ghostdag_scoped;
 pub mod linearizer;
 pub mod metrics;
@@ -26,6 +27,7 @@ pub use engine::{
     BlockBroadcaster, ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState,
     VoteBroadcaster, VoteRejection,
 };
+pub use genesis::is_genesis_subdag;
 pub use kvnc_types::Vote;
 pub use linearizer::Linearizer;
 pub use metrics::{
