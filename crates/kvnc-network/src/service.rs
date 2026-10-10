@@ -999,12 +999,18 @@ impl NetworkService {
                 | MempoolError::GasLimitTooHigh
                 | MempoolError::TransactionTooLarge(_)
                 | MempoolError::HashMismatch
-                | MempoolError::FeeTooLow { .. }
                 | MempoolError::Crypto(_)
                 | MempoolError::Serialization(_)),
             ) => {
                 warn!(%hash, %err, "rejected invalid transaction received over gossip");
                 Verdict::Reject(format!("transaction: {err}"))
+            }
+            // Exec-Network decision: min fee is node-local config, not a
+            // network rule yet, so a low fee is not misbehaviour. Ignore =
+            // no forwarding, no gossipsub P4 penalty, no ban counter.
+            Err(err @ MempoolError::FeeTooLow { .. }) => {
+                debug!(%hash, %err, "transaction below local min fee; ignored");
+                Verdict::Ignore
             }
             Err(err) => {
                 debug!(%hash, %err, "transaction not admitted (local state)");
@@ -1482,8 +1488,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hash_mismatch_and_fee_too_low_are_rejected_at_gossip_edge() {
-        // HashMismatch: cached hash is not the signing hash.
+    async fn hash_mismatch_is_rejected_and_fee_too_low_is_ignored_at_gossip_edge() {
+        // HashMismatch: cached hash is not the signing hash -> Reject.
         let (_dir, service) = test_service();
         let mut tx = signed_transfer(1_000);
         tx.hash = Hash::new(b"not the signing hash");
@@ -1493,16 +1499,29 @@ mod tests {
             other => panic!("HashMismatch must be Reject, got {other:?}"),
         }
 
-        // FeeTooLow: fee rate below the configured floor.
+        // FeeTooLow: below this node's floor -> Ignore, no penalty.
         let (_dir, service) = test_service_with_mempool(MempoolConfig {
             min_fee_rate: 1_000_000,
             ..MempoolConfig::default()
         });
         let payload = bincode::serialize(&signed_transfer(1)).expect("serialize");
-        match service.on_transaction_message(&payload) {
-            Verdict::Reject(reason) => assert!(reason.contains("Fee rate"), "{reason}"),
-            other => panic!("FeeTooLow must be Reject, got {other:?}"),
+        let verdict = service.on_transaction_message(&payload);
+        assert!(
+            matches!(verdict, Verdict::Ignore),
+            "FeeTooLow must be Ignore, got {verdict:?}"
+        );
+        // Reporting the verdict must not count against the relaying peer.
+        let peer = PeerId::random();
+        for i in 0..(INVALID_BLOCK_FAILURE_LIMIT + 2) {
+            let verdict = service.on_transaction_message(&payload);
+            let id = gossipsub::MessageId::from(vec![i as u8]);
+            service.report_validation(&id, peer, verdict);
         }
+        assert!(lock(&service.invalid_block_failures).get(&peer).is_none());
+        assert!(
+            !service.enforce_score_ban(peer),
+            "no score ban for FeeTooLow"
+        );
     }
 
     #[tokio::test]
