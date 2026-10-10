@@ -26,6 +26,7 @@ use kvnc_staking::{RewardOutcome, StakingError, StakingState};
 use kvnc_storage::{
     address_to_bytes, state_store::Account, tables, BincodeSerialize, Storage, StorageError,
 };
+use kvnc_types::signing::{chain_id, SigningContext};
 use kvnc_types::{Address, Transaction, TransactionKind};
 use redb::{ReadableTable, TableDefinition, WriteTransaction};
 use thiserror::Error;
@@ -150,7 +151,9 @@ pub struct ExecutionContext {
     pub contract_runner: ContractRunner,
     /// Event publisher for transaction logs.
     pub log_publisher: Option<Box<dyn LogPublisher>>,
-    // TODO: account balances, contract storage, etc.
+    /// Signature format v1 context (`chain_id`) every transaction signature
+    /// is verified against. Built from local configuration only.
+    signing_ctx: SigningContext,
 }
 
 /// Trait for publishing transaction execution logs.
@@ -160,12 +163,29 @@ pub trait LogPublisher: Send + Sync {
 }
 
 impl ExecutionContext {
+    /// **Dev/test only.** Context for `chain_id::LOCAL` (1337). On a real
+    /// network every signature (signed for mainnet/testnet/devnet) is
+    /// rejected — it fails closed. Nodes must use
+    /// [`ExecutionContext::with_signing_context`].
     pub fn new() -> Self {
+        Self::with_signing_context(SigningContext::new(chain_id::LOCAL))
+    }
+
+    /// Execution context verifying transaction signatures (format v1,
+    /// `KUNA/tx/v1` domain tag) against `ctx.chain_id`. `ctx` must come from
+    /// the node's own configuration, never from a network message.
+    pub fn with_signing_context(ctx: SigningContext) -> Self {
         Self {
             staking: StakingState::new(),
             contract_runner: ContractRunner::new(),
             log_publisher: None,
+            signing_ctx: ctx,
         }
+    }
+
+    /// The signing context transactions are verified against.
+    pub fn signing_context(&self) -> SigningContext {
+        self.signing_ctx
     }
 
     /// Configure treasury address at genesis.
@@ -369,7 +389,7 @@ impl ExecutionContext {
         // Every transaction must carry a valid Ed25519 signature by its
         // sender over the signing hash. There is deliberately no bypass:
         // tests sign with real keypairs (see `tests::signed_tx`).
-        if !tx.verify_signature() {
+        if !tx.verify_signature(&self.signing_ctx) {
             return Ok(TransactionReceipt {
                 tx_hash: tx.hash,
                 success: false,
@@ -457,6 +477,7 @@ impl ExecutionContext {
             }
             TransactionKind::Call {
                 contract,
+                value,
                 method,
                 args,
                 gas_limit,
@@ -465,6 +486,7 @@ impl ExecutionContext {
                 storage,
                 &tx.sender,
                 *contract,
+                *value,
                 method,
                 args,
                 *gas_limit,
@@ -778,6 +800,7 @@ impl ExecutionContext {
         storage: &Storage,
         from: &Address,
         contract: Address,
+        value: u64,
         method: &str,
         args: &[u8],
         gas_limit: u64,
@@ -812,6 +835,10 @@ impl ExecutionContext {
             // Single writer: the host reads and writes through the sub-DAG's
             // open write transaction instead of opening a second one.
             txn: Some(&*txn),
+            // Signed Call.value: moved signer -> contract inside the host
+            // overlay, so a failed call moves nothing (fee/nonce still
+            // charged by the per-tx savepoint).
+            value,
             config: &config,
         };
 
@@ -1011,6 +1038,9 @@ mod tests {
     use kvnc_types::crypto::SigningKey;
     use kvnc_types::{Signature, StatementBlock};
 
+    /// Tests sign for the dev/test network `ExecutionContext::new` uses.
+    const TEST_CTX: SigningContext = SigningContext::new(chain_id::LOCAL);
+
     fn sample_block(author: u16) -> StatementBlock {
         sample_block_at(author, 1)
     }
@@ -1075,10 +1105,10 @@ mod tests {
             signature: Signature([0u8; 64]),
             hash: kvnc_types::hash::Hash([0u8; 32]),
         };
-        tx.hash = tx.signing_hash();
-        tx.signature = kvnc_crypto::sign(key, &tx.signing_hash().0);
+        tx.hash = tx.signing_hash(&TEST_CTX);
+        tx.signature = kvnc_crypto::sign(key, &tx.signing_hash(&TEST_CTX).0);
         assert!(
-            tx.verify_signature(),
+            tx.verify_signature(&TEST_CTX),
             "test helper must produce valid signatures"
         );
         tx
@@ -1242,6 +1272,7 @@ mod tests {
             staking: initial_staking,
             contract_runner: ContractRunner::new(),
             log_publisher: None,
+            signing_ctx: TEST_CTX,
         };
         let initial_bytes = staking_state_bytes(&ctx.staking);
         let subdag = sample_committed_subdag(1, 0);
@@ -1284,11 +1315,13 @@ mod tests {
             staking: bincode::deserialize(&genesis_bytes).expect("genesis state a"),
             contract_runner: ContractRunner::new(),
             log_publisher: None,
+            signing_ctx: TEST_CTX,
         };
         let mut context_b = ExecutionContext {
             staking: bincode::deserialize(&genesis_bytes).expect("genesis state b"),
             contract_runner: ContractRunner::new(),
             log_publisher: None,
+            signing_ctx: TEST_CTX,
         };
         persist_initial_staking_state(&storage_a, &context_a.staking);
         persist_initial_staking_state(&storage_b, &context_b.staking);
@@ -1510,6 +1543,7 @@ mod tests {
                 staking: genesis_staking_state(),
                 contract_runner: ContractRunner::new(),
                 log_publisher: None,
+                signing_ctx: TEST_CTX,
             };
             persist_initial_staking_state(&storage, &context.staking);
             first_reward = context
@@ -1526,6 +1560,7 @@ mod tests {
             staking: load_staking_state(&storage),
             contract_runner: ContractRunner::new(),
             log_publisher: None,
+            signing_ctx: TEST_CTX,
         };
         let replay = context
             .execute_committed_subdag(&subdag, &storage)
@@ -1755,7 +1790,7 @@ mod tests {
             signature: Signature([1u8; 64]),
             hash: kvnc_types::hash::Hash([0u8; 32]),
         };
-        forged.hash = forged.signing_hash();
+        forged.hash = forged.signing_hash(&TEST_CTX);
 
         let result = execute_single_tx(&mut ctx, &storage, forged);
         assert_eq!(result.receipts.len(), 1);
@@ -1788,7 +1823,7 @@ mod tests {
             1000,
         );
         tx.sender = victim;
-        tx.hash = tx.signing_hash();
+        tx.hash = tx.signing_hash(&TEST_CTX);
 
         let result = execute_single_tx(&mut ctx, &storage, tx);
         assert!(!result.receipts[0].success);
@@ -2106,6 +2141,7 @@ mod tests {
     fn probe_call(key: &SigningKey, fail: bool, nonce: u64, fee: u64) -> Transaction {
         let kind = TransactionKind::Call {
             contract: PROBE_CONTRACT,
+            value: 0,
             method: "probe".to_string(),
             args: if fail { vec![1] } else { Vec::new() },
             gas_limit: 1_000_000,
@@ -2654,6 +2690,232 @@ mod tests {
             )
         };
         let a = go();
+        assert_eq!(a, go());
+    }
+    // ---- signature format v1 + Call.value -------------------------------
+
+    fn signed_tx_for(
+        key: &SigningKey,
+        kind: TransactionKind,
+        nonce: u64,
+        fee: u64,
+        ctx: &SigningContext,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            sender: address_of(key),
+            nonce,
+            kind,
+            fee,
+            signature: Signature([0u8; 64]),
+            hash: kvnc_types::hash::Hash([0u8; 32]),
+        };
+        tx.hash = tx.signing_hash(ctx);
+        tx.signature = kvnc_crypto::sign(key, &tx.signing_hash(ctx).0);
+        tx
+    }
+
+    // A valid v1 signature for another chain_id is rejected; nothing charged.
+    #[test]
+    fn v1_signature_for_other_chain_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let mut ctx = setup_funded_sender(&storage, &sender, 1_000 * K);
+        let testnet = SigningContext::new(chain_id::TESTNET);
+        let kind = TransactionKind::Transfer {
+            to: Address([2u8; 32]),
+            amount: K,
+        };
+        let tx = signed_tx_for(&key, kind, 0, 1000, &testnet);
+        assert!(tx.verify_signature(&testnet), "valid on its own chain");
+        let r = execute_single_tx(&mut ctx, &storage, tx);
+        assert!(!r.receipts[0].success);
+        assert_eq!(r.receipts[0].error.as_deref(), Some("Invalid signature"));
+        assert_eq!(read_balance(&storage, &sender), 1_000 * K);
+        assert_eq!(read_nonce(&storage, &sender), 0);
+        // The same chain configured via with_signing_context accepts it.
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let storage2 = Storage::new(dir2.path().join("t.redb")).expect("storage");
+        let mut ctx2 = setup_funded_sender(&storage2, &sender, 1_000 * K);
+        ctx2.signing_ctx = testnet;
+        let tx = signed_tx_for(
+            &key,
+            TransactionKind::Transfer {
+                to: Address([2u8; 32]),
+                amount: K,
+            },
+            0,
+            1000,
+            &testnet,
+        );
+        assert!(execute_single_tx(&mut ctx2, &storage2, tx).receipts[0].success);
+        assert_eq!(
+            ExecutionContext::with_signing_context(testnet).signing_context(),
+            testnet
+        );
+        assert_eq!(
+            ExecutionContext::new().signing_context().chain_id,
+            chain_id::LOCAL
+        );
+    }
+
+    /// Pre-v1 (v0) signing preimage: no domain tag, no chain_id, keyed with
+    /// the old `KVNC-TX-v1` BLAKE3 key.
+    fn v0_signing_hash(tx: &Transaction) -> kvnc_types::hash::Hash {
+        let TransactionKind::Transfer { to, amount } = &tx.kind else {
+            unreachable!("transfer only")
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&tx.sender.0);
+        data.extend_from_slice(&tx.nonce.to_le_bytes());
+        data.push(0);
+        data.extend_from_slice(&to.0);
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&tx.fee.to_le_bytes());
+        kvnc_types::hash::Hash::new_keyed(b"KVNC-TX-v1", &data)
+    }
+
+    #[test]
+    fn v0_signature_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let mut ctx = setup_funded_sender(&storage, &sender, 1_000 * K);
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Transfer {
+                to: Address([2u8; 32]),
+                amount: K,
+            },
+            fee: 1000,
+            signature: Signature([0u8; 64]),
+            hash: kvnc_types::hash::Hash([0u8; 32]),
+        };
+        let v0 = v0_signing_hash(&tx);
+        tx.hash = v0;
+        tx.signature = kvnc_crypto::sign(&key, &v0.0);
+        let r = execute_single_tx(&mut ctx, &storage, tx);
+        assert!(!r.receipts[0].success);
+        assert_eq!(r.receipts[0].error.as_deref(), Some("Invalid signature"));
+        assert_eq!(read_balance(&storage, &sender), 1_000 * K);
+    }
+
+    fn probe_call_value(key: &SigningKey, fail: bool, value: u64, nonce: u64) -> Transaction {
+        let kind = TransactionKind::Call {
+            contract: PROBE_CONTRACT,
+            value,
+            method: "probe".to_string(),
+            args: if fail { vec![1] } else { Vec::new() },
+            gas_limit: 1_000_000,
+        };
+        signed_tx(key, kind, nonce, 1000)
+    }
+
+    // Call.value moves exactly that amount signer -> contract, before the
+    // call runs (the contract sees the reduced caller balance).
+    #[test]
+    fn call_value_moves_exact_amount_to_contract() {
+        let (slot, sender_bal, contract_bal, ok) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call_value(&key, false, 1234, 0));
+            (
+                probe_slot(&storage),
+                read_balance(&storage, &sender),
+                read_balance(&storage, &PROBE_CONTRACT),
+                r.receipts[0].success,
+            )
+        });
+        assert!(ok);
+        assert_eq!(sender_bal, 1_000_000 - 1000 - 1234);
+        assert_eq!(contract_bal, 1234);
+        assert_eq!(slot, Some(1_000_000 - 1000 - 1234), "moved before the call");
+    }
+
+    // value > balance: rejected, only fee/nonce charged.
+    #[test]
+    fn call_value_above_balance_is_rejected() {
+        let (ok, sender_bal, contract_bal, nonce) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 10_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call_value(&key, false, 9_500, 0));
+            (
+                r.receipts[0].success,
+                read_balance(&storage, &sender),
+                read_balance(&storage, &PROBE_CONTRACT),
+                read_nonce(&storage, &sender),
+            )
+        });
+        assert!(!ok);
+        assert_eq!(sender_bal, 10_000 - 1000);
+        assert_eq!(contract_bal, 0);
+        assert_eq!(nonce, 1);
+    }
+
+    // A failing call does not move its value.
+    #[test]
+    fn failed_call_does_not_move_value() {
+        let (ok, sender_bal, contract_bal, slot) = with_timeout(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let key = test_keypair(1);
+            let sender = address_of(&key);
+            let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+            deploy_probe(&storage);
+            let r = execute_single_tx(&mut ctx, &storage, probe_call_value(&key, true, 5_000, 0));
+            (
+                r.receipts[0].success,
+                read_balance(&storage, &sender),
+                read_balance(&storage, &PROBE_CONTRACT),
+                probe_slot(&storage),
+            )
+        });
+        assert!(!ok);
+        assert_eq!(sender_bal, 1_000_000 - 1000);
+        assert_eq!(contract_bal, 0);
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn replay_with_call_values_is_deterministic() {
+        let go = || {
+            with_timeout(|| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+                let key = test_keypair(1);
+                let sender = address_of(&key);
+                let mut ctx = setup_funded_sender(&storage, &sender, 1_000_000);
+                deploy_probe(&storage);
+                let txs = vec![
+                    probe_call_value(&key, false, 100, 0),
+                    probe_call_value(&key, true, 200, 1),
+                    probe_call_value(&key, false, 10_000_000, 2),
+                    probe_call_value(&key, false, 300, 3),
+                ];
+                let r = ctx
+                    .execute_committed_subdag(&subdag_at(1, txs), &storage)
+                    .expect("execute");
+                (
+                    bincode::serialize(&r.receipts).expect("r"),
+                    read_balance(&storage, &sender),
+                    read_balance(&storage, &PROBE_CONTRACT),
+                    probe_slot(&storage),
+                )
+            })
+        };
+        let a = go();
+        assert_eq!(a.2, 400);
         assert_eq!(a, go());
     }
 }

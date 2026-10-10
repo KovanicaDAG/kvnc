@@ -64,24 +64,26 @@
 //! 1. `from == contract` — own funds. Spendable is the contract account
 //!    balance **minus the total held in custody**, so own spends can never
 //!    touch escrowed funds. `to` is credited as a real account.
-//! 2. `from == caller` with an open **create approval** — the pull must be
-//!    exactly the approved amount and happens at most once per call. The
-//!    caller is debited, the *contract's* real account is credited, and the
-//!    amount is booked in the custody ledger under `to` (e.g. the HTLC/vault
-//!    escrow address). Approved funds therefore only ever land in custody,
-//!    never directly in a third party's account. `to` may not be the contract
-//!    or the caller.
+//! 2. `from == caller` while signed **attached value** (`Call.value`)
+//!    remains — the value was already moved from the signer to the
+//!    contract's real account before the entry point ran, so this pull only
+//!    books up to the remaining attached value in the custody ledger under
+//!    `to` (e.g. the HTLC/vault escrow address); no real balance moves again.
+//!    `to` may not be the contract or the caller. Pulling more than the
+//!    remaining attached value is `Unauthorized`.
 //! 3. `from` has a custody balance in **this contract's** ledger — release:
 //!    the ledger entry and the contract account are debited, `to` is credited
 //!    as a real account.
 //! 4. Anything else — `ContractError::Unauthorized`, nothing moved.
 //!
-//! **Create approval (interim).** `Call` carries no attached value yet, so
-//! for exactly two entry points — `htlc_create` and `vault_create` — the
-//! `amount` field of the signed arguments is treated as an explicit approval
-//! to pull that amount from the caller (the transaction signer on chain).
-//! No other entry point gets an approval. This is to be replaced by a signed
-//! `value` field on `Call` (kvnc-types).
+//! **Attached value (`Call.value`, signature format v1).** Before the
+//! entry point runs, [`ContractHost::attach_value`] moves the signed `value`
+//! from the caller's real account to the contract's real account (rejected
+//! with `InsufficientBalance` if the caller cannot cover it). Like every
+//! host write it lives in the overlay, so a failed call moves nothing.
+//! Value not booked into custody stays in the contract's own funds. The
+//! former interim args-based create approval (decoding the `amount` of
+//! `htlc_create`/`vault_create` arguments) is removed.
 //!
 //! **Custody ledger.** Custody balances are *virtual sub-accounts* stored in
 //! the contract's own namespaced storage under the reserved raw-key prefix
@@ -133,33 +135,6 @@ fn custody_key(address: &[u8; 32]) -> Vec<u8> {
     key.extend_from_slice(CUSTODY_PREFIX);
     key.extend_from_slice(address);
     key
-}
-
-/// The interim create approval: for `htlc_create` and `vault_create` only,
-/// the `amount` of the signed arguments. Any other entry, undecodable
-/// arguments, a zero amount or an amount above `u64::MAX` yield no approval.
-pub(crate) fn create_approval(entry: &str, args: &[u8]) -> Option<u64> {
-    let amount: kvnc_common::Amount = match entry {
-        "htlc_create" => {
-            let (_claimer, amount, _hash_lock, _expiry): (
-                [u8; 32],
-                kvnc_common::Amount,
-                [u8; 32],
-                kvnc_common::Timestamp,
-            ) = bincode::deserialize(args).ok()?;
-            amount
-        }
-        "vault_create" => {
-            let (_beneficiary, amount, _schedule): (
-                [u8; 32],
-                kvnc_common::Amount,
-                kvnc_vault::VestingSchedule,
-            ) = bincode::deserialize(args).ok()?;
-            amount
-        }
-        _ => return None,
-    };
-    u64::try_from(amount).ok().filter(|amount| *amount > 0)
 }
 
 /// The 16 dispatchable contract entry points (FIXED ABI, Lane 3a).
@@ -226,9 +201,9 @@ pub struct ContractHost<'a> {
     /// access); when set, [`ContractHost::commit`] refuses to flush so a
     /// failed read can never be mistaken for "absent".
     read_error: RefCell<Option<String>>,
-    /// Open create approval: the exact amount that may be pulled once from
-    /// the caller into custody. `None` once used or when not granted.
-    caller_approval: Option<u64>,
+    /// Remaining signed attached value (`Call.value`) the contract may book
+    /// into custody on behalf of the caller.
+    attached_value: u64,
 }
 
 impl<'a> ContractHost<'a> {
@@ -255,7 +230,7 @@ impl<'a> ContractHost<'a> {
             accounts: BTreeMap::new(),
             events: Vec::new(),
             read_error: RefCell::new(None),
-            caller_approval: None,
+            attached_value: 0,
         })
     }
 
@@ -285,14 +260,26 @@ impl<'a> ContractHost<'a> {
             accounts: BTreeMap::new(),
             events: Vec::new(),
             read_error: RefCell::new(None),
-            caller_approval: None,
+            attached_value: 0,
         }
     }
 
-    /// Grant the interim create approval: `amount` may be pulled exactly
-    /// once, from the caller only, into custody only.
-    pub(crate) fn grant_caller_approval(&mut self, amount: Option<u64>) {
-        self.caller_approval = amount;
+    /// Attach the signed `Call.value`: move `value` from the caller's real
+    /// account to the contract's real account (overlay only; dropped if the
+    /// call fails) and make it available for custody bookings.
+    pub fn attach_value(&mut self, value: u64) -> Result<(), ContractError> {
+        if value == 0 {
+            return Ok(());
+        }
+        let caller = self.caller;
+        let contract = self.contract;
+        if caller == contract {
+            return Err(ContractError::Unauthorized);
+        }
+        let balance = self.load_account(&caller)?.balance;
+        self.move_real(&caller, &contract, value, balance)?;
+        self.attached_value = value;
+        Ok(())
     }
 
     /// Whether the contract account has deployed code (snapshot read).
@@ -617,7 +604,6 @@ impl Host for ContractHost<'_> {
         }
         let amount = amount as u64;
         let contract = self.contract;
-        let from_addr = Address(*from);
         let to_addr = Address(*to);
 
         // 1. Own funds: account balance minus everything held in custody.
@@ -627,23 +613,20 @@ impl Host for ContractHost<'_> {
             return self.move_real(&contract, &to_addr, amount, spendable);
         }
 
-        // 2. Create approval: exact amount, once, caller only, custody only.
-        if *from == self.caller.0 {
-            if let Some(approved) = self.caller_approval {
-                if amount != approved || *to == contract.0 || *to == self.caller.0 {
-                    return Err(ContractError::Unauthorized);
-                }
-                let caller_balance = self.load_account(&from_addr)?.balance;
-                let entry = self.custody_balance(to)?;
-                let total = self.custody_total()?;
-                let new_entry = entry.checked_add(amount).ok_or(ContractError::Overflow)?;
-                let new_total = total.checked_add(amount).ok_or(ContractError::Overflow)?;
-                self.move_real(&from_addr, &contract, amount, caller_balance)?;
-                self.set_host_u64(custody_key(to), new_entry);
-                self.set_host_u64(CUSTODY_TOTAL_KEY.to_vec(), new_total);
-                self.caller_approval = None;
-                return Ok(());
+        // 2. Attached value: book up to the remaining signed value into
+        //    custody (the funds already sit in the contract account).
+        if *from == self.caller.0 && self.attached_value > 0 {
+            if amount > self.attached_value || *to == contract.0 || *to == self.caller.0 {
+                return Err(ContractError::Unauthorized);
             }
+            let entry = self.custody_balance(to)?;
+            let total = self.custody_total()?;
+            let new_entry = entry.checked_add(amount).ok_or(ContractError::Overflow)?;
+            let new_total = total.checked_add(amount).ok_or(ContractError::Overflow)?;
+            self.set_host_u64(custody_key(to), new_entry);
+            self.set_host_u64(CUSTODY_TOTAL_KEY.to_vec(), new_total);
+            self.attached_value -= amount;
+            return Ok(());
         }
 
         // 3. Release from this contract's custody ledger to a real account.
@@ -718,8 +701,9 @@ impl Host for ContractHost<'_> {
 /// - Unknown entry name → [`ExecutionError::Other`].
 /// - Contract address without deployed code → [`ExecutionError::Validation`]
 ///   (nothing runs).
-/// - `caller` is trusted as the signer for the create approval: only call
-///   this with a signature-verified caller.
+/// - `caller` is trusted as the signer: only call this with a
+///   signature-verified caller. Attached `value` is 0 (use
+///   [`execute_contract_call_with_value`] for a signed `Call.value`).
 /// - On success the overlay is committed and the bincode-encoded Ok result is
 ///   returned (identical bytes to the wasm path).
 pub fn execute_contract_call(
@@ -737,7 +721,32 @@ pub fn execute_contract_call(
             "Contract not found: no deployed code at the contract address".to_string(),
         ));
     }
-    host.grant_caller_approval(create_approval(entry, args));
+    let out = dispatch_entry(entry, &mut host, args)?;
+    let events = host.commit()?;
+    log_events(&events);
+    Ok(out)
+}
+
+/// Standalone (test/offline) native call with a signed attached `value`
+/// moved from `caller` to `contract` before the entry point runs.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_contract_call_with_value(
+    entry: &str,
+    contract: Address,
+    caller: Address,
+    height: u64,
+    timestamp: u64,
+    args: &[u8],
+    value: u64,
+    storage: &Storage,
+) -> Result<Vec<u8>, ExecutionError> {
+    let mut host = ContractHost::new(storage, contract, caller, height, timestamp)?;
+    if !host.contract_has_code()? {
+        return Err(ExecutionError::Validation(
+            "Contract not found: no deployed code at the contract address".to_string(),
+        ));
+    }
+    host.attach_value(value)?;
     let out = dispatch_entry(entry, &mut host, args)?;
     let events = host.commit()?;
     log_events(&events);
@@ -755,6 +764,7 @@ pub fn execute_contract_call_in_txn(
     height: u64,
     timestamp: u64,
     args: &[u8],
+    value: u64,
     storage: &Storage,
     txn: &WriteTransaction,
 ) -> Result<(Vec<u8>, Vec<ContractEvent>), ExecutionError> {
@@ -764,7 +774,7 @@ pub fn execute_contract_call_in_txn(
             "Contract not found: no deployed code at the contract address".to_string(),
         ));
     }
-    host.grant_caller_approval(create_approval(entry, args));
+    host.attach_value(value)?;
     let out = dispatch_entry(entry, &mut host, args)?;
     let events = host.commit()?;
     log_events(&events);
@@ -938,6 +948,9 @@ pub struct WasmCall<'a> {
     /// standalone with its own read snapshot and its own write commit —
     /// never use `None` while another write transaction is open.
     pub txn: Option<&'a WriteTransaction>,
+    /// Signed attached value (`Call.value`), moved caller -> contract before
+    /// the entry point runs; `0` when unused.
+    pub value: u64,
     /// Gas / memory limits for this call.
     pub config: &'a ExecutionConfig,
 }
@@ -1022,7 +1035,7 @@ impl ContractRunner {
                 call.timestamp,
             )?,
         };
-        host.grant_caller_approval(create_approval(call.entry, call.args));
+        host.attach_value(call.value)?;
         // Runtime errors propagate before `commit` — nothing is persisted.
         let out = self
             .runtime
@@ -1270,13 +1283,14 @@ mod tests {
     ) -> ([u8; 32], Address) {
         deploy(storage, contract);
         fund(storage, sender, 1_000);
-        let out = execute_contract_call(
+        let out = execute_contract_call_with_value(
             "htlc_create",
             *contract,
             *sender,
             1,
             100,
             &htlc_create_args(claimer, 500, 1_000),
+            500,
             storage,
         )
         .expect("htlc_create");
@@ -1372,9 +1386,17 @@ mod tests {
             cliff: None,
         };
         let create = bincode::serialize(&(beneficiary.0, 1_000u128, schedule)).expect("encode");
-        let out =
-            execute_contract_call("vault_create", contract, creator, 1, 50, &create, &storage)
-                .expect("vault_create");
+        let out = execute_contract_call_with_value(
+            "vault_create",
+            contract,
+            creator,
+            1,
+            50,
+            &create,
+            1_000,
+            &storage,
+        )
+        .expect("vault_create");
         let id: kvnc_vault::VaultId = bincode::deserialize(&out).expect("vault id");
         let escrow = Address(kvnc_vault::escrow_address(&id));
         assert_eq!(native_balance(&storage, &creator), 0);
@@ -1494,14 +1516,15 @@ mod tests {
         deploy(&storage, &contract);
         fund(&storage, &sender, 100);
 
-        // Signed amount above the sender's balance.
-        let err = execute_contract_call(
+        // Attached value above the sender's balance.
+        let err = execute_contract_call_with_value(
             "htlc_create",
             contract,
             sender,
             1,
             100,
             &htlc_create_args(&claimer, 500, 1_000),
+            500,
             &storage,
         )
         .expect_err("insufficient balance");
@@ -1519,57 +1542,53 @@ mod tests {
         // A pull followed by a dropped (uncommitted) host persists nothing.
         fund(&storage, &sender, 1_000);
         let mut host = ContractHost::new(&storage, contract, sender, 1, 100).expect("host");
-        host.grant_caller_approval(Some(500));
+        host.attach_value(500).expect("attach");
         host.transfer(&sender.0, &addr(7).0, 500).expect("pull");
         drop(host);
         assert_eq!(native_balance(&storage, &sender), 1_000);
         assert_eq!(custody_total(&storage, &contract), 0);
     }
 
-    // Create approval: exact amount, once, signer only, custody only.
+    // Attached value: up to the signed value, signer only, custody only.
     #[test]
-    fn create_approval_is_exact_once_signer_only_custody_only() {
+    fn attached_value_bounds_custody_pulls() {
         let (_dir, storage) = open_storage();
         let (signer, other, contract, escrow) = (addr(1), addr(2), addr(20), addr(7));
         fund(&storage, &signer, 1_000);
         fund(&storage, &other, 1_000);
 
         let mut host = ContractHost::new(&storage, contract, signer, 1, 100).expect("host");
-        host.grant_caller_approval(Some(500));
-        // Above and below the signed amount are both rejected.
+        host.attach_value(500).expect("attach");
+        // Above the attached value is rejected.
         assert_eq!(
             host.transfer(&signer.0, &escrow.0, 501),
             Err(ContractError::Unauthorized)
         );
-        assert_eq!(
-            host.transfer(&signer.0, &escrow.0, 499),
-            Err(ContractError::Unauthorized)
-        );
         // Not from a non-signer.
         assert_eq!(
-            host.transfer(&other.0, &escrow.0, 500),
+            host.transfer(&other.0, &escrow.0, 100),
             Err(ContractError::Unauthorized)
         );
         // Not into the contract's own funds or back to the caller.
         assert_eq!(
-            host.transfer(&signer.0, &contract.0, 500),
+            host.transfer(&signer.0, &contract.0, 100),
             Err(ContractError::Unauthorized)
         );
         assert_eq!(
-            host.transfer(&signer.0, &signer.0, 500),
+            host.transfer(&signer.0, &signer.0, 100),
             Err(ContractError::Unauthorized)
         );
-        // Exactly the signed amount works once …
-        host.transfer(&signer.0, &escrow.0, 500)
-            .expect("exact pull");
-        // … and never again (no leftover budget).
+        // Partial pulls up to the attached value …
+        host.transfer(&signer.0, &escrow.0, 300).expect("pull 300");
+        host.transfer(&signer.0, &escrow.0, 200).expect("pull 200");
+        // … and no more.
         assert_eq!(
-            host.transfer(&signer.0, &escrow.0, 500),
+            host.transfer(&signer.0, &escrow.0, 1),
             Err(ContractError::Unauthorized)
         );
         host.commit().expect("commit");
 
-        // Funds landed in custody, not in the escrow's real account.
+        // Exactly the value moved; it sits in custody, not in escrow's account.
         assert_eq!(native_balance(&storage, &signer), 500);
         assert_eq!(native_balance(&storage, &escrow), 0);
         assert_eq!(native_balance(&storage, &contract), 500);
@@ -1577,41 +1596,53 @@ mod tests {
         assert_eq!(native_balance(&storage, &other), 1_000);
     }
 
+    // Old behaviour: htlc_create args alone authorised pulling the caller's
+    // funds. Without attached value the caller is not spendable.
     #[test]
-    fn create_approval_only_for_htlc_and_vault_create() {
-        let claimer = addr(2);
-        let htlc = htlc_create_args(&claimer, 500, 1_000);
-        assert_eq!(create_approval("htlc_create", &htlc), Some(500));
-        let schedule = kvnc_vault::VestingSchedule::Absolute { unlock_at: 10 };
-        let vault = bincode::serialize(&(claimer.0, 700u128, schedule)).expect("encode");
-        assert_eq!(create_approval("vault_create", &vault), Some(700));
-
-        // Same bytes under any other entry point grant nothing.
-        for entry in ENTRY_POINTS
-            .iter()
-            .filter(|e| **e != "htlc_create" && **e != "vault_create")
-        {
-            assert_eq!(create_approval(entry, &htlc), None, "{entry}");
-            assert_eq!(create_approval(entry, &vault), None, "{entry}");
-        }
-        assert_eq!(create_approval("htlc_create", &[]), None);
-        assert_eq!(
-            create_approval("htlc_create", &htlc_create_args(&claimer, 0, 1)),
-            None
-        );
-        let too_big = htlc_create_args(&claimer, u64::MAX as u128 + 1, 1);
-        assert_eq!(create_approval("htlc_create", &too_big), None);
-
-        // Without an approval the caller's account is not spendable, e.g. a
-        // non-create entry point that tries to pull from the caller.
+    fn create_without_value_cannot_pull_caller_funds() {
         let (_dir, storage) = open_storage();
-        fund(&storage, &addr(1), 1_000);
-        let mut host = ContractHost::new(&storage, addr(20), addr(1), 1, 100).expect("host");
-        host.grant_caller_approval(create_approval("htlc_claim", &htlc));
-        assert_eq!(
-            host.transfer(&addr(1).0, &addr(7).0, 500),
-            Err(ContractError::Unauthorized)
+        let (sender, claimer, contract) = (addr(1), addr(2), addr(20));
+        deploy(&storage, &contract);
+        fund(&storage, &sender, 1_000);
+        let err = execute_contract_call(
+            "htlc_create",
+            contract,
+            sender,
+            1,
+            100,
+            &htlc_create_args(&claimer, 500, 1_000),
+            &storage,
+        )
+        .expect_err("no attached value");
+        assert!(
+            matches!(err, ExecutionError::Contract(ContractError::Unauthorized)),
+            "{err:?}"
         );
+        assert_eq!(native_balance(&storage, &sender), 1_000);
+        assert_eq!(custody_total(&storage, &contract), 0);
+    }
+
+    // Value larger than the create amount: the rest stays as contract funds.
+    #[test]
+    fn surplus_value_stays_with_contract() {
+        let (_dir, storage) = open_storage();
+        let (sender, claimer, contract) = (addr(1), addr(2), addr(20));
+        deploy(&storage, &contract);
+        fund(&storage, &sender, 1_000);
+        execute_contract_call_with_value(
+            "htlc_create",
+            contract,
+            sender,
+            1,
+            100,
+            &htlc_create_args(&claimer, 500, 1_000),
+            600,
+            &storage,
+        )
+        .expect("create");
+        assert_eq!(native_balance(&storage, &sender), 400);
+        assert_eq!(native_balance(&storage, &contract), 600);
+        assert_eq!(custody_total(&storage, &contract), 500);
     }
 
     #[test]
@@ -1829,6 +1860,7 @@ mod tests {
                 args: &create,
                 storage: &storage,
                 txn: None,
+                value: 0,
                 config: &config,
             })
             .expect("wasm token_create");
@@ -1845,6 +1877,7 @@ mod tests {
                 args: &transfer,
                 storage: &storage,
                 txn: None,
+                value: 0,
                 config: &config,
             })
             .expect("wasm token_transfer");
@@ -1902,6 +1935,7 @@ mod tests {
             1,
             1_000,
             &args,
+            700,
             &storage,
             &txn,
         )
@@ -1922,7 +1956,7 @@ mod tests {
         deploy(&storage, &contract);
         fund(&storage, &caller, 100);
         let txn = storage.begin_write().expect("outer txn");
-        // Approval amount exceeds the balance → InsufficientBalance.
+        // Attached value exceeds the balance → InsufficientBalance.
         let args = htlc_create_args(&addr(2), 500, 10_000);
         let err = execute_contract_call_in_txn(
             "htlc_create",
@@ -1931,6 +1965,7 @@ mod tests {
             1,
             1_000,
             &args,
+            500,
             &storage,
             &txn,
         )
@@ -1940,5 +1975,64 @@ mod tests {
         assert_eq!(native_balance(&storage, &caller), 100);
         assert_eq!(native_balance(&storage, &contract), 0);
         assert_eq!(custody_total(&storage, &contract), 0);
+    }
+    // HTLC and vault create through Call.value in single-writer mode.
+    #[test]
+    fn htlc_and_vault_create_via_value_in_txn() {
+        let (_dir, storage) = open_storage();
+        let caller = addr(1);
+        let (htlc, vault) = (addr(60), addr(61));
+        deploy(&storage, &htlc);
+        deploy(&storage, &vault);
+        fund(&storage, &caller, 2_000);
+        let txn = storage.begin_write().expect("outer txn");
+        let args = htlc_create_args(&addr(2), 500, 10_000);
+        execute_contract_call_in_txn(
+            "htlc_create",
+            htlc,
+            caller,
+            1,
+            100,
+            &args,
+            500,
+            &storage,
+            &txn,
+        )
+        .expect("htlc_create");
+        let schedule = kvnc_vault::VestingSchedule::Absolute { unlock_at: 1_000 };
+        let vargs = bincode::serialize(&(addr(3).0, 700u128, schedule)).expect("encode");
+        execute_contract_call_in_txn(
+            "vault_create",
+            vault,
+            caller,
+            1,
+            100,
+            &vargs,
+            700,
+            &storage,
+            &txn,
+        )
+        .expect("vault_create");
+        // Create amount above the attached value: rejected, nothing moved.
+        let err = execute_contract_call_in_txn(
+            "htlc_create",
+            htlc,
+            caller,
+            1,
+            100,
+            &htlc_create_args(&addr(4), 500, 10_000),
+            499,
+            &storage,
+            &txn,
+        )
+        .expect_err("value too small");
+        assert!(
+            matches!(err, ExecutionError::Contract(ContractError::Unauthorized)),
+            "{err:?}"
+        );
+        txn.commit().expect("commit");
+        assert_eq!(native_balance(&storage, &caller), 800);
+        assert_eq!(custody_total(&storage, &htlc), 500);
+        assert_eq!(custody_total(&storage, &vault), 700);
     }
 }
