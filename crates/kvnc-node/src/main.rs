@@ -121,6 +121,8 @@ enum NetworkCommand {
     BroadcastBlock(StatementBlock),
     /// Gossip a consensus vote.
     BroadcastVote(Vote),
+    /// Gossip a transaction accepted into the local mempool via RPC.
+    BroadcastTransaction(Transaction),
     /// Request a block sync from a specific peer.
     RequestSync(PeerId, BlockSyncRequest),
     /// Ask the network task to stop.
@@ -526,7 +528,23 @@ where
     // Liveness of the execution worker and consensus engine, surfaced on /health.
     let node_health = NodeHealth::new();
     let auth_config = rpc_auth_config_from_env();
+    // RPC-accepted transactions are forwarded to the network task.
+    let (rpc_tx_gossip, mut rpc_tx_gossip_rx) = mpsc::unbounded_channel::<Transaction>();
+    {
+        let cmd_tx = network_cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(tx) = rpc_tx_gossip_rx.recv().await {
+                if cmd_tx
+                    .send(NetworkCommand::BroadcastTransaction(tx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     let rpc_state = RpcState {
+        tx_gossip: Some(rpc_tx_gossip),
         health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -908,6 +926,11 @@ async fn run_network(
                 Some(NetworkCommand::BroadcastVote(vote)) => {
                     if let Err(e) = service.broadcast_vote(&vote) {
                         warn!(error = %e, "failed to broadcast vote");
+                    }
+                }
+                Some(NetworkCommand::BroadcastTransaction(tx)) => {
+                    if let Err(e) = service.broadcast_transaction(&tx) {
+                        warn!(error = %e, "failed to broadcast transaction");
                     }
                 }
                 Some(NetworkCommand::RequestSync(peer, request)) => {
