@@ -284,25 +284,14 @@ impl BlockManager {
 
         self.validate_block_content(block)?;
 
-        self.validate_parent_references(block)?;
-
-        // Authenticate the full causal history. This also protects against
-        // blocks written by older ingress paths or pre-existing invalid data.
-        let mut pending: Vec<Hash> = block.parents.iter().map(|parent| parent.digest).collect();
-        let mut visited = std::collections::HashSet::new();
-        while let Some(ancestor_hash) = pending.pop() {
-            if !visited.insert(ancestor_hash) {
-                continue;
-            }
-            let ancestor = self.dag_store.get_block(&ancestor_hash)?;
-            if ancestor.round == 0 {
-                self.validate_canonical_genesis(&ancestor)?;
-            } else {
-                self.validate_block_content(&ancestor)?;
-                self.validate_parent_references(&ancestor)?;
-            }
-            pending.extend(ancestor.parents.iter().map(|parent| parent.digest));
-        }
+        // Bounded validation: only the direct parents are read. Every stored
+        // block was validated the same way before it was stored (see
+        // `process_block`), so the history behind a valid parent is already
+        // authenticated by induction. Parents below the durable prune
+        // boundary are not looked up at all and are accepted as already
+        // validated. Cost is O(parents), independent of DAG size.
+        let prune_boundary = self.dag_store.prune_boundary()?;
+        self.validate_parent_references_bounded(block, prune_boundary, true)?;
 
         Ok(())
     }
@@ -398,12 +387,9 @@ impl BlockManager {
         Ok(())
     }
 
-    /// Check that each referenced parent exists, its round and author match
-    /// the reference, that the parent strictly precedes the block, that the
-    /// gap is within `MAX_PARENT_ROUND_GAP`, and that the parent count does not
-    /// exceed the committee size (minimum 3).
-    fn validate_parent_references(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
-        // Parent-count ceiling: committee size, but never below the wave width.
+    /// Structural parent checks that need no store access: parent count,
+    /// `parent.round < block.round`, and the `MAX_PARENT_ROUND_GAP` window.
+    fn validate_parent_structure(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
         let committee_size = {
             let stakes = self.authority_stakes.read();
             let keys = self.authority_keys.read();
@@ -421,7 +407,6 @@ impl BlockManager {
                 max_parents
             )));
         }
-
         for parent_ref in &block.parents {
             if parent_ref.round >= block.round {
                 return Err(BlockManagerError::ParentValidation(format!(
@@ -437,7 +422,30 @@ impl BlockManager {
                     kvnc_types::MAX_PARENT_ROUND_GAP
                 )));
             }
+        }
+        Ok(())
+    }
 
+    /// Validate `block`'s parent references reading only its direct parents.
+    ///
+    /// Parents with `round < prune_boundary` are pruned history: they are not
+    /// looked up and are accepted as already validated. Every other parent
+    /// must exist with matching metadata. When `check_parent_content` is set,
+    /// each loaded parent's own content (digest, merkle root, signature or
+    /// canonical genesis) and its own parent *structure* are re-checked as a
+    /// defence against blocks stored without validation; this never reads
+    /// grandparents.
+    fn validate_parent_references_bounded(
+        &self,
+        block: &StatementBlock,
+        prune_boundary: Round,
+        check_parent_content: bool,
+    ) -> Result<(), BlockManagerError> {
+        self.validate_parent_structure(block)?;
+        for parent_ref in &block.parents {
+            if parent_ref.round < prune_boundary {
+                continue;
+            }
             let parent = self.dag_store.get_block(&parent_ref.digest).map_err(|_| {
                 BlockManagerError::ParentValidation(format!(
                     "Parent block {} not found",
@@ -450,8 +458,25 @@ impl BlockManager {
                     parent_ref.digest
                 )));
             }
+            if check_parent_content {
+                if parent.round == 0 {
+                    self.validate_canonical_genesis(&parent)?;
+                } else {
+                    self.validate_block_content(&parent)?;
+                    self.validate_parent_structure(&parent)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Check that each referenced parent exists, its round and author match
+    /// the reference, that the parent strictly precedes the block, that the
+    /// gap is within `MAX_PARENT_ROUND_GAP`, and that the parent count does not
+    /// exceed the committee size (minimum 3).
+    #[cfg(test)]
+    fn validate_parent_references(&self, block: &StatementBlock) -> Result<(), BlockManagerError> {
+        self.validate_parent_references_bounded(block, 0, false)
     }
 
     /// Process a received block (validate and store if valid).
@@ -1090,5 +1115,172 @@ mod tests {
             manager.validate_parent_references(&too_many).is_err(),
             "more than max_parents parents must be rejected"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Task #4: bounded validation + durable prune boundary
+    // -----------------------------------------------------------------
+
+    fn signed(
+        key: &SigningKey,
+        author: AuthorityIndex,
+        round: Round,
+        parents: Vec<BlockReference>,
+    ) -> StatementBlock {
+        let digest = StatementBlock::compute_digest(author, round, &parents, &[]);
+        StatementBlock {
+            author,
+            round,
+            parents,
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: crypto::sign(key, digest.as_ref()),
+            digest,
+            merkle_root: Default::default(),
+        }
+    }
+
+    fn bref(block: &StatementBlock) -> BlockReference {
+        BlockReference {
+            author: block.author,
+            round: block.round,
+            digest: block.digest,
+        }
+    }
+
+    fn genesis_block() -> StatementBlock {
+        StatementBlock {
+            author: 0,
+            round: 0,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: Signature([0; 64]),
+            digest: StatementBlock::compute_digest(0, 0, &[], &[]),
+            merkle_root: Default::default(),
+        }
+    }
+
+    /// Store genesis + a single-author chain for rounds 1..=top, each block
+    /// processed through `process_block` (validated before stored).
+    fn build_chain(
+        manager: &BlockManager,
+        store: &DagStore,
+        key: &SigningKey,
+        top: Round,
+    ) -> Vec<StatementBlock> {
+        let genesis = genesis_block();
+        store.put_block(&genesis).unwrap();
+        let mut chain = vec![genesis];
+        for round in 1..=top {
+            let b = signed(key, 0, round, vec![bref(chain.last().unwrap())]);
+            manager.process_block(&b).expect("chain block valid");
+            chain.push(b);
+        }
+        chain
+    }
+
+    #[test]
+    fn prune_validate_new_block_with_pruned_ancestor_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (key, pk) = crypto::generate_keypair();
+        manager.set_authority_keys(HashMap::from([(0, pk)]));
+
+        let chain = build_chain(&manager, &store, &key, 9);
+        // wave 3, window 1 => prune waves < 2, i.e. rounds 0..=5.
+        let pruned = store.prune_waves_before(3, 1).unwrap();
+        assert!(pruned > 0);
+        assert_eq!(store.prune_boundary().unwrap(), 6);
+        assert!(!store.has_block(&chain[5].digest).unwrap());
+
+        // Parent (round 9) is live; its ancestors below round 6 are pruned.
+        let child = signed(&key, 0, 10, vec![bref(&chain[9])]);
+        manager
+            .validate_block(&child)
+            .expect("a block whose history is pruned must still validate");
+
+        // A parent that is itself below the boundary is accepted unread.
+        let over_pruned = signed(&key, 0, 10, vec![bref(&chain[4])]);
+        manager
+            .validate_block(&over_pruned)
+            .expect("parent below the prune boundary is accepted as validated");
+    }
+
+    #[test]
+    fn prune_validate_missing_parent_above_boundary_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (key, pk) = crypto::generate_keypair();
+        manager.set_authority_keys(HashMap::from([(0, pk)]));
+
+        let chain = build_chain(&manager, &store, &key, 9);
+        store.prune_waves_before(3, 1).unwrap();
+        assert_eq!(store.prune_boundary().unwrap(), 6);
+
+        // Never stored, round 8 >= boundary 6.
+        let ghost = signed(&key, 0, 8, vec![bref(&chain[6])]);
+        let child = signed(&key, 0, 10, vec![bref(&chain[9]), bref(&ghost)]);
+        let err = manager.validate_block(&child).expect_err("missing parent");
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error: {err}"
+        );
+        // Exactly at the boundary is still looked up (and missing).
+        let at_boundary = signed(&key, 0, 6, vec![bref(&chain[4])]);
+        let child = signed(&key, 0, 10, vec![bref(&at_boundary)]);
+        assert!(manager.validate_block(&child).is_err());
+    }
+
+    #[test]
+    fn prune_validate_reads_only_direct_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = kvnc_storage::Storage::new(dir.path().join("dag.redb")).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        let manager = BlockManager::new(store.clone());
+        let (key, pk) = crypto::generate_keypair();
+        manager.set_authority_keys(HashMap::from([(0, pk)]));
+
+        let chain = build_chain(&manager, &store, &key, 40);
+        let child = signed(&key, 0, 41, vec![bref(&chain[40])]);
+        let before = store.get_block_calls();
+        manager.validate_block(&child).expect("valid");
+        let reads = store.get_block_calls() - before;
+        assert!(
+            reads <= child.parents.len() as u64,
+            "validation read {reads} blocks for {} direct parent(s); history depth is 40",
+            child.parents.len()
+        );
+    }
+
+    #[test]
+    fn prune_validate_boundary_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dag.redb");
+        let (key, pk) = crypto::generate_keypair();
+        let chain = {
+            let storage = kvnc_storage::Storage::new(&path).unwrap();
+            let store = Arc::new(DagStore::new(storage).unwrap());
+            let manager = BlockManager::new(store.clone());
+            manager.set_authority_keys(HashMap::from([(0, pk)]));
+            let chain = build_chain(&manager, &store, &key, 9);
+            store.prune_waves_before(3, 1).unwrap();
+            chain
+        };
+
+        // Reopen the redb database.
+        let storage = kvnc_storage::Storage::new(&path).unwrap();
+        let store = Arc::new(DagStore::new(storage).unwrap());
+        assert_eq!(store.prune_boundary().unwrap(), 6, "boundary is durable");
+        let manager = BlockManager::new(store.clone());
+        manager.set_authority_keys(HashMap::from([(0, pk)]));
+        let child = signed(&key, 0, 10, vec![bref(&chain[9]), bref(&chain[3])]);
+        manager
+            .validate_block(&child)
+            .expect("after restart, pruned parents/ancestors are still accepted");
     }
 }

@@ -9,7 +9,9 @@ use kvnc_types::{
     hash::Hash,
     AuthorityIndex, Round,
 };
-use redb::{CommitError, ReadTransaction, ReadableTable, TableError, WriteTransaction};
+use redb::{
+    CommitError, ReadTransaction, ReadableTable, TableDefinition, TableError, WriteTransaction,
+};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -37,18 +39,25 @@ pub enum DagStoreError {
     Serialization(#[from] bincode::Error),
 }
 
+/// Durable prune boundary: every DAG round strictly below the stored value
+/// has been pruned. Written in the same redb write transaction as the pruning
+/// itself, so the boundary and the deletion are atomic.
+const DAG_PRUNE_BOUNDARY: TableDefinition<&str, u64> = TableDefinition::new("dag_prune_boundary");
+const DAG_PRUNE_BOUNDARY_KEY: &str = "round";
+
 /// DAG store for high-level DAG operations.
 #[derive(Clone)]
 pub struct DagStore {
     storage: Arc<Storage>,
+    /// Test-only instrumentation: number of `get_block` calls.
+    #[cfg(test)]
+    get_block_calls: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DagStore {
     /// Create a new DAG store.
     pub fn new(storage: Storage) -> Result<Self, DagStoreError> {
-        Ok(Self {
-            storage: Arc::new(storage),
-        })
+        Ok(Self::from_storage(Arc::new(storage)))
     }
 
     /// Wrap an existing shared [`Storage`] handle.
@@ -58,7 +67,49 @@ impl DagStore {
     /// `DagStore` over it without reopening the database (handy for tests and
     /// for exposing the DAG view alongside the state view).
     pub fn from_storage(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            #[cfg(test)]
+            get_block_calls: Arc::default(),
+        }
+    }
+
+    /// Test-only: number of `get_block` calls made so far.
+    #[cfg(test)]
+    pub(crate) fn get_block_calls(&self) -> u64 {
+        self.get_block_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Durable prune boundary: every round strictly below it has been pruned
+    /// (0 if nothing was ever pruned). Survives restarts.
+    pub fn prune_boundary(&self) -> Result<Round, DagStoreError> {
+        let txn = self.storage.begin_read()?;
+        let table = match txn.open_table(DAG_PRUNE_BOUNDARY) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let boundary = table.get(DAG_PRUNE_BOUNDARY_KEY)?.map(|v| v.value());
+        Ok(boundary.unwrap_or(0))
+    }
+
+    /// Raise (never lower) the prune boundary inside `txn`, i.e. in the same
+    /// transaction as the pruning it describes.
+    fn raise_prune_boundary(
+        &self,
+        txn: &WriteTransaction,
+        boundary: Round,
+    ) -> Result<(), DagStoreError> {
+        let mut table = txn.open_table(DAG_PRUNE_BOUNDARY)?;
+        let current = table
+            .get(DAG_PRUNE_BOUNDARY_KEY)?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        if boundary > current {
+            table.insert(DAG_PRUNE_BOUNDARY_KEY, boundary)?;
+        }
+        Ok(())
     }
 
     /// Get a block by hash.
@@ -68,6 +119,9 @@ impl DagStore {
     /// tolerates a pruned/absent block can match on the same variant — the
     /// in-memory DAG implementations used in tests behave the same way.
     pub fn get_block(&self, hash: &Hash) -> Result<StatementBlock, DagStoreError> {
+        #[cfg(test)]
+        self.get_block_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let txn = self.storage.begin_read()?;
         match self.storage.consensus().get_dag_block(&txn, hash) {
             Ok(block) => Ok(block),
@@ -294,6 +348,8 @@ impl DagStore {
     pub fn prune_below(&self, min_round: Round) -> Result<u64, DagStoreError> {
         let txn = self.storage.begin_write()?;
         let pruned = self.storage.consensus().prune_dag_below(&txn, min_round)?;
+        // `prune_dag_below` removes rounds <= min_round.
+        self.raise_prune_boundary(&txn, min_round.saturating_add(1))?;
         txn.commit()?;
         Ok(pruned)
     }
@@ -415,6 +471,8 @@ impl DagStore {
             .storage
             .consensus()
             .prune_dag_below(&txn, max_round_to_prune)?;
+        // Same transaction: rounds <= max_round_to_prune are gone.
+        self.raise_prune_boundary(&txn, max_round_to_prune + 1)?;
 
         // The committed_leader_height counter is not changed here because
         // it represents the total number of committed leaders ever, not just recent ones.
