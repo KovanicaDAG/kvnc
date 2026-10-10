@@ -15,6 +15,16 @@ use thiserror::Error;
 pub enum StateStoreError {
     #[error("Account not found: {0}")]
     NotFound(String),
+    /// A debit larger than the account balance; nothing was written.
+    #[error("Insufficient balance: account {address} has {balance}, debit {amount}")]
+    InsufficientBalance {
+        /// Account being debited.
+        address: String,
+        /// Balance before the (rejected) debit.
+        balance: u64,
+        /// Requested debit.
+        amount: u64,
+    },
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
     #[error("Database error: {0}")]
@@ -163,7 +173,14 @@ impl StateStore {
         Ok(account.balance)
     }
 
-    /// Subtract from account balance.
+    /// Subtract `amount` from an existing account's balance and return the
+    /// new balance.
+    ///
+    /// Errors with `NotFound` if the account does not exist and with
+    /// `InsufficientBalance` if `amount` exceeds the balance; in both cases
+    /// nothing is written. Safe to combine with other table operations in
+    /// the same write transaction: the ACCOUNTS table and its read guard
+    /// are dropped before the write.
     pub fn sub_balance(
         &self,
         txn: &WriteTransaction,
@@ -171,13 +188,22 @@ impl StateStore {
         amount: u64,
     ) -> Result<u64, StateStoreError> {
         let key = address_to_bytes(address);
-        let table = txn.open_table(crate::tables::ACCOUNTS)?;
-        let value = table.get(key)?;
-        let account =
-            value.ok_or_else(|| StateStoreError::NotFound(format!("account {}", address)))?;
-        let mut account = Account::from_bytes(&account.value())?;
-        // table is dropped here after account is extracted
-        account.balance = account.balance.saturating_sub(amount);
+        let mut account = {
+            let table = txn.open_table(crate::tables::ACCOUNTS)?;
+            let value = table
+                .get(key)?
+                .ok_or_else(|| StateStoreError::NotFound(format!("account {}", address)))?;
+            Account::from_bytes(&value.value())?
+            // `value` (read guard) and `table` are dropped at the end of
+            // this block, before `set_account` reopens ACCOUNTS.
+        };
+        account.balance = account.balance.checked_sub(amount).ok_or_else(|| {
+            StateStoreError::InsufficientBalance {
+                address: address.to_string(),
+                balance: account.balance,
+                amount,
+            }
+        })?;
         self.set_account(txn, address, &account)?;
         Ok(account.balance)
     }
@@ -645,4 +671,68 @@ fn merkle_root(mut leaves: Vec<[u8; 32]>) -> [u8; 32] {
         leaves = next_level;
     }
     leaves[0]
+}
+
+#[cfg(test)]
+mod sub_balance_tests {
+    use super::*;
+    use crate::Storage;
+    use kvnc_types::Address;
+    use tempfile::tempdir;
+
+    fn seeded(balance: u64) -> (tempfile::TempDir, Storage, Address) {
+        let dir = tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("sub.db")).unwrap();
+        let addr = Address([9; 32]);
+        let txn = storage.begin_write().unwrap();
+        storage.state().add_balance(&txn, &addr, balance).unwrap();
+        txn.commit().unwrap();
+        (dir, storage, addr)
+    }
+
+    fn balance(storage: &Storage, addr: &Address) -> u64 {
+        let txn = storage.begin_write().unwrap();
+        storage
+            .state()
+            .get_account_or_default_write(&txn, addr)
+            .unwrap()
+            .balance
+    }
+
+    #[test]
+    fn sub_balance_then_other_table_op_in_one_txn_commits() {
+        let (_dir, storage, addr) = seeded(1_000);
+        let other = Address([8; 32]);
+        let txn = storage.begin_write().unwrap();
+        let left = storage.state().sub_balance(&txn, &addr, 300).unwrap();
+        assert_eq!(left, 700);
+        // Another ACCOUNTS write and a STAKING_STATE table op in the same txn.
+        storage.state().add_balance(&txn, &other, 300).unwrap();
+        txn.open_table(crate::tables::STAKING_STATE).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(balance(&storage, &addr), 700);
+        assert_eq!(balance(&storage, &other), 300);
+    }
+
+    #[test]
+    fn sub_balance_overdraft_is_rejected_and_balance_unchanged() {
+        let (_dir, storage, addr) = seeded(100);
+        let txn = storage.begin_write().unwrap();
+        let err = storage.state().sub_balance(&txn, &addr, 101).unwrap_err();
+        assert!(
+            matches!(err, StateStoreError::InsufficientBalance { .. }),
+            "got {err:?}"
+        );
+        txn.commit().unwrap();
+        assert_eq!(balance(&storage, &addr), 100);
+    }
+
+    #[test]
+    fn sub_balance_exact_balance_to_zero() {
+        let (_dir, storage, addr) = seeded(250);
+        let txn = storage.begin_write().unwrap();
+        assert_eq!(storage.state().sub_balance(&txn, &addr, 250).unwrap(), 0);
+        txn.commit().unwrap();
+        assert_eq!(balance(&storage, &addr), 0);
+    }
 }
