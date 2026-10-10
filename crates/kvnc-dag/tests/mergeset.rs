@@ -117,7 +117,8 @@ fn test_mergeset_with_committed_leader() {
         &key,
     );
     dag.put_block(&leader1).unwrap();
-    dag.commit_leader(&leader1.digest).unwrap();
+    dag.mark_decided_and_commit_leader(3, &leader1.digest)
+        .unwrap();
 
     // Round 4
     let r4a = make_block(0, 4, vec![block_ref(&leader1)], "r4a", &key);
@@ -169,7 +170,8 @@ fn test_mergeset_boundary_leader() {
     // Round 3 - first leader (committed)
     let leader1 = make_block(0, 3, vec![block_ref(&r1a)], "leader1", &key);
     dag.put_block(&leader1).unwrap();
-    dag.commit_leader(&leader1.digest).unwrap();
+    dag.mark_decided_and_commit_leader(3, &leader1.digest)
+        .unwrap();
 
     // Round 6 - second leader, but its parent is leader1 (boundary case)
     let leader2 = make_block(0, 6, vec![block_ref(&leader1)], "leader2", &key);
@@ -291,4 +293,88 @@ fn test_mergeset_diamond_structure() {
     assert!(mergeset.contains(&r1a.digest));
     assert!(mergeset.contains(&genesis.digest));
     assert_eq!(mergeset.len(), 5);
+}
+
+/// Task #12: a late block below the last committed leader's round, not in
+/// any earlier leader's history, enters the next mergeset; consecutive
+/// mergesets never repeat a block and lose nothing.
+#[test]
+fn test_mergeset_late_block_delivered_and_no_duplicates() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path().join("test.db")).unwrap();
+    let dag = DagStore::new(storage).unwrap();
+    let (key, _) = kvnc_crypto::generate_keypair();
+
+    let genesis = make_block(0, 0, Vec::new(), "genesis", &key);
+    let r1a = make_block(0, 1, vec![block_ref(&genesis)], "r1a", &key);
+    let r2a = make_block(0, 2, vec![block_ref(&r1a)], "r2a", &key);
+    let leader1 = make_block(0, 3, vec![block_ref(&r2a)], "leader1", &key);
+    for b in [&genesis, &r1a, &r2a, &leader1] {
+        dag.put_block(b).unwrap();
+    }
+
+    let mut delivered = dag.mergeset(&leader1.digest).unwrap();
+    dag.mark_decided_and_commit_leader(3, &leader1.digest)
+        .unwrap();
+
+    // Late block: round 2 (< committed leader round 3), arrives after the
+    // commit and is not in leader1's history.
+    let late = make_block(1, 2, vec![block_ref(&r1a)], "late-r2", &key);
+    let r4a = make_block(0, 4, vec![block_ref(&leader1)], "r4a", &key);
+    let leader2 = make_block(
+        0,
+        6,
+        vec![block_ref(&r4a), block_ref(&late)],
+        "leader2",
+        &key,
+    );
+    for b in [&late, &r4a, &leader2] {
+        dag.put_block(b).unwrap();
+    }
+    let second = dag.mergeset(&leader2.digest).unwrap();
+    assert!(
+        second.contains(&late.digest),
+        "late block below the last leader's round must enter the next batch"
+    );
+    delivered.extend(second);
+    dag.mark_decided_and_commit_leader(6, &leader2.digest)
+        .unwrap();
+
+    let r7a = make_block(0, 7, vec![block_ref(&leader2)], "r7a", &key);
+    let leader3 = make_block(0, 9, vec![block_ref(&r7a)], "leader3", &key);
+    for b in [&r7a, &leader3] {
+        dag.put_block(b).unwrap();
+    }
+    delivered.extend(dag.mergeset(&leader3.digest).unwrap());
+
+    let unique: std::collections::HashSet<_> = delivered.iter().copied().collect();
+    assert_eq!(unique.len(), delivered.len(), "duplicate in mergesets");
+    // Nothing lost: all 9 blocks delivered exactly once.
+    assert_eq!(unique.len(), 9, "every block delivered once");
+}
+
+/// Task #12: the trait path (`compute_mergeset` / `already_committed`) works
+/// when the last committed leader block has been pruned.
+#[test]
+fn test_compute_mergeset_after_last_committed_pruned() {
+    let dir = tempdir().unwrap();
+    let storage = Storage::new(dir.path().join("test.db")).unwrap();
+    let dag = DagStore::new(storage).unwrap();
+    let (key, _) = kvnc_crypto::generate_keypair();
+
+    let genesis = make_block(0, 0, Vec::new(), "genesis", &key);
+    let leader1 = make_block(0, 3, vec![block_ref(&genesis)], "leader1", &key);
+    let r4a = make_block(0, 4, vec![block_ref(&leader1)], "r4a", &key);
+    let leader2 = make_block(0, 6, vec![block_ref(&r4a)], "leader2", &key);
+    for b in [&genesis, &leader1, &r4a, &leader2] {
+        dag.put_block(b).unwrap();
+    }
+    dag.mark_decided_and_commit_leader(3, &leader1.digest)
+        .unwrap();
+    dag.prune_below(3).unwrap(); // removes rounds <= 3, incl. last committed
+
+    let mergeset = compute_mergeset(&dag, &leader2.digest).expect("works after pruning");
+    assert!(mergeset.contains(&leader2.digest));
+    assert!(mergeset.contains(&r4a.digest));
+    assert_eq!(mergeset.len(), 2);
 }

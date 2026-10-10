@@ -1,17 +1,9 @@
-//! KVNC command-line interface.
+//! Kovanica (KUNA) command-line interface.
 //!
 //! Wallet operations (keygen/import/export/sign), node operations
 //! (status/balance/staking/governance) and contract subcommands
 //! (htlc/vault/multisig/token). All commands support `--json` for
 //! machine-readable output and `--rpc-url` to target a specific node.
-
-mod contracts;
-mod node;
-mod output;
-mod rpc;
-mod stake;
-mod tx;
-pub mod wallet;
 
 use std::{
     io::{self, Write},
@@ -22,16 +14,19 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
-use contracts::{ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand};
+use kvnc_cli::contracts::{
+    ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand,
+};
+use kvnc_cli::rpc::RpcClient;
+use kvnc_cli::{contracts, node, output, rpc, tx, wallet};
 use kvnc_types::transaction::TransactionKind;
 use kvnc_types::{crypto::PublicKey, crypto::SigningKey, Address};
-use rpc::RpcClient;
 use zeroize::Zeroizing;
 
 const UNSAFE_SIGN_WARNING: &str = "WARNING: arbitrary message signing is unsafe and cross-context; signatures may be replayed or misinterpreted by other protocols.";
 
 #[derive(Parser)]
-#[command(name = "kvnc", version, about = "Kovanica (KVNC) CLI", long_about = None)]
+#[command(name = "kvnc", version, about = "Kovanica (KUNA) CLI", long_about = None)]
 struct Cli {
     /// JSON-RPC endpoint of the node
     #[arg(long, global = true, default_value = "http://127.0.0.1:8545")]
@@ -61,7 +56,7 @@ enum Commands {
     Address(AddressArgs),
     /// Sign a message offline and print the signature as hex
     Sign(SignArgs),
-    /// Submit a native KVNC transfer
+    /// Submit a native KUNA transfer
     Transfer(TransferArgs),
     /// Show chain/node status
     Status,
@@ -69,9 +64,9 @@ enum Commands {
     Info,
     /// Query an account balance
     Balance { address: String },
-    /// Stake KVNC (builds and submits a signed Stake transaction)
+    /// Stake KUNA (builds and submits a signed Stake transaction)
     Stake(AmountArgs),
-    /// Unstake KVNC (builds and submits a signed Unstake transaction)
+    /// Unstake KUNA (builds and submits a signed Unstake transaction)
     Unstake(AmountArgs),
     /// Delegate stake to a validator
     Delegate(DelegateArgs),

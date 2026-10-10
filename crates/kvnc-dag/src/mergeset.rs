@@ -10,7 +10,6 @@
 use crate::dag_store::DagStore;
 use kvnc_types::hash::Hash;
 use std::collections::{HashSet, VecDeque};
-use std::sync::LazyLock;
 
 /// Trait that the DAG store should implement for mergeset computation.
 pub trait DagReachability {
@@ -20,8 +19,9 @@ pub trait DagReachability {
     /// Direct parents of a block.
     fn parents(&self, block: &Hash) -> Vec<Hash>;
 
-    /// All blocks that have already been committed in previous sub-dags.
-    fn already_committed(&self) -> &HashSet<Hash>;
+    /// All blocks already committed by previous sub-dags, i.e. by decided
+    /// leaders of rounds strictly below `leader`'s round (and their histories).
+    fn already_committed(&self, leader: &Hash) -> Result<HashSet<Hash>, crate::DagStoreError>;
 
     /// Get a block by hash (for reading round info).
     fn get_block(
@@ -45,23 +45,18 @@ pub fn compute_mergeset<D: DagReachability>(
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
-    let committed_leader_round = dag.committed_leader_round()?;
+    // Cutoff is the actual committed set, not the last leader's round, so a
+    // late lower-round block that no earlier leader referenced is included.
+    let committed = dag.already_committed(leader)?;
 
     queue.push_back(*leader);
     visited.insert(*leader);
 
     while let Some(current) = queue.pop_front() {
-        let block = dag.get_block(&current)?;
-
-        // If there's a committed leader and this block's round is <= committed_leader_round,
-        // it's already in a previous sub-DAG. Don't include it and don't traverse further.
-        if current != *leader {
-            if let Some(committed_round) = committed_leader_round {
-                if block.round <= committed_round {
-                    continue;
-                }
-            }
+        if current != *leader && committed.contains(&current) {
+            continue;
         }
+        dag.get_block(&current)?;
 
         result.push(current);
 
@@ -90,12 +85,9 @@ impl DagReachability for DagStore {
         self.get_parents(block).unwrap_or_default()
     }
 
-    fn already_committed(&self) -> &HashSet<Hash> {
-        // This is a placeholder - in reality we'd maintain a committed set.
-        // For now, we compute committed blocks on-the-fly in compute_mergeset
-        // using committed_leader_round.
-        static EMPTY: LazyLock<HashSet<Hash>> = LazyLock::new(HashSet::new);
-        &EMPTY
+    fn already_committed(&self, leader: &Hash) -> Result<HashSet<Hash>, crate::DagStoreError> {
+        let round = DagStore::get_block(self, leader)?.round;
+        self.committed_before(round)
     }
 
     fn get_block(
@@ -107,10 +99,12 @@ impl DagReachability for DagStore {
 
     fn committed_leader_round(&self) -> Result<Option<u64>, crate::DagStoreError> {
         match self.get_last_committed()? {
-            Some(last_committed_hash) => {
-                let block = self.get_block(&last_committed_hash)?;
-                Ok(Some(block.round))
-            }
+            Some(last_committed_hash) => match DagStore::get_block(self, &last_committed_hash) {
+                Ok(block) => Ok(Some(block.round)),
+                // Last committed block pruned: its round is unknown.
+                Err(crate::DagStoreError::NotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
             None => Ok(None), // No committed leaders yet - don't stop
         }
     }

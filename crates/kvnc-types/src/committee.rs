@@ -4,7 +4,7 @@ use crate::crypto::PublicKey;
 use crate::Address;
 use serde::{Deserialize, Serialize};
 
-/// Stake amount (in smallest units of KVNC).
+/// Stake amount (in smallest units of KUNA).
 pub type Stake = u64;
 
 /// Single authority (validator).

@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 /// Protocol name for state sync request-response.
 pub const STATE_SYNC_PROTOCOL: &str = "/kvanc/state-sync/1.0.0";
 
+/// Maximum state sync request size.
+pub const MAX_STATE_SYNC_REQUEST_SIZE: usize = 1024;
+
 /// Maximum response size (10 MB for state snapshots).
-#[allow(dead_code)]
 pub const MAX_STATE_SYNC_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 
 /// State sync request.
@@ -98,8 +100,7 @@ impl Codec for StateSyncCodec {
     where
         T: AsyncReadExt + Unpin + Send,
     {
-        let mut buf = Vec::new();
-        io.read_to_end(&mut buf).await?;
+        let buf = crate::block_sync::read_bounded(io, MAX_STATE_SYNC_REQUEST_SIZE).await?;
         bincode::deserialize(&buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -112,8 +113,7 @@ impl Codec for StateSyncCodec {
     where
         T: AsyncReadExt + Unpin + Send,
     {
-        let mut buf = Vec::new();
-        io.read_to_end(&mut buf).await?;
+        let buf = crate::block_sync::read_bounded(io, MAX_STATE_SYNC_RESPONSE_SIZE).await?;
         bincode::deserialize(&buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }

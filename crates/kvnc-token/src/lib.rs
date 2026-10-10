@@ -15,7 +15,7 @@
 //! Token balances live in the contract's **own serialized state** (a
 //! `BTreeMap`), NOT in native host balances. `transfer` / `transfer_from` /
 //! `mint` / `burn` never call `Host::transfer` — only the contract's storage
-//! changes. Native KVNC and token balances are therefore fully independent.
+//! changes. Native KUNA and token balances are therefore fully independent.
 //!
 //! ## Storage keys (FIXED)
 //!
@@ -423,7 +423,7 @@ mod tests {
         Token::create(
             &mut host,
             String::from("Kovanica"),
-            String::from("KVNC"),
+            String::from("KUNA"),
             8,
             supply,
         )
@@ -436,7 +436,7 @@ mod tests {
         let host = new_token(addr(A), 1_000);
         let t = Token::load(&host).unwrap();
         assert_eq!(t.name, "Kovanica");
-        assert_eq!(t.symbol, "KVNC");
+        assert_eq!(t.symbol, "KUNA");
         assert_eq!(t.decimals, 8);
         assert_eq!(t.total_supply, 1_000);
         assert_eq!(t.owner, addr(A));
