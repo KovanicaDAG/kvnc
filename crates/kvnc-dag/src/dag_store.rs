@@ -525,8 +525,7 @@ impl DagStore {
                     .get((round, author))?
                     .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
                     .unwrap_or_default();
-                let filtered: Vec<[u8; 32]> =
-                    existing.into_iter().filter(|h| *h != key).collect();
+                let filtered: Vec<[u8; 32]> = existing.into_iter().filter(|h| *h != key).collect();
                 if filtered.is_empty() {
                     table.remove((round, author))?;
                 } else {
@@ -539,8 +538,7 @@ impl DagStore {
                     .get((author, round))?
                     .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
                     .unwrap_or_default();
-                let filtered: Vec<[u8; 32]> =
-                    existing.into_iter().filter(|h| *h != key).collect();
+                let filtered: Vec<[u8; 32]> = existing.into_iter().filter(|h| *h != key).collect();
                 if filtered.is_empty() {
                     table.remove((author, round))?;
                 } else {

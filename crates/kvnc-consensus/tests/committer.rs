@@ -848,14 +848,19 @@ fn test_try_commit_direct_commit_end_to_end() {
     );
 }
 
-/// Rounds that never reach quorum are passed over; a later certified round
-/// commits. Threshold soundness: the un-certified round must never be marked
-/// Commit.
+/// A round that never reaches quorum and is NOT in the later certified
+/// leader's causal history is decided Skip by the indirect rule (never passed
+/// over undecided); the later certified round then commits. Threshold
+/// soundness: the un-certified round must never be marked Commit.
+///
+/// (Task #3: previously b3 descended from b1 and the test asserted b1 was
+/// silently passed over. Under the indirect rule such a b1 is Commit; that
+/// case is covered by `commit_order_*` unit tests in `src/committer.rs`.)
 #[test]
 fn test_try_commit_passes_over_uncertified_round() {
     let g = genesis();
     let b1 = make_block(0, 1, vec![block_ref(&g)], "b1");
-    let b3 = make_block(1, 3, vec![block_ref(&b1)], "b3");
+    let b3 = make_block(1, 3, vec![block_ref(&g)], "b3");
     let dag = MockDag::with_blocks([g, b1, b3.clone()]);
 
     let committer = UniversalCommitter::new(committee(4), false, 100);
@@ -894,14 +899,16 @@ fn test_try_commit_passes_over_uncertified_round() {
         Some(LeaderStatus::Commit),
         "round 1 had only 1 of 4 votes"
     );
-    // And no round is ever both committed and skipped.
-    for (round, info) in &decided {
-        assert_ne!(
-            info.status,
-            LeaderStatus::Skip,
-            "round {round} committed without ever being skipped"
-        );
-    }
+    // Round 1 is passed over only via an explicit indirect Skip decision.
+    assert_eq!(
+        decided.get(&1).map(|l| l.status),
+        Some(LeaderStatus::Skip),
+        "round 1 must be explicitly skipped, not silently passed over"
+    );
+    assert_eq!(
+        decided.get(&3).map(|l| l.status),
+        Some(LeaderStatus::Commit)
+    );
 }
 
 /// Round 0 is exempt from commits even with full quorum (genesis handling).

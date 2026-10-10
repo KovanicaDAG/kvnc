@@ -106,7 +106,12 @@ impl BaseCommitter {
     }
 
     /// Check if there's a causal path from one leader to another.
-    fn has_path(&self, dag_store: &dyn DagStoreTrait, from: &LeaderInfo, to: &LeaderInfo) -> bool {
+    pub(crate) fn has_path(
+        &self,
+        dag_store: &dyn DagStoreTrait,
+        from: &LeaderInfo,
+        to: &LeaderInfo,
+    ) -> bool {
         if let Some(from_hash) = from.block_hash {
             if let Some(to_hash) = to.block_hash {
                 match dag_store.get_ancestors(&to_hash, from.round) {
@@ -123,6 +128,20 @@ impl BaseCommitter {
 
     fn wave_of(&self, round: Round) -> u64 {
         round / kvnc_types::WAVE_LENGTH
+    }
+}
+
+/// Helper: registered leaders strictly after `round`, in round order.
+trait RangeAfter {
+    fn range_after(&self, round: Round) -> Vec<LeaderInfo>;
+}
+
+impl RangeAfter for HashMap<Round, LeaderInfo> {
+    fn range_after(&self, round: Round) -> Vec<LeaderInfo> {
+        let mut later: Vec<LeaderInfo> =
+            self.values().filter(|l| l.round > round).cloned().collect();
+        later.sort_unstable_by_key(|l| l.round);
+        later
     }
 }
 
@@ -352,6 +371,11 @@ impl UniversalCommitter {
         // reachable (there is no fixed look-ahead cap) at a cost proportional to
         // the number of known leaders. A round already present in `decided` is
         // skipped, and no integer round without a leader is ever visited.
+        //
+        // The walk is strictly in round order and stops at the first leader
+        // that is still Undecided (see below), so commits are emitted in
+        // strictly increasing round order and no leader is passed over
+        // without an explicit Skip decision.
         let max_checked = leaders.keys().copied().max().unwrap_or(last_decided);
         let mut candidate_rounds: Vec<Round> = leaders
             .keys()
@@ -401,7 +425,9 @@ impl UniversalCommitter {
             }
 
             // Try indirect decision
-            let indirect_status = self.base.try_indirect_decide(dag_store, leader_info, &decided);
+            let indirect_status = self
+                .base
+                .try_indirect_decide(dag_store, leader_info, &decided);
             if indirect_status == LeaderStatus::Commit {
                 // Construct only; candidate-only callers do not publish it.
                 return self
@@ -414,7 +440,39 @@ impl UniversalCommitter {
                 continue;
             }
 
-            // Still undecided: move on to the next registered leader round.
+            // Still undecided. A later leader may decide this one only via the
+            // indirect rule: the nearest later leader that is committed
+            // (directly, by quorum, or already decided Commit) acts as anchor.
+            // Commit if this leader is in the anchor's causal history, Skip
+            // otherwise. Without an anchor we stop here: no commit may ever
+            // pass over an undecided round leader.
+            let anchor = leaders.range_after(round).into_iter().find(|later| {
+                later.block_hash.is_some()
+                    && (self.base.try_direct_decide(dag_store, later) == LeaderStatus::Commit
+                        || decided
+                            .get(&later.round)
+                            .map(|d| d.status == LeaderStatus::Commit)
+                            .unwrap_or(false))
+            });
+            let Some(anchor) = anchor else {
+                break;
+            };
+            if self.base.has_path(dag_store, leader_info, &anchor) {
+                debug!(
+                    "Indirect commit: leader round {} in history of committed leader round {}",
+                    round, anchor.round
+                );
+                return self
+                    .build_committed_subdag(dag_store, leader_info)
+                    .map(|(subdag, colouring)| (subdag, leader_info.clone(), colouring));
+            }
+            debug!(
+                "Indirect skip: leader round {} not in history of committed leader round {}",
+                round, anchor.round
+            );
+            let mut skipped = leader_info.clone();
+            skipped.status = LeaderStatus::Skip;
+            self.mark_decided(round, skipped);
         }
 
         None
@@ -655,8 +713,10 @@ impl UniversalCommitter {
         dag_store: &D,
         leader_hash: &Hash,
     ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
-        let ancestors: HashSet<Hash> =
-            dag_store.get_ancestors(leader_hash, 0)?.into_iter().collect();
+        let ancestors: HashSet<Hash> = dag_store
+            .get_ancestors(leader_hash, 0)?
+            .into_iter()
+            .collect();
         let decided_rounds = dag_store.get_decided_rounds(u64::MAX)?;
         let mut tips = Vec::new();
 
@@ -1133,5 +1193,132 @@ mod tests {
             .try_commit(&dag)
             .expect("a leader beyond the old cap must still be reached");
         assert_eq!(committed.leader_round, far_round);
+    }
+
+    // -----------------------------------------------------------------
+    // #3: commit order — never commit over an undecided earlier leader
+    // -----------------------------------------------------------------
+
+    /// Earlier leader (round 5, wave 1) has no quorum, later leader (round 6,
+    /// wave 2) has quorum. Crossing a wave boundary means the same-wave sweep
+    /// cannot rescue the earlier leader. Returns (dag, committer, earlier block, later block).
+    fn gap_fixture(
+        earlier_in_history: bool,
+    ) -> (
+        RecordingDag,
+        UniversalCommitter,
+        StatementBlock,
+        StatementBlock,
+    ) {
+        let genesis = make_block(0, 0, vec![], "genesis");
+        let earlier = make_block(1, 5, vec![block_ref(&genesis)], "earlier-5");
+        let later_parents = if earlier_in_history {
+            vec![block_ref(&earlier)]
+        } else {
+            vec![block_ref(&genesis)]
+        };
+        let later = make_block(2, 6, later_parents, "later-6");
+        let mut dag = RecordingDag::default();
+        dag.insert(genesis.clone());
+        dag.insert(earlier.clone());
+        dag.insert(later.clone());
+        dag.set_ancestors(earlier.digest, vec![genesis.digest]);
+        let later_anc = if earlier_in_history {
+            vec![earlier.digest, genesis.digest]
+        } else {
+            vec![genesis.digest]
+        };
+        dag.set_ancestors(later.digest, later_anc);
+
+        let committer = UniversalCommitter::new(committee(4), false, 100);
+        committer.update_leader(leader(5, 1, Some(earlier.digest)));
+        committer.update_leader(leader(6, 2, Some(later.digest)));
+        // Only one vote for the earlier leader: Undecided on its own.
+        committer.add_vote(5, 0, earlier.digest);
+        for voter in [0u16, 1, 2] {
+            committer.add_vote(6, voter, later.digest);
+        }
+        (dag, committer, earlier, later)
+    }
+
+    fn drain(committer: &UniversalCommitter, dag: &RecordingDag) -> Vec<Round> {
+        let mut out = Vec::new();
+        for _ in 0..16 {
+            match committer
+                .try_commit_and_mark_durable(dag)
+                .expect("no storage error")
+            {
+                Some(sub) => out.push(sub.leader_round),
+                None => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn commit_order_no_commit_over_undecided_gap_earlier_decided_indirectly() {
+        let (dag, committer, earlier, _) = gap_fixture(true);
+        let first = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("no storage error")
+            .expect("something commits");
+        assert_eq!(
+            first.leader_round, 5,
+            "earlier leader in later's history must be indirectly committed first, not jumped over"
+        );
+        assert_eq!(first.leader.digest, earlier.digest);
+    }
+
+    #[test]
+    fn commit_order_no_commit_over_undecided_gap_without_anchor() {
+        // Later leader has no quorum either: nothing may commit at all.
+        let (dag, committer, _, later) = gap_fixture(true);
+        let fresh = UniversalCommitter::new(committee(4), false, 100);
+        for l in committer.get_all_leaders().into_values() {
+            let mut l = l;
+            l.votes.clear();
+            l.status = LeaderStatus::Undecided;
+            fresh.update_leader(l);
+        }
+        fresh.add_vote(6, 0, later.digest);
+        assert!(drain(&fresh, &dag).is_empty());
+        assert_eq!(fresh.last_decided_round(), 0);
+    }
+
+    #[test]
+    fn commit_order_no_leader_skipped_without_skip_decision() {
+        for in_history in [true, false] {
+            let (dag, committer, _, _) = gap_fixture(in_history);
+            drain(&committer, &dag);
+            let last = committer.last_decided_round();
+            let decided = committer.get_all_decided_leaders();
+            for round in committer.get_all_leaders().into_keys() {
+                if round <= last {
+                    let status = decided.get(&round).map(|l| l.status);
+                    assert!(
+                        matches!(status, Some(LeaderStatus::Commit) | Some(LeaderStatus::Skip)),
+                        "round {round} is below last_decided={last} but has no decision ({status:?}), in_history={in_history}"
+                    );
+                }
+            }
+            if !in_history {
+                assert_eq!(
+                    decided.get(&5).map(|l| l.status),
+                    Some(LeaderStatus::Skip),
+                    "earlier leader outside later's history must be explicitly Skipped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commit_order_sequence_strictly_increasing_and_complete() {
+        let (dag, committer, _, _) = gap_fixture(true);
+        let seq = drain(&committer, &dag);
+        assert!(
+            seq.windows(2).all(|w| w[0] < w[1]),
+            "commit sequence must be strictly increasing by round: {seq:?}"
+        );
+        assert_eq!(seq, vec![5, 6], "both leaders committed, in round order");
     }
 }
