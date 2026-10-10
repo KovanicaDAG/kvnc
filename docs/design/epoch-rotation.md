@@ -27,6 +27,8 @@ state sync across epochs (`docs/STATE-SYNC.md`), key rotation inside an epoch.
 |---|---|---|
 | Committee + epoch | `kvnc-consensus/src/types.rs` `CommitteeInfo { epoch, authorities, .. }`, `epoch()` | set once at startup, always 0 |
 | Vote ctx | `kvnc-consensus/src/engine.rs` `vote_signing_ctx()` | `chain_id` from local ctx + `self.committee.epoch()`; never from the message |
+| Own votes | engine `vote_for_leader` (round loop + late vote from `process_block`, #43) | exactly once per leader round via the in-memory `voted_rounds` |
+| Red blocks | `CommittedSubDag::non_blue`, `non_blue_refs` / `non_blue_transactions` (#47) | not executed as blocks; removed only by round pruning |
 | Vote bytes | `kvnc-types/src/vote.rs` `Vote::signature_data(ctx)` | 74 bytes, `KUNA/vote/v1` + chain_id + epoch + voter + leader_round + leader_hash. `Vote` itself has **no epoch field** |
 | Tx ctx | `kvnc-types/src/transaction.rs` | `chain_id` only; epoch is NOT part of tx hash (test `epoch_is_not_part_of_tx_hash`) |
 | Node ctx | `kvnc-node/src/main.rs:447` | `SigningContext::new(chain_id).with_epoch(committee.epoch())` |
@@ -95,6 +97,11 @@ fn signing_ctx_for_round(s: &EpochSchedule, chain_id: u64, r: Round)
 - `vote_signing_ctx()` and block verification become
   `signing_ctx_for_round(schedule, local chain_id, round)`. Only local state
   is used, never the message, so the v1 rule still holds.
+- Own votes: `vote_for_leader(r)` signs with `ctx(r)` of the **leader round**,
+  not the current epoch. That matters for a late vote (#43) cast after the
+  boundary for a leader of `e-1`; it uses `C(e-1)`'s epoch, consistent with
+  the votes table below. `voted_rounds` stays keyed by round (rounds are
+  global), so no epoch dimension is needed.
 
 ### 3.3 Context per round: blocks and votes alike
 
@@ -218,6 +225,9 @@ No change to the v1 byte format, so no new signature version is needed.
   not leak across epochs.
 - **Pruning**: `prune_waves_before` must not remove the closing wave before the
   next epoch's first commit (recovery needs it). `DAG_EPOCHS` is never pruned.
+  Red blocks (`non_blue`, #47) are removed only by round pruning, so the
+  same window must cover them until the closing sub-DAG's
+  `non_blue_transactions` are read.
 
 ## 7. Test plan
 

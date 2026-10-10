@@ -22,8 +22,12 @@ conditions in §3.5 hold.
   (`kvnc-consensus/src/lib.rs` `is_leader_round`, `is_vote_round`).
 - Proposing: engine `propose_block` runs only when `is_leader_for_round`
   (`engine.rs:417`); leader from `CommitteeInfo::leader(round)` or `leader_schedule`.
-- Votes: `produce_vote` on vote rounds signs a `Vote { leader_round, leader_hash, voter, signature }`
-  (v1 ctx); `process_vote` verifies and accumulates stake in `LeaderInfo.votes`.
+- Votes: `vote_for_leader(leader_round)` signs a `Vote { leader_round, leader_hash, voter, signature }`
+  (v1 ctx). It is called by the round loop at the vote round (`produce_vote`) and,
+  since #43, again from `process_block` when the leader block arrives after the
+  vote round (late vote). The in-memory `voted_rounds` set makes it exactly once
+  per round (not persisted across restarts). `process_vote` verifies and
+  accumulates stake in `LeaderInfo.votes`.
 - Commit: `committer.rs` `try_commit_with_leader` stops at the first Undecided
   leader; Commit requires the leader's own vote quorum; earlier undecided
   leaders get explicit Skip when a later one decides (#18).
@@ -34,8 +38,13 @@ conditions in §3.5 hold.
 - Validation: `validate_block` is bounded (#4): direct parents exist,
   `parent.round < block.round`, gap ≤ `MAX_PARENT_ROUND_GAP`, below the durable
   prune boundary accepted.
-- Pruning: `prune_waves_before` (round-based, durable boundary) and
-  `prune_non_blue` (MysticGhost red blocks; being retired by #13).
+- MysticGhost red blocks (#47): reported in `CommittedSubDag::non_blue`
+  (`non_blue_refs`: round order, digest tie-break), never executed as blocks;
+  their transactions come from `non_blue_transactions` (deduped, blue txs
+  excluded).
+- Pruning: only `prune_waves_before` (round-based, durable boundary). The
+  committer no longer calls `prune_non_blue` (deprecated), so red blocks are
+  removed only by round pruning.
 
 ## 3. Model
 
@@ -101,13 +110,14 @@ separate owner decision and PR (feature flag in `UniversalCommitter`).
   committed set (#27) becomes necessary for performance.
 - **Mergeset / MysticGhost (dag + consensus)**: mergeset sizes grow with n;
   blue/red classification (GHOSTDAG `k`) must be re-tuned for n blocks per round.
-  With #13, red blocks are returned as `non_blue` (not executed as blocks);
-  their transactions must be deduped against blue ones — more overlap expected
-  because all proposers pull from the same mempool.
+  Red blocks are already returned as `non_blue` (#47, not executed as blocks),
+  and `non_blue_transactions` dedups their transactions against the blue ones.
+  Expect more overlap, because all proposers pull from the same mempool.
 - **Pruning (dag)**: `prune_waves_before` remains round-based. The prune window
   must keep at least the rounds needed for the indirect rule (leaders up to the
   next committed leader + 2 rounds) and anything an undelivered batch needs
-  (correctness condition already documented at `uncommitted_history`). Storage
+  (correctness condition already documented at `uncommitted_history`), including
+  red blocks until their sub-DAG's `non_blue_transactions` have been read. Storage
   per round grows n×; window may need to shrink in rounds.
 - **`validate_block` (dag)**: add checks — parents of round `r-1` sum to
   ≥ quorum stake; at most one parent per author per round; own previous block
@@ -118,7 +128,9 @@ separate owner decision and PR (feature flag in `UniversalCommitter`).
   quorum parents (round `r-1`) to be above the boundary — true by construction
   when the window ≫ 1 round.
 - **Engine**: proposal loop for every round, wait-for-quorum of `r-1` with
-  timeout; `produce_vote`/`process_vote` replaced by DAG-derived decisions;
+  timeout; `vote_for_leader` (round-loop and late-vote paths, `voted_rounds`)
+  and `process_vote` replaced by DAG-derived decisions. A late leader block
+  then simply gets referenced by later blocks, so the late-vote path disappears;
   leader timeout still produces Skip only through §3.3 rules (or a timeout path
   kept as today).
 - **Network/mempool (Network)**: block gossip volume ×n; vote topic retired;
