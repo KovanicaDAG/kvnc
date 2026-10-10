@@ -54,7 +54,7 @@ pub fn verify_vote(
     let key = keys
         .get(&vote.voter)
         .ok_or(Rejection::UnknownAuthority(vote.voter))?;
-    kvnc_crypto::verify(key, &vote.signature_data(ctx), &vote.signature)
+    kvnc_crypto::verify_vote_signature(ctx, vote, key)
         .map_err(|_| Rejection::BadSignature(vote.voter))
 }
 

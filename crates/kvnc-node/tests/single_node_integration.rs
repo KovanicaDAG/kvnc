@@ -91,7 +91,10 @@ fn drive_single_node(use_mysticghost: bool) -> SingleNodeRun {
 fn execute_and_credit(subdag: &CommittedSubDag) -> (u64, Address) {
     let dir = tempfile::tempdir().expect("tempdir");
     let storage = Storage::new(dir.path().join("single-node.redb")).expect("storage");
-    let mut ctx = ExecutionContext::new();
+    // Explicit context matching the node's default `chain_id` (local).
+    let mut ctx = ExecutionContext::with_signing_context(kvnc_types::SigningContext::new(
+        kvnc_types::signing::chain_id::LOCAL,
+    ));
 
     let mut payouts = Vec::new();
     for i in 0..4u8 {

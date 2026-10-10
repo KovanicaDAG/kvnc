@@ -41,6 +41,11 @@ pub struct NodeConfig {
     /// JSON-RPC rate limit, in requests per minute per client IP. `0` disables
     /// rate limiting. Overridable with `KVNC_RPC_RATE_LIMIT_PER_MIN`.
     pub rpc_rate_limit_per_min: u32,
+    /// Chain id bound into every v1 signature (see `docs/SIGNATURE_FORMAT.md`):
+    /// 1 mainnet, 2 testnet, 3 devnet, 1337 local. Must match the genesis
+    /// chain id; the node refuses to start otherwise. Overridable with
+    /// `KVNC_CHAIN_ID`.
+    pub chain_id: u64,
 }
 
 impl Default for NodeConfig {
@@ -62,6 +67,7 @@ impl Default for NodeConfig {
             use_mysticghost: false,
             run_validator: true,
             rpc_rate_limit_per_min: 60,
+            chain_id: kvnc_types::signing::chain_id::LOCAL,
         }
     }
 }
@@ -149,6 +155,12 @@ impl NodeConfig {
                 _ => tracing::warn!(value = %v, "ignoring invalid KVNC_RUN_VALIDATOR"),
             }
         }
+        if let Ok(v) = std::env::var("KVNC_CHAIN_ID") {
+            match v.trim().parse() {
+                Ok(id) => self.chain_id = id,
+                Err(_) => tracing::warn!(value = %v, "ignoring invalid KVNC_CHAIN_ID"),
+            }
+        }
         if let Ok(v) = std::env::var("KVNC_RPC_RATE_LIMIT_PER_MIN") {
             match v.parse() {
                 Ok(rate) => self.rpc_rate_limit_per_min = rate,
@@ -182,6 +194,12 @@ impl NodeConfig {
         }
         if self.max_peers == 0 {
             anyhow::bail!("max_peers must be greater than 0");
+        }
+        if !kvnc_types::signing::chain_id::is_registered(self.chain_id) {
+            anyhow::bail!(
+                "chain_id {} is not registered (expected 1 mainnet, 2 testnet, 3 devnet or 1337 local)",
+                self.chain_id
+            );
         }
         self.rpc_socket_addr()?;
         Ok(())
@@ -323,5 +341,28 @@ treasury_address = "treasury-address-placeholder"
         let mut c = base;
         c.rpc_addr = "not an ip".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_only_registered_chain_ids() {
+        let base = NodeConfig {
+            run_validator: false,
+            ..NodeConfig::default()
+        };
+        assert_eq!(base.chain_id, 1337, "default is the local chain");
+        for id in [1, 2, 3, 1337] {
+            let c = NodeConfig {
+                chain_id: id,
+                ..base.clone()
+            };
+            c.validate().expect("registered chain id is valid");
+        }
+        for id in [0, 4, 42, u64::MAX] {
+            let c = NodeConfig {
+                chain_id: id,
+                ..base.clone()
+            };
+            assert!(c.validate().is_err(), "chain id {id} must be rejected");
+        }
     }
 }
