@@ -231,6 +231,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             "founder_address_bytes": hex::encode(founder.0),
             "founder_premine_atoms": FOUNDER_PREMINE,
             "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
+            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KVNC,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
