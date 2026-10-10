@@ -40,10 +40,13 @@ use kvnc_consensus::metrics::{record_mempool_size, record_peer_count};
 use kvnc_consensus::{AuthorityInfo, CommitteeInfo, ConsensusConfig, ConsensusEngine, Vote};
 use kvnc_dag::{BlockManager, BlockManagerError, DagStore, DagStoreError};
 use kvnc_execution::ExecutionContext;
-use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
-use kvnc_network::{NetworkConfig, NetworkEvent, NetworkService, BlockSyncRequest, BlockSyncResponse, StateSyncResponse};
-use kvnc_rpc::{EventBus, RpcServer, RpcState, AuthConfig, RateLimitConfig, RateLimiterState};
 use kvnc_execution::{LogPublisher, TransactionReceipt};
+use kvnc_mempool::{Mempool, MempoolConfig, MempoolError};
+use kvnc_network::{
+    BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
+    StateSyncResponse,
+};
+use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -263,7 +266,7 @@ struct GenesisValidatorInput {
 
 /// Install the tracing subscriber, honouring `RUST_LOG` when set.
 fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let json_layer = fmt::layer()
@@ -476,6 +479,15 @@ where
             .context("creating network service")?;
     // Share one service between the swarm event loop and the broadcast command
     // loop so broadcast commands never re-enter `start` or rebuild listeners.
+    // Votes and blocks are authenticated against the committee at the network
+    // edge before they are forwarded or handed to consensus.
+    network.set_authority_keys(
+        committee
+            .authorities()
+            .iter()
+            .map(|authority| (authority.index, authority.public_key))
+            .collect(),
+    );
     let network = Arc::new(network);
     let peer_count = network.peer_count_handle();
     let peer_count_for_rpc = peer_count.clone();
@@ -493,7 +505,8 @@ where
     // Fan-out bus for WebSocket subscription events (newHeads,
     // newCommittedLeader, pendingTransactions).
     let events = EventBus::new();
-    let rate_limit_config = RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    let rate_limit_config =
+        RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
     let rpc_state = RpcState {
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
@@ -503,28 +516,33 @@ where
         peer_count: peer_count_for_rpc,
         events: events.clone(),
         rate_limiter: Arc::new(RateLimiterState::new(rate_limit_config.clone())),
-        auth_config: Arc::new(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-            AuthConfig {
-                write_tokens: vec!["test".to_string()],
-                require_auth_for_writes: false,
-            }
-        } else {
-            AuthConfig::default()
-        }),
+        auth_config: Arc::new(
+            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+                AuthConfig {
+                    write_tokens: vec!["test".to_string()],
+                    require_auth_for_writes: false,
+                }
+            } else {
+                AuthConfig::default()
+            },
+        ),
     };
     let rpc_server = RpcServer::new(
         rpc_socket,
         rpc_state,
         Some(rate_limit_config),
-        Some(if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
-            AuthConfig {
-                write_tokens: vec!["test".to_string()],
-                require_auth_for_writes: false,
-            }
-        } else {
-            AuthConfig::default()
-        }),
-    ).await;
+        Some(
+            if std::env::var("KVNC_RPC_AUTH").as_deref() == Ok("disable") {
+                AuthConfig {
+                    write_tokens: vec!["test".to_string()],
+                    require_auth_for_writes: false,
+                }
+            } else {
+                AuthConfig::default()
+            },
+        ),
+    )
+    .await;
     let rpc_handle = rpc_server.start().await.context("starting RPC server")?;
 
     // ------------------------------------------------------------------
@@ -621,7 +639,6 @@ where
         network_events,
         mempool.clone(),
         engine.clone(),
-        dag_store.clone(),
         network_cmd_tx.clone(),
         events.clone(),
         shutdown_rx.clone(),
@@ -892,7 +909,6 @@ async fn run_event_handler(
     mut network_events: mpsc::UnboundedReceiver<NetworkEvent>,
     mempool: Arc<Mempool>,
     engine: Arc<ConsensusEngine<NodeDagStore, NodeBlockManager>>,
-    dag_store: Arc<DagStore>,
     network_cmd_tx: mpsc::UnboundedSender<NetworkCommand>,
     events: EventBus,
     mut shutdown: watch::Receiver<bool>,
@@ -904,7 +920,6 @@ async fn run_event_handler(
                     event,
                     &mempool,
                     &engine,
-                    &dag_store,
                     &network_cmd_tx,
                     &events,
                 ),
@@ -924,7 +939,6 @@ fn handle_network_event(
     event: NetworkEvent,
     mempool: &Mempool,
     engine: &ConsensusEngine<NodeDagStore, NodeBlockManager>,
-    dag_store: &DagStore,
     network_cmd_tx: &mpsc::UnboundedSender<NetworkCommand>,
     events: &EventBus,
 ) {
@@ -987,13 +1001,15 @@ fn handle_network_event(
             debug!(%peer, ?response, "block sync response received");
             match response {
                 BlockSyncResponse::Block(block) => {
-                    // Hot-path validation before inserting into DAG
-                    if let Err(e) = kvnc_crypto::verify_batch(std::slice::from_ref(&block)) {
-                        warn!(digest = %block.digest, error = %e, "rejected invalid block signature from sync response");
-                    } else {
-                        match dag_store.put_block(&block) {
-                            Ok(()) => debug!(digest = %block.digest, "synced block inserted into DAG"),
-                            Err(e) => warn!(digest = %block.digest, error = %e, "failed to insert synced block"),
+                    // Synced blocks take the same path as gossiped ones: the
+                    // network layer already checked digest/merkle/signature and
+                    // that it is the block we asked for; the engine's block
+                    // manager validates parents before anything is stored. A
+                    // synced block is never written to the DAG directly.
+                    match engine.process_block(&block) {
+                        Ok(()) => debug!(digest = %block.digest, "synced block validated into DAG"),
+                        Err(e) => {
+                            warn!(digest = %block.digest, error = %e, "rejected synced block")
                         }
                     }
                 }
@@ -1008,7 +1024,9 @@ fn handle_network_event(
                     // Re-request each missing block
                     for hash in hashes {
                         let request = BlockSyncRequest::ByHash(hash);
-                        if let Err(e) = network_cmd_tx.send(NetworkCommand::RequestSync(peer, request)) {
+                        if let Err(e) =
+                            network_cmd_tx.send(NetworkCommand::RequestSync(peer, request))
+                        {
                             debug!(error = %e, "failed to queue re-request for missing block");
                         }
                     }
