@@ -206,7 +206,9 @@ where
     commit_trigger_lock: Mutex<()>,
     /// Mempool for transaction selection during block proposal.
     mempool: Option<Arc<Mempool>>,
-    /// Signing context (chain_id/epoch) for vote signature bytes.
+    /// Local signing context. Only its `chain_id` is used for votes; the
+    /// vote epoch always comes from the local [`CommitteeInfo`] (see
+    /// [`Self::vote_signing_ctx`]).
     signing_ctx: kvnc_types::SigningContext,
     /// Timeout deadline for the current leader slot (round, instant).
     leader_deadline: RwLock<Option<(Round, std::time::Instant)>>,
@@ -512,7 +514,10 @@ where
             voter: our_authority,
             signature: kvnc_types::Signature([0u8; 64]),
         };
-        vote.signature = sign(&self.signing_key, &vote.signature_data(&self.signing_ctx));
+        vote.signature = sign(
+            &self.signing_key,
+            &vote.signature_data(&self.vote_signing_ctx()),
+        );
 
         // Record the vote locally
         self.committer
@@ -533,12 +538,17 @@ where
         Ok(())
     }
 
-    /// Helper to create the data signed for a vote.
-    fn vote_signature_data(leader_round: Round, leader_hash: Hash) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&leader_round.to_le_bytes());
-        data.extend_from_slice(&leader_hash.0);
-        data
+    /// Signing context for votes (v1, domain tag `KUNA/vote/v1`).
+    ///
+    /// Built ONLY from local state: the node's configured `chain_id` and the
+    /// epoch of the local committee that is checking/casting the vote. Nothing
+    /// from the network message (or a caller-supplied epoch) is used, so a
+    /// vote signed for another chain or another epoch never verifies.
+    fn vote_signing_ctx(&self) -> kvnc_types::SigningContext {
+        kvnc_types::SigningContext {
+            chain_id: self.signing_ctx.chain_id,
+            epoch: self.committee.epoch(),
+        }
     }
 
     /// Process a received block from another validator.
@@ -636,12 +646,8 @@ where
         let Some(authority) = self.committee.get_by_index(voter) else {
             return Err(VoteRejection::UnknownVoter(voter).into());
         };
-        if kvnc_crypto::verify(
-            &authority.public_key,
-            &vote.signature_data(&self.signing_ctx),
-            &vote.signature,
-        )
-        .is_err()
+        if kvnc_crypto::verify_vote_signature(&self.vote_signing_ctx(), vote, &authority.public_key)
+            .is_err()
         {
             return Err(VoteRejection::BadSignature(voter).into());
         }
@@ -1018,10 +1024,21 @@ mod tests {
         Arc<TestDag>,
         kvnc_types::SigningKey,
     ) {
+        test_engine_at_epoch(round_duration_ms, 0)
+    }
+
+    fn test_engine_at_epoch(
+        round_duration_ms: u64,
+        committee_epoch: u64,
+    ) -> (
+        ConsensusEngine<TestDag, TestBlockManager>,
+        Arc<TestDag>,
+        kvnc_types::SigningKey,
+    ) {
         let (key, public_key) = kvnc_crypto::generate_keypair();
         let dag = Arc::new(TestDag::default());
         let committee = CommitteeInfo::try_new(
-            0,
+            committee_epoch,
             vec![AuthorityInfo {
                 index: 0,
                 stake: 100,
@@ -1566,5 +1583,123 @@ mod tests {
             LeaderStatus::Skip,
             "Skip status must be persisted"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Signature format v1: vote context is local chain_id + committee epoch
+    // -----------------------------------------------------------------
+
+    const SIG_V1_EPOCH: u64 = 5;
+
+    fn vote_with_ctx(
+        key: &kvnc_types::SigningKey,
+        ctx: &kvnc_types::SigningContext,
+        leader_round: Round,
+        leader_hash: Hash,
+    ) -> kvnc_types::Vote {
+        let mut vote = kvnc_types::Vote {
+            leader_round,
+            leader_hash,
+            voter: 0,
+            signature: kvnc_types::Signature([0; 64]),
+        };
+        vote.signature = kvnc_crypto::sign(key, &vote.signature_data(ctx));
+        vote
+    }
+
+    fn engine_with_leader_at_epoch() -> (
+        ConsensusEngine<TestDag, TestBlockManager>,
+        kvnc_types::SigningKey,
+        Hash,
+        mpsc::UnboundedReceiver<kvnc_types::CommittedSubDag>,
+    ) {
+        let (engine, _dag, key) = test_engine_at_epoch(100, SIG_V1_EPOCH);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        engine.set_commit_sender(sender);
+        let digest = kvnc_types::StatementBlock::compute_digest(0, 3, &[], &[]);
+        let block = kvnc_types::StatementBlock {
+            author: 0,
+            round: 3,
+            parents: Vec::new(),
+            transactions: Vec::new(),
+            statements: Vec::new(),
+            signature: kvnc_crypto::sign(&key, digest.as_ref()),
+            digest,
+            merkle_root: Default::default(),
+        };
+        engine.process_block(&block).unwrap();
+        (engine, key, digest, receiver)
+    }
+
+    fn local_v1_ctx() -> kvnc_types::SigningContext {
+        kvnc_types::SigningContext {
+            chain_id: TEST_CTX.chain_id,
+            epoch: SIG_V1_EPOCH,
+        }
+    }
+
+    #[tokio::test]
+    async fn sig_v1_correct_quorum_commits() {
+        let (engine, key, digest, mut receiver) = engine_with_leader_at_epoch();
+        engine
+            .process_vote(&vote_with_ctx(&key, &local_v1_ctx(), 3, digest))
+            .expect("v1 vote for local chain_id + committee epoch is accepted");
+        assert_eq!(receiver.try_recv().unwrap().leader.digest, digest);
+    }
+
+    #[tokio::test]
+    async fn sig_v1_vote_for_other_chain_id_rejected() {
+        let (engine, key, digest, mut receiver) = engine_with_leader_at_epoch();
+        let other_chain = kvnc_types::SigningContext {
+            chain_id: TEST_CTX.chain_id + 1,
+            epoch: SIG_V1_EPOCH,
+        };
+        assert!(matches!(
+            engine.process_vote(&vote_with_ctx(&key, &other_chain, 3, digest)),
+            Err(ConsensusError::VoteRejected(VoteRejection::BadSignature(0)))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sig_v1_vote_for_other_epoch_rejected() {
+        let (engine, key, digest, mut receiver) = engine_with_leader_at_epoch();
+        // Signed for epoch 0 (e.g. the configured ctx default) while the
+        // local committee is at epoch 5.
+        let other_epoch = kvnc_types::SigningContext {
+            chain_id: TEST_CTX.chain_id,
+            epoch: 0,
+        };
+        assert!(matches!(
+            engine.process_vote(&vote_with_ctx(&key, &other_epoch, 3, digest)),
+            Err(ConsensusError::VoteRejected(VoteRejection::BadSignature(0)))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sig_v1_old_format_without_domain_tag_rejected() {
+        let (engine, key, digest, mut receiver) = engine_with_leader_at_epoch();
+        // Legacy encoding: leader_round (LE) || leader_hash, no tag/ctx.
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&3u64.to_le_bytes());
+        legacy.extend_from_slice(&digest.0);
+        let vote = kvnc_types::Vote {
+            leader_round: 3,
+            leader_hash: digest,
+            voter: 0,
+            signature: kvnc_crypto::sign(&key, &legacy),
+        };
+        assert!(matches!(
+            engine.process_vote(&vote),
+            Err(ConsensusError::VoteRejected(VoteRejection::BadSignature(0)))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn sig_v1_own_vote_is_signed_with_committee_epoch() {
+        let (engine, _key, _digest, _receiver) = engine_with_leader_at_epoch();
+        assert_eq!(engine.vote_signing_ctx(), local_v1_ctx());
     }
 }
