@@ -493,9 +493,10 @@ impl UniversalCommitter {
 
         // Persist the exact eligible leader selected above; never synthesize a
         // leader record from a caller-provided sub-DAG.
-        dag_store.mark_round_decided(subdag.leader_round, &subdag.leader.digest)?;
-        // Increment the committed leader height so RPCs and restarts see the new height.
-        dag_store.commit_leader(&subdag.leader.digest)?;
+        // The decided-round mark and the committed leader height / last
+        // committed leader are written atomically (both or neither), so a
+        // crash between them cannot leave inconsistent durable state.
+        dag_store.mark_decided_and_commit_leader(subdag.leader_round, &subdag.leader.digest)?;
         decided_leader.status = LeaderStatus::Commit;
         self.mark_decided(subdag.leader_round, decided_leader);
 
@@ -874,6 +875,15 @@ mod tests {
 
         fn commit_leader(&self, _leader_hash: &Hash) -> Result<u64, kvnc_dag::DagStoreError> {
             Ok(1)
+        }
+
+        fn mark_decided_and_commit_leader(
+            &self,
+            round: Round,
+            leader_hash: &Hash,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            self.mark_round_decided(round, leader_hash)?;
+            self.commit_leader(leader_hash)
         }
 
         fn mark_round_decided(

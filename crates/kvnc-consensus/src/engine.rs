@@ -86,6 +86,16 @@ pub trait DagStoreTrait: Send + Sync {
         round: kvnc_types::Round,
         leader_hash: &Hash,
     ) -> Result<(), kvnc_dag::DagStoreError>;
+    /// Atomically mark `round` decided for `leader_hash` AND advance the
+    /// committed leader height / last committed leader. Implementations
+    /// backed by durable storage must apply both or neither (one write
+    /// transaction), so a crash can never leave a decided round without the
+    /// matching committed-leader record or vice versa.
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: kvnc_types::Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, kvnc_dag::DagStoreError>;
     /// Get the mergeset for a leader block (blocks reachable from leader not in previous sub-DAGs).
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, kvnc_dag::DagStoreError>;
     /// Get multiple blocks by their hashes.
@@ -874,6 +884,15 @@ mod tests {
 
         fn commit_leader(&self, _leader_hash: &Hash) -> Result<u64, kvnc_dag::DagStoreError> {
             Ok(self.decisions.lock().len() as u64 + 1)
+        }
+
+        fn mark_decided_and_commit_leader(
+            &self,
+            round: Round,
+            leader_hash: &Hash,
+        ) -> Result<u64, kvnc_dag::DagStoreError> {
+            self.mark_round_decided(round, leader_hash)?;
+            self.commit_leader(leader_hash)
         }
 
         fn mark_round_decided(

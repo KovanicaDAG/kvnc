@@ -311,6 +311,15 @@ impl DagStoreTrait for MockDag {
         Ok(0)
     }
 
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.mark_round_decided(round, leader_hash)?;
+        self.commit_leader(leader_hash)
+    }
+
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         if let Some(observer) = self.decision_mark_observer.lock().as_ref() {
             observer();
