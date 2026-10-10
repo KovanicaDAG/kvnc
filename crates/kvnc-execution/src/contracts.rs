@@ -1151,7 +1151,7 @@ mod tests {
     }
 
     fn token_create_args(supply: Amount) -> Vec<u8> {
-        bincode::serialize(&("KVNC Test".to_string(), "TKT".to_string(), 9u8, supply))
+        bincode::serialize(&("KUNA Test".to_string(), "TKT".to_string(), 9u8, supply))
             .expect("encode")
     }
 

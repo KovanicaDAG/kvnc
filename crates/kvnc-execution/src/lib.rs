@@ -333,10 +333,11 @@ impl ExecutionContext {
 
         info!(
             target: "kvnc-execution",
-            "Committed leader round={} author={} reward={} KVNC (height={}) paid to {:?}",
+            "Committed leader round={} author={} reward={} {} (height={}) paid to {:?}",
             subdag.leader_round,
             subdag.leader_author,
             reward.amount / kvnc_staking::ONE_KVNC,
+            kvnc_staking::TICKER,
             reward.height,
             reward.recipient,
         );
@@ -492,7 +493,7 @@ impl ExecutionContext {
         })
     }
 
-    /// Execute a native KVNC transfer.
+    /// Execute a native KUNA transfer.
     fn execute_transfer(
         &self,
         txn: &mut WriteTransaction,
@@ -904,8 +905,9 @@ impl ExecutionContext {
 
         info!(
             target: "kvnc-execution",
-            "Treasury claim: {} KVNC credited to {:?}",
+            "Treasury claim: {} {} credited to {:?}",
             claimed / kvnc_staking::ONE_KVNC,
+            kvnc_staking::TICKER,
             treasury_address
         );
 
@@ -1450,11 +1452,11 @@ mod tests {
             treasury.vested = 2 * kvnc_staking::TREASURY_ANNUAL;
         }
 
-        // Treasury should have 2M KVNC vested and claimable
+        // Treasury should have 2M KUNA vested and claimable
         let claimable = ctx.staking.treasury_claimable();
         assert_eq!(claimable, 2 * kvnc_staking::TREASURY_ANNUAL);
 
-        // Claim 1M KVNC
+        // Claim 1M KUNA
         let claimed = ctx
             .claim_treasury(kvnc_staking::TREASURY_ANNUAL, &storage)
             .expect("claim treasury");
@@ -1545,7 +1547,7 @@ mod tests {
         let validator = Address([3u8; 32]);
         let payout = Address([4u8; 32]);
 
-        // Fund sender with 1000 KVNC
+        // Fund sender with 1000 KUNA
         let txn = storage.begin_write().expect("write txn");
         storage
             .state()
@@ -1615,7 +1617,7 @@ mod tests {
         let validator = Address([3u8; 32]);
         let payout = Address([4u8; 32]);
 
-        // Fund sender with 1000 KVNC
+        // Fund sender with 1000 KUNA
         let txn = storage.begin_write().expect("write txn");
         storage
             .state()
@@ -2427,7 +2429,7 @@ mod tests {
             )],
         );
         assert!(r[0].success);
-        // Reward of round 1 (10 KVNC) split 50/50 (commission 0).
+        // Reward of round 1 (10 KUNA) split 50/50 (commission 0).
         assert_eq!(pending_reward(&storage, &me, &validator), 5 * K);
         assert_eq!(read_balance(&storage, &payout), 5 * K);
         let before = read_balance(&storage, &me);
