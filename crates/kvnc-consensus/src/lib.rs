@@ -18,6 +18,7 @@ pub mod ghostdag_scoped;
 pub mod linearizer;
 pub mod metrics;
 pub mod mysticghost;
+pub mod non_blue;
 pub mod types;
 
 pub use committer::{uncommitted_history, BaseCommitter, UniversalCommitter};
@@ -33,6 +34,7 @@ pub use metrics::{
     record_pruned_blocks, record_pruned_waves, record_rss_proxy, registry,
     update_dag_blocks_in_memory,
 };
+pub use non_blue::{non_blue_refs, non_blue_transactions};
 pub use types::{
     AuthorityInfo, CommitResult, CommittedSubDag, CommitteeInfo, CommitteeInfoError, LeaderInfo,
     LeaderStatus,

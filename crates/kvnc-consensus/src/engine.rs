@@ -108,6 +108,11 @@ pub trait DagStoreTrait: Send + Sync {
     /// Get all decided rounds up to a maximum.
     fn get_decided_rounds(&self, max_round: Round) -> Result<Vec<Round>, kvnc_dag::DagStoreError>;
     /// Prune non-blue blocks from a committed wave.
+    ///
+    /// Deprecated (#13, variant A): the committer no longer calls this. Red
+    /// blocks are reported in `CommittedSubDag::non_blue` and removed only by
+    /// round pruning (`prune_waves_before`). Kept for compatibility; do not
+    /// add new callers.
     fn prune_non_blue(
         &self,
         blue_hashes: &[Hash],
