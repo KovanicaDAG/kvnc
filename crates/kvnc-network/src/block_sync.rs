@@ -11,9 +11,32 @@ use serde::{Deserialize, Serialize};
 /// Protocol name for block sync request-response.
 pub const BLOCK_SYNC_PROTOCOL: &str = "/kvanc/block-sync/1.0.0";
 
-/// Maximum response size (1 MB).
-#[allow(dead_code)]
+/// Maximum response size (1 MiB): one block, same cap as a gossip frame.
 pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+
+/// Maximum request size. Requests are a hash or an (author, round) pair, so
+/// anything larger than this is garbage.
+pub const MAX_REQUEST_SIZE: usize = 1024;
+
+/// Read the rest of a request-response stream, failing once more than
+/// `limit` bytes arrive instead of buffering an arbitrarily large message
+/// from a hostile peer.
+pub(crate) async fn read_bounded<T>(io: &mut T, limit: usize) -> std::io::Result<Vec<u8>>
+where
+    T: AsyncReadExt + Unpin + Send,
+{
+    let mut buf = Vec::new();
+    // Read one byte past the limit so "exactly at the limit" is accepted and
+    // "over the limit" is detected without reading the whole stream.
+    io.take(limit as u64 + 1).read_to_end(&mut buf).await?;
+    if buf.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("message exceeds {limit} byte limit"),
+        ));
+    }
+    Ok(buf)
+}
 
 /// Block sync request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,8 +91,7 @@ impl libp2p::request_response::Codec for BlockSyncCodec {
     where
         T: AsyncReadExt + Unpin + Send,
     {
-        let mut buf = Vec::new();
-        io.read_to_end(&mut buf).await?;
+        let buf = read_bounded(io, MAX_REQUEST_SIZE).await?;
         bincode::deserialize(&buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -82,8 +104,7 @@ impl libp2p::request_response::Codec for BlockSyncCodec {
     where
         T: AsyncReadExt + Unpin + Send,
     {
-        let mut buf = Vec::new();
-        io.read_to_end(&mut buf).await?;
+        let buf = read_bounded(io, MAX_RESPONSE_SIZE).await?;
         bincode::deserialize(&buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -144,6 +165,33 @@ pub struct BlockSyncResponseEvent {
 mod tests {
     use super::*;
     use kvnc_types::hash::Hash;
+
+    #[test]
+    fn bounded_read_accepts_up_to_the_limit_and_rejects_beyond() {
+        futures::executor::block_on(async {
+            let mut exact = futures::io::Cursor::new(vec![1u8; 16]);
+            assert_eq!(
+                read_bounded(&mut exact, 16).await.expect("at limit").len(),
+                16
+            );
+            let mut over = futures::io::Cursor::new(vec![1u8; 17]);
+            let err = read_bounded(&mut over, 16).await.expect_err("over limit");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn oversized_block_sync_response_is_rejected_by_the_codec() {
+        use libp2p::request_response::Codec;
+        futures::executor::block_on(async {
+            let mut codec = BlockSyncCodec;
+            let protocol = libp2p::StreamProtocol::new(BLOCK_SYNC_PROTOCOL);
+            let mut io = futures::io::Cursor::new(vec![0u8; MAX_RESPONSE_SIZE + 1]);
+            assert!(codec.read_response(&protocol, &mut io).await.is_err());
+            let mut io = futures::io::Cursor::new(vec![0u8; MAX_REQUEST_SIZE + 1]);
+            assert!(codec.read_request(&protocol, &mut io).await.is_err());
+        });
+    }
 
     #[test]
     fn block_sync_request_by_hash_round_trip() {

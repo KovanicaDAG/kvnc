@@ -643,8 +643,7 @@ pub fn write_openapi_json(path: &std::path::Path) -> Result<(), std::io::Error> 
 /// Write OpenAPI spec to YAML file.
 pub fn write_openapi_yaml(path: &std::path::Path) -> Result<(), std::io::Error> {
     let spec = generate_openapi_spec();
-    let yaml = serde_yaml::to_string(&spec)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let yaml = serde_yaml::to_string(&spec).map_err(std::io::Error::other)?;
     std::fs::write(path, yaml)
 }
 

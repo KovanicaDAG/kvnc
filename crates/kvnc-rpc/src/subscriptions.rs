@@ -54,7 +54,7 @@ use tokio::sync::broadcast;
 use crate::chain_methods::{block_to_json, transaction_to_json};
 use crate::{JsonRpcErrorObject, JsonRpcRequest, JsonRpcResponse, RpcError};
 use kvnc_execution::TransactionReceipt;
-use kvnc_types::{CommittedSubDag, StatementBlock, Transaction, TransactionKind};
+use kvnc_types::{CommittedSubDag, StatementBlock, Transaction};
 
 /// Capacity of each broadcast channel. Slow consumers that fall further than
 /// this behind simply drop missed notifications (a `Lagged` receive error is
