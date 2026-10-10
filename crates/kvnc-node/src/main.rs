@@ -1158,6 +1158,15 @@ impl DagStoreTrait for NodeDagStore {
         self.inner.mark_round_decided(round, leader_hash)
     }
 
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.inner
+            .mark_decided_and_commit_leader(round, leader_hash)
+    }
+
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
         self.inner.mergeset(leader)
     }

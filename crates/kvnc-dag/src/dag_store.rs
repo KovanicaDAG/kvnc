@@ -290,6 +290,41 @@ impl DagStore {
         Ok(height)
     }
 
+    /// Atomically mark `round` decided for `leader_hash` and advance the
+    /// committed leader height / last committed leader, in ONE redb write
+    /// transaction: after a crash either both are durable or neither is.
+    /// Idempotent for the decided mark (an existing identical mark is kept).
+    pub fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        let already_decided = self
+            .get_decided_leaders(round)?
+            .iter()
+            .any(|existing| existing == leader_hash);
+        let txn = self.storage.begin_write()?;
+        if !already_decided {
+            self.storage
+                .consensus()
+                .mark_round_decided(&txn, round, leader_hash)?;
+        }
+        #[cfg(test)]
+        if fault::crash_between_steps() {
+            // Simulated crash: the transaction is dropped uncommitted.
+            return Err(DagStoreError::NotFound("injected crash".into()));
+        }
+        let height = self
+            .storage
+            .consensus()
+            .increment_committed_leader_height(&txn)?;
+        self.storage
+            .consensus()
+            .set_last_committed(&txn, leader_hash)?;
+        txn.commit()?;
+        Ok(height)
+    }
+
     /// Prune DAG blocks below a certain round.
     pub fn prune_below(&self, min_round: Round) -> Result<u64, DagStoreError> {
         let txn = self.storage.begin_write()?;
@@ -618,6 +653,26 @@ impl DagStore {
     }
 }
 
+/// Test-only fault injection: simulate a process crash between the
+/// decided-round mark and the committed-leader update.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CRASH_BETWEEN_STEPS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn arm() {
+        CRASH_BETWEEN_STEPS.with(|c| c.set(true));
+    }
+
+    /// Returns true (once) when a crash was armed.
+    pub(crate) fn crash_between_steps() -> bool {
+        CRASH_BETWEEN_STEPS.with(|c| c.replace(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +829,38 @@ mod tests {
             .mergeset(&child.digest)
             .expect("mergeset walk tolerates pruned parents");
         assert_eq!(mergeset, vec![child.digest]);
+    }
+
+    #[test]
+    fn mark_decided_and_commit_leader_is_atomic_across_crash_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dag.redb");
+        let leader = make_block(1, 3, Vec::new(), "atomic-leader");
+        {
+            let store = DagStore::new(Storage::new(&path).unwrap()).unwrap();
+            store.put_block(&leader).unwrap();
+            fault::arm();
+            let res = store.mark_decided_and_commit_leader(3, &leader.digest);
+            assert!(res.is_err(), "injected crash must surface");
+        } // "process" dies here
+
+        let store = DagStore::new(Storage::new(&path).unwrap()).unwrap();
+        let decided = store.is_round_decided(3).unwrap();
+        let height = store.get_committed_leader_height().unwrap();
+        let last = store.get_last_committed().unwrap();
+        let committed = height == 1 && last == Some(leader.digest);
+        let not_committed = height == 0 && last.is_none();
+        assert!(
+            (decided && committed) || (!decided && not_committed),
+            "inconsistent durable state after crash: decided={decided}, height={height}, last={last:?}"
+        );
+
+        // A retry after restart completes both steps exactly once.
+        let h = store
+            .mark_decided_and_commit_leader(3, &leader.digest)
+            .unwrap();
+        assert_eq!(h, 1);
+        assert!(store.is_round_decided(3).unwrap());
+        assert_eq!(store.get_last_committed().unwrap(), Some(leader.digest));
     }
 }
