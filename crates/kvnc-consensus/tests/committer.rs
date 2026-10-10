@@ -848,9 +848,11 @@ fn test_try_commit_direct_commit_end_to_end() {
     );
 }
 
-/// Rounds that never reach quorum are passed over; a later certified round
-/// commits. Threshold soundness: the un-certified round must never be marked
-/// Commit.
+/// A round that never reaches quorum is decided Skip once a later round
+/// reaches its own quorum (never passed over undecided), even though it is in
+/// the later leader's causal history; the later certified round then commits.
+/// Threshold soundness: every Commit requires the leader's OWN direct quorum,
+/// so the un-certified round must never be marked Commit.
 #[test]
 fn test_try_commit_passes_over_uncertified_round() {
     let g = genesis();
@@ -894,14 +896,16 @@ fn test_try_commit_passes_over_uncertified_round() {
         Some(LeaderStatus::Commit),
         "round 1 had only 1 of 4 votes"
     );
-    // And no round is ever both committed and skipped.
-    for (round, info) in &decided {
-        assert_ne!(
-            info.status,
-            LeaderStatus::Skip,
-            "round {round} committed without ever being skipped"
-        );
-    }
+    // Round 1 is passed over only via an explicit indirect Skip decision.
+    assert_eq!(
+        decided.get(&1).map(|l| l.status),
+        Some(LeaderStatus::Skip),
+        "round 1 must be explicitly skipped (no own quorum), not silently passed over"
+    );
+    assert_eq!(
+        decided.get(&3).map(|l| l.status),
+        Some(LeaderStatus::Commit)
+    );
 }
 
 /// Round 0 is exempt from commits even with full quorum (genesis handling).
@@ -1103,13 +1107,13 @@ fn test_try_commit_committed_rounds_strictly_increase() {
 // BUG (disabled): indirect commit rule is unreachable from `try_commit`
 // ---------------------------------------------------------------------------
 
-/// Regression: `UniversalCommitter` must apply the indirect commit rule for
-/// earlier leaders of a wave when a later leader of the same wave commits.
+/// Regression: `UniversalCommitter` must decide (as Skip, see PR #18) the
+/// no-quorum earlier leaders of a wave when a later leader of that wave commits.
 ///
 /// `try_commit` only walks rounds *after* the last decided round, so the
 /// indirect rule (which needs a *later* decided leader in the same wave) is
 /// applied by `decide_earlier_in_wave` at commit time: when round 5 commits,
-/// round 3 (same wave, causally connected) is decided Commit. Without the
+/// round 3 (same wave, causally connected, no own quorum) is decided Skip. Without the
 /// sweep this round never entered `decided_leaders` (the historical BUG).
 ///
 /// Note: round 3's *block* is also committed as part of round 5's causal
@@ -1155,10 +1159,13 @@ fn test_try_commit_indirect_commit_through_later_committed_leader() {
          indirect rule unreachable, got decided rounds {:?}",
         decided.keys().collect::<Vec<_>>()
     );
+    // Owner decision (PR #18 review): a leader without its OWN direct quorum
+    // is never Commit; causal connection to a committed leader is not
+    // certificate proof, so round 3 is an explicit Skip.
     assert_eq!(
         round3.map(|l| l.status),
-        Some(LeaderStatus::Commit),
-        "connected to the committed round-5 leader => indirect Commit"
+        Some(LeaderStatus::Skip),
+        "no own quorum => Skip even when connected to the committed round-5 leader"
     );
 }
 
