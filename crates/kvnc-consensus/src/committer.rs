@@ -138,6 +138,20 @@ impl BaseCommitter {
 ///
 /// Returned in `get_ancestors` order (the linearizer canonicalises order);
 /// excludes `leader` itself.
+///
+/// Correctness condition (pruning): pruning must be downward-closed by round.
+/// If any block of round `r` is deleted, every block of round `<= r` must be
+/// deleted too (as `prune_waves_before` / `prune_below` do). Then every
+/// still-stored ancestor of an earlier decided leader is reachable from that
+/// leader via stored parent edges, or that leader's whole stored history is
+/// gone. A deletion that leaves a gap (e.g. `prune_non_blue` removing a block
+/// while lower-round blocks of the same history remain) can hide still-stored
+/// committed blocks behind the gap; they would then be re-delivered.
+///
+/// TODO(follow-up): cache the committed set incrementally (e.g. keep an
+/// in-memory / persisted set updated on each durable commit, seeded once from
+/// the decided index on startup) instead of re-walking every earlier
+/// leader's history on each commit, which is O(sum of earlier histories).
 pub fn uncommitted_history<D: DagStoreTrait + ?Sized>(
     dag_store: &D,
     leader: &StatementBlock,
