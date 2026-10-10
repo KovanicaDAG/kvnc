@@ -609,7 +609,7 @@ impl NetworkService {
                 message,
             } => {
                 let acceptance = match message.topic.as_str() {
-                    topics::BLOCKS => self.on_block_message(&message.data),
+                    topics::BLOCKS => self.on_block_message(propagation_source, &message.data),
                     topics::TRANSACTIONS => self.on_transaction_message(&message.data),
                     topics::SYNC => self.on_sync_message(message.source, &message.data),
                     topics::VOTES => self.on_vote_message(message.source, &message.data),
@@ -938,7 +938,7 @@ impl NetworkService {
     /// DAG-level validation (parents, rounds) and persistence still belong to
     /// the BlockManager; this only keeps forged or tampered blocks from being
     /// forwarded or handed to consensus.
-    fn on_block_message(&self, payload: &[u8]) -> Verdict {
+    fn on_block_message(&self, peer: PeerId, payload: &[u8]) -> Verdict {
         let block: StatementBlock = match bincode::deserialize(payload) {
             Ok(block) => block,
             Err(err) => {
@@ -956,7 +956,7 @@ impl NetworkService {
         }
         let (round, digest) = (block.round, block.digest);
         info!(round, %digest, "block received over gossip");
-        self.emit(NetworkEvent::BlockReceived(block));
+        self.emit(NetworkEvent::BlockReceived { peer, block });
         Verdict::Accept
     }
 
@@ -1403,7 +1403,7 @@ mod tests {
         let (_dir, service) = test_service();
         // Malformed payloads are dropped and rejected, never propagated.
         assert!(matches!(
-            service.on_block_message(&[0xff, 0xff]),
+            service.on_block_message(PeerId::random(), &[0xff, 0xff]),
             Verdict::Reject(_)
         ));
         assert!(matches!(
@@ -1502,7 +1502,10 @@ mod tests {
             service.on_vote_message(Some(PeerId::random()), &vote),
             Verdict::Ignore
         );
-        assert_eq!(service.on_block_message(&block), Verdict::Ignore);
+        assert_eq!(
+            service.on_block_message(PeerId::random(), &block),
+            Verdict::Ignore
+        );
     }
 
     #[tokio::test]
@@ -1510,9 +1513,12 @@ mod tests {
         let (_dir, service, mut events, signers) = validating_service();
         let block = test_support::signed_block(&signers[3], 3);
         let payload = bincode::serialize(&block).expect("serialize block");
-        assert_eq!(service.on_block_message(&payload), Verdict::Accept);
+        assert_eq!(
+            service.on_block_message(PeerId::random(), &payload),
+            Verdict::Accept
+        );
         match events.try_recv().expect("block event emitted") {
-            NetworkEvent::BlockReceived(got) => assert_eq!(got, block),
+            NetworkEvent::BlockReceived { block: got, .. } => assert_eq!(got, block),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -1601,7 +1607,7 @@ mod tests {
         let block = sample_block();
         let payload = bincode::serialize(&block).expect("serialize block");
         assert!(matches!(
-            service.on_block_message(&payload),
+            service.on_block_message(PeerId::random(), &payload),
             Verdict::Reject(_)
         ));
         assert!(!dag_store.has_block(&block.digest).expect("query store"));

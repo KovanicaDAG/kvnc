@@ -37,10 +37,10 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 libp2p = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.8"
 redb = { workspace = true }
-bincode = { workspace = true }
 ed25519-dalek = { version = "2", features = ["rand_core", "batch"] }
 reqwest = { workspace = true }
