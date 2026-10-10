@@ -98,6 +98,10 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
     }
 
     let ping_interval = config.ping_interval;
+    let scoring = config.peer_scoring.clone();
+    scoring
+        .validate()
+        .map_err(|err| NetworkError::Config(format!("peer scoring: {err}")))?;
     // Keep connections alive well past the ping interval; the default idle
     // timeout (5s) would otherwise drop peers between pings.
     let idle_timeout = std::cmp::max(ping_interval * 4, Duration::from_secs(60));
@@ -125,6 +129,11 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
                 gossipsub_config()?,
             )
             .map_err(|err| NetworkError::Gossipsub(err.to_string()))?;
+            if scoring.enabled {
+                gossipsub
+                    .with_peer_score(scoring.params(), scoring.thresholds())
+                    .map_err(NetworkError::Gossipsub)?;
+            }
             for name in topics::ALL {
                 gossipsub
                     .subscribe(&gossipsub::IdentTopic::new(name))
@@ -250,5 +259,35 @@ mod tests {
             .expect("swarm builds")
             .local_peer_id();
         assert_ne!(first, ephemeral);
+    }
+
+    #[test]
+    fn build_swarm_enables_peer_scoring_by_default() {
+        let swarm = build_swarm(&NetworkConfig::default()).expect("swarm builds");
+        let stranger = PeerId::random();
+        // With scoring active, gossipsub reports a score for any peer id.
+        assert_eq!(swarm.behaviour().gossipsub.peer_score(&stranger), Some(0.0));
+
+        let off = NetworkConfig {
+            peer_scoring: crate::PeerScoringConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..NetworkConfig::default()
+        };
+        let swarm = build_swarm(&off).expect("swarm builds");
+        assert_eq!(swarm.behaviour().gossipsub.peer_score(&stranger), None);
+    }
+
+    #[test]
+    fn build_swarm_rejects_invalid_scoring_config() {
+        let bad = NetworkConfig {
+            peer_scoring: crate::PeerScoringConfig {
+                ban_threshold: 0.0,
+                ..Default::default()
+            },
+            ..NetworkConfig::default()
+        };
+        assert!(build_swarm(&bad).is_err());
     }
 }

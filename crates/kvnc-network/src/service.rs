@@ -379,6 +379,11 @@ impl NetworkService {
         self.validator.set_vote_verifier(verifier);
     }
 
+    /// Our libp2p peer id (transport identity, not the validator key).
+    pub fn local_peer_id(&self) -> PeerId {
+        *self.swarm().local_peer_id()
+    }
+
     /// Get connected peers.
     pub fn connected_peers(&self) -> HashSet<PeerId> {
         lock(&self.connected).clone()
@@ -665,6 +670,7 @@ impl NetworkService {
         }
         if let Verdict::Reject(reason) = verdict {
             self.record_invalid_block_failure(propagation_source, &reason);
+            self.enforce_score_ban(propagation_source);
         }
     }
 
@@ -1161,6 +1167,24 @@ impl NetworkService {
         }
     }
 
+    /// Ban `peer` once its gossipsub score drops below the configured ban
+    /// threshold. Returns whether the peer was banned.
+    fn enforce_score_ban(&self, peer: PeerId) -> bool {
+        let scoring = &self.config.peer_scoring;
+        if !scoring.enabled {
+            return false;
+        }
+        let score = self.swarm().behaviour().gossipsub.peer_score(&peer);
+        match score {
+            Some(score) if score < scoring.ban_threshold => {
+                warn!(%peer, score, threshold = scoring.ban_threshold, "peer score below ban threshold; banning");
+                self.ban_peer(peer);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Reset invalid block failure counter for a peer (e.g., on successful validation).
     pub fn reset_invalid_block_failures(&self, peer: PeerId) {
         lock(&self.invalid_block_failures).remove(&peer);
@@ -1203,6 +1227,89 @@ mod tests {
             digest: Hash::zero(),
             merkle_root: Default::default(),
         }
+    }
+
+    /// Like [`test_service`] but with a custom network config.
+    fn test_service_with(config: NetworkConfig) -> (tempfile::TempDir, Arc<NetworkService>) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dag_storage = Storage::new(dir.path().join("dag.db")).expect("dag storage");
+        let mempool_storage =
+            Arc::new(Storage::new(dir.path().join("mempool.db")).expect("mempool storage"));
+        let dag_store = Arc::new(DagStore::new(dag_storage).expect("dag store"));
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            mempool_storage,
+            test_support::TEST_CTX,
+        ));
+        let (service, _events) = NetworkService::new(config, dag_store, mempool).expect("service");
+        (dir, Arc::new(service))
+    }
+
+    fn free_tcp_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("free port")
+            .port()
+    }
+
+    /// Two live services: the sender gossips malformed transactions, the
+    /// receiver rejects them, its gossipsub score for the sender falls below
+    /// the ban threshold and the sender is disconnected — before the legacy
+    /// invalid-message counter (5) would have fired.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_gossip_lowers_score_and_bans_peer() {
+        let port = free_tcp_port();
+        let scoring = crate::PeerScoringConfig {
+            // Two rejects on the tx topic (weight 0.5): 0.5 * -100 * 2^2 = -200.
+            invalid_message_weight: -100.0,
+            ..Default::default()
+        };
+        let (_da, receiver) = test_service_with(NetworkConfig {
+            listen_addrs: vec![address(&format!("/ip4/127.0.0.1/tcp/{port}"))],
+            bootstrap_nodes: Vec::new(),
+            peer_scoring: scoring,
+            ..NetworkConfig::default()
+        });
+        let receiver_id = receiver.local_peer_id();
+        let (_db, sender) = test_service_with(NetworkConfig {
+            listen_addrs: vec![address("/ip4/127.0.0.1/tcp/0")],
+            bootstrap_nodes: vec![address(&format!(
+                "/ip4/127.0.0.1/tcp/{port}/p2p/{receiver_id}"
+            ))],
+            ..NetworkConfig::default()
+        });
+        let sender_id = sender.local_peer_id();
+        let r = receiver.clone();
+        let rx_task = tokio::spawn(async move { r.start().await });
+        let s = sender.clone();
+        let tx_task = tokio::spawn(async move { s.start().await });
+
+        // Wait for the connection and the gossip mesh (heartbeat ~1s).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !receiver.connected_peers().contains(&sender_id) {
+            assert!(Instant::now() < deadline, "peers never connected");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mut banned = false;
+        for i in 0u8..4 {
+            // Distinct payloads (content-addressed ids), all undecodable.
+            let _ = sender.publish(topics::TRANSACTIONS, vec![0xff, i, 0xee]);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if !receiver.connected_peers().contains(&sender_id) {
+                banned = true;
+                break;
+            }
+        }
+        rx_task.abort();
+        tx_task.abort();
+        assert!(banned, "sender should be banned by peer score");
+        let failures = lock(&receiver.invalid_block_failures)
+            .get(&sender_id)
+            .copied()
+            .unwrap_or(0);
+        assert!(failures < INVALID_BLOCK_FAILURE_LIMIT);
     }
 
     fn address(text: &str) -> Multiaddr {

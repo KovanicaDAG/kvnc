@@ -1557,6 +1557,7 @@ fn build_network_config(config: &NodeConfig) -> Result<NetworkConfig> {
         max_peers: config.max_peers,
         ping_interval: Duration::from_secs(10),
         node_key_path: Some(config.data_dir.join(NODE_IDENTITY_FILE)),
+        peer_scoring: config.peer_scoring.clone(),
     })
 }
 
