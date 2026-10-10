@@ -1,4 +1,4 @@
-//! KVNC command-line interface.
+//! Kovanica (KUNA) command-line interface.
 //!
 //! Wallet operations (keygen/import/export/sign), node operations
 //! (status/balance/staking/governance) and contract subcommands
@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 const UNSAFE_SIGN_WARNING: &str = "WARNING: arbitrary message signing is unsafe and cross-context; signatures may be replayed or misinterpreted by other protocols.";
 
 #[derive(Parser)]
-#[command(name = "kvnc", version, about = "Kovanica (KVNC) CLI", long_about = None)]
+#[command(name = "kvnc", version, about = "Kovanica (KUNA) CLI", long_about = None)]
 struct Cli {
     /// JSON-RPC endpoint of the node
     #[arg(long, global = true, default_value = "http://127.0.0.1:8545")]
@@ -56,7 +56,7 @@ enum Commands {
     Address(AddressArgs),
     /// Sign a message offline and print the signature as hex
     Sign(SignArgs),
-    /// Submit a native KVNC transfer
+    /// Submit a native KUNA transfer
     Transfer(TransferArgs),
     /// Show chain/node status
     Status,
@@ -64,9 +64,9 @@ enum Commands {
     Info,
     /// Query an account balance
     Balance { address: String },
-    /// Stake KVNC (builds and submits a signed Stake transaction)
+    /// Stake KUNA (builds and submits a signed Stake transaction)
     Stake(AmountArgs),
-    /// Unstake KVNC (builds and submits a signed Unstake transaction)
+    /// Unstake KUNA (builds and submits a signed Unstake transaction)
     Unstake(AmountArgs),
     /// Delegate stake to a validator
     Delegate(DelegateArgs),

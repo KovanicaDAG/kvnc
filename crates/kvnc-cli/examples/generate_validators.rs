@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
 
     // Generate genesis_validators.toml with [[validator]] array-of-tables format
     let mut toml = String::from("# Phase 16.6 — 4-node validator set for genesis\n");
-    toml.push_str("# Stakes = MIN_VALIDATOR_STAKE = 50_000 KVNC (50_000_000_000_000 atoms)\n");
+    toml.push_str("# Stakes = MIN_VALIDATOR_STAKE = 50_000 KUNA (50_000_000_000_000 atoms)\n");
     toml.push_str("# Generated from keystores\n\n");
 
     for (_address, public_key_hex, _seed) in &validators {

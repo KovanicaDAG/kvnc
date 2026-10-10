@@ -1,6 +1,6 @@
 //! Offline transaction construction and encoding.
 //!
-//! A KVNC [`Transaction`] carries a cached `hash` and an Ed25519 `signature`
+//! A Kovanica [`Transaction`] carries a cached `hash` and an Ed25519 `signature`
 //! over that hash. The CLI derives the hash deterministically from the signable
 //! fields (sender, nonce, kind, fee) and signs it offline — private keys never
 //! leave the machine.

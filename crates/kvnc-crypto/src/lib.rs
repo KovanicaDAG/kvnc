@@ -1,4 +1,4 @@
-//! Cryptographic operations for KVNC.
+//! Cryptographic operations for Kovanica.
 //! Signing, verification, key generation.
 
 #![deny(unsafe_code)]
