@@ -797,7 +797,8 @@ impl StakingState {
     /// `validator.stake` already includes delegated stake, so the cut is
     /// computed once on the self-stake and once per delegation (never twice
     /// on delegated stake). Returns the total amount removed from stake; the
-    /// caller decides its destination (execution burns it). Duplicate
+    /// caller decides its destination (execution credits it to the treasury
+    /// account). Duplicate
     /// evidence must be rejected by the caller (`EvidenceProcessed`), as the
     /// processed-evidence set is persisted outside `StakingState`.
     pub fn slash(&mut self, evidence: DoubleSignEvidence) -> Result<u64, StakingError> {
@@ -1404,14 +1405,14 @@ mod tests {
     }
 
     proptest! {
-        // Conservation: liquid + staked + unbonding + burned
+        // Conservation: liquid + staked + unbonding + treasury (slashed stake)
         // == premine + mining issued, and everything stays <= the cap.
         #[test]
         fn supply_never_exceeds_cap(ops in proptest::collection::vec(op(), 1..60)) {
             let mut st = StakingState::new();
             st.init_treasury(a(0xFF));
             let mut liquid: u128 = u128::from(FOUNDER_PREMINE);
-            let mut burned: u128 = 0;
+            let mut treasury: u128 = 0;
             let mut slashed_evidence = std::collections::BTreeSet::new();
             for o in ops {
                 match o {
@@ -1442,7 +1443,7 @@ mod tests {
                     Op::Slash(v) => {
                         let ev = DoubleSignEvidence { validator: a(v + 1), height: st.committed_leader_height };
                         if slashed_evidence.insert(StakingState::evidence_id(&ev)) {
-                            if let Ok(x) = st.slash(ev) { burned += u128::from(x); }
+                            if let Ok(x) = st.slash(ev) { treasury += u128::from(x); }
                         }
                     }
                     Op::Advance => {
@@ -1459,7 +1460,7 @@ mod tests {
                 for v in &st.validators {
                     prop_assert!(v.stake >= st.delegated_to(v.address));
                 }
-                let accounted = liquid + u128::from(st.total_staked) + queued + burned;
+                let accounted = liquid + u128::from(st.total_staked) + queued + treasury;
                 prop_assert_eq!(accounted, u128::from(FOUNDER_PREMINE) + u128::from(st.total_mining_issued));
                 prop_assert!(accounted + u128::from(TREASURY_TOTAL) <= u128::from(TOTAL_SUPPLY));
             }
