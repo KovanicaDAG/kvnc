@@ -63,10 +63,10 @@ All contracts currently have placeholder `store` / `load` methods.
 ### 5. Tokenomics alignment (`staking/src/lib.rs` in skeleton)
 This file contains pure constants and functions that align emission + treasury with the well-known numbers:
 
-- Total supply 90 200 000 KVNC
+- Total supply 90 200 000 KUNA
 - 200 000 premine
 - 8 000 000 treasury (linear 1 M / year)
-- Initial reward 10 KVNC
+- Initial reward 10 KUNA
 - Era length 2 050 000 committed leaders
 - Decay × 3/4
 

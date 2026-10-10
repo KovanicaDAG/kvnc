@@ -47,7 +47,9 @@ use kvnc_network::{
     BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
     StateSyncResponse,
 };
-use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
+use kvnc_rpc::{
+    AuthConfig, EventBus, NodeHealth, RateLimitConfig, RateLimiterState, RpcServer, RpcState,
+};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -69,7 +71,7 @@ use kvnc_types::{
 /// Command line arguments.
 #[derive(Parser, Debug)]
 #[command(name = "kvnc-node")]
-#[command(about = "Kovanica (KVNC) full node", long_about = None)]
+#[command(about = "Kovanica (KUNA) full node", long_about = None)]
 #[command(subcommand_required = false, arg_required_else_help = false)]
 struct Args {
     #[command(subcommand)]
@@ -96,7 +98,7 @@ struct GenesisArgs {
     #[arg(long, value_name = "HEX")]
     treasury_address: String,
 
-    /// Founder premine address (32-byte hex, receives 200,000 KVNC)
+    /// Founder premine address (32-byte hex, receives 200,000 KUNA)
     #[arg(long, value_name = "HEX")]
     founder_address: String,
 
@@ -159,7 +161,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
-    // Founder premine (200,000 KVNC) - included in genesis allocations output
+    // Founder premine (200,000 KUNA) - included in genesis allocations output
     // Actual balance set when genesis block is executed on first run
 
     // Join each validator
@@ -229,6 +231,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             "founder_address_bytes": hex::encode(founder.0),
             "founder_premine_atoms": FOUNDER_PREMINE,
             "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
+            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KVNC,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
@@ -483,6 +486,8 @@ where
     // loop so broadcast commands never re-enter `start` or rebuild listeners.
     // Votes and blocks are authenticated against the committee at the network
     // edge before they are forwarded or handed to consensus.
+    // Vote signatures are checked through the injected VoteVerifier.
+    network.set_vote_verifier(Arc::new(kvnc_network::Ed25519VoteVerifier));
     network.set_authority_keys(
         committee
             .authorities()
@@ -509,8 +514,11 @@ where
     let events = EventBus::new();
     let rate_limit_config =
         RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    // Liveness of the execution worker and consensus engine, surfaced on /health.
+    let node_health = NodeHealth::new();
     let auth_config = rpc_auth_config_from_env();
     let rpc_state = RpcState {
+        health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
         mempool: mempool.clone(),
@@ -638,12 +646,19 @@ where
         events.clone(),
         Some(mempool.clone()),
         shutdown_rx.clone(),
+        node_health.clone(),
     ));
 
     let engine_for_task = engine.clone();
+    let engine_health = node_health.clone();
     let engine_task = tokio::spawn(async move {
-        if let Err(e) = engine_for_task.start().await {
-            error!(error = %e, "consensus engine stopped with an error");
+        engine_health.consensus_running();
+        match engine_for_task.start().await {
+            Ok(()) => engine_health.consensus_stopped(),
+            Err(e) => {
+                error!(error = %e, "consensus engine stopped with an error");
+                engine_health.consensus_failed(&e.to_string());
+            }
         }
     });
 
@@ -783,7 +798,7 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     // Begin write transaction early (needed for premine + staking save)
     let txn = state_storage.begin_write()?;
 
-    // Founder premine (200_000 KVNC) — write to state store if founder file present.
+    // Founder premine (200_000 KUNA) — write to state store if founder file present.
     let premine_path = config.data_dir.join("founder_premine.hex");
     if premine_path.exists() {
         let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
@@ -1074,6 +1089,7 @@ async fn run_execution(
     events: EventBus,
     mempool: Option<Arc<Mempool>>,
     mut shutdown: watch::Receiver<bool>,
+    health: NodeHealth,
 ) {
     let mut ctx = ExecutionContext::new();
     ctx.log_publisher = Some(Box::new(EventLogPublisher(events.clone())));
@@ -1105,6 +1121,7 @@ async fn run_execution(
                             debug!(removed, "pruned committed transactions from mempool");
                         }
                         events.publish_committed_leader(&subdag);
+                        health.execution_progress(subdag.leader_round);
                     }
                     Err(e) => {
                         error!(
@@ -1112,10 +1129,14 @@ async fn run_execution(
                             round = subdag.leader_round,
                             "execution failed; stopping worker so committed decisions replay after restart"
                         );
+                        health.execution_failed(&format!("round {}: {e}", subdag.leader_round));
                         break;
                     }
                 },
-                None => break,
+                None => {
+                    warn!("committed sub-DAG channel closed; execution worker stopping");
+                    break;
+                }
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1124,6 +1145,7 @@ async fn run_execution(
             }
         }
     }
+    health.execution_stopped();
 }
 
 /// Adapter implementing [`DagStoreTrait`] over the concrete [`DagStore`].
@@ -1178,6 +1200,15 @@ impl DagStoreTrait for NodeDagStore {
 
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         self.inner.mark_round_decided(round, leader_hash)
+    }
+
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.inner
+            .mark_decided_and_commit_leader(round, leader_hash)
     }
 
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
@@ -1319,11 +1350,12 @@ fn recover_committed_subdags(
                 subdags.push(subdag);
             } else {
                 // Original linearizer path (bit-identical to current behaviour)
-                let history = dag_store
-                    .get_ancestors(&leader_hash, 0)?
-                    .into_iter()
-                    .map(|hash| dag_store.get_block(&hash))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // Same not-yet-committed history as the live committer, so
+                // replay never re-delivers a block from an earlier commit.
+                let node_store = NodeDagStore {
+                    inner: Arc::new(dag_store.clone()),
+                };
+                let history = kvnc_consensus::uncommitted_history(&node_store, &leader)?;
                 subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
             }
         }
@@ -1790,6 +1822,54 @@ mod tests {
     }
 
     #[test]
+    fn committed_subdag_recovery_never_replays_a_block_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let mut parents = Vec::new();
+        let mut chain = Vec::new();
+        for round in 1..=5u64 {
+            let digest = StatementBlock::compute_digest(0, round, &parents, &[]);
+            let block = StatementBlock {
+                author: 0,
+                round,
+                parents: parents.clone(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: Signature([0; 64]),
+                digest,
+                merkle_root: Default::default(),
+            };
+            dag.put_block(&block).unwrap();
+            parents = vec![kvnc_types::block::BlockReference {
+                author: 0,
+                round,
+                digest,
+            }];
+            chain.push(block);
+        }
+        // Leaders committed at rounds 1, 3 and 5.
+        for i in [0usize, 2, 4] {
+            dag.mark_round_decided(chain[i].round, &chain[i].digest)
+                .unwrap();
+        }
+
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
+        assert_eq!(recovered.len(), 3);
+        let delivered: Vec<Hash> = recovered
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.digest))
+            .collect();
+        let unique: std::collections::HashSet<Hash> = delivered.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            delivered.len(),
+            "replayed twice: {delivered:?}"
+        );
+        assert_eq!(unique.len(), 5);
+    }
+
+    #[test]
     fn committed_subdag_recovery_skips_missing_decided_block() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
@@ -1983,6 +2063,7 @@ mod tests {
             EventBus::new(),
             None,
             shutdown_rx,
+            NodeHealth::new(),
         ));
 
         let leader_round = 3;
@@ -2088,14 +2169,18 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = NodeHealth::new();
         run_execution(
             exec_rx,
             state_storage.clone(),
             EventBus::new(),
             None,
             shutdown_rx,
+            health.clone(),
         )
         .await;
+        assert_eq!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+        assert!(!health.is_healthy());
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();
@@ -2193,7 +2278,7 @@ mod tests {
         let mut staking = StakingState::new();
         staking.init_treasury(Address([0xaa; 32]));
 
-        // Validator stakes: 100K, 80K, 120K, 60K KVNC (all above MIN_VALIDATOR_STAKE = 50K)
+        // Validator stakes: 100K, 80K, 120K, 60K KUNA (all above MIN_VALIDATOR_STAKE = 50K)
         staking
             .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
             .unwrap();

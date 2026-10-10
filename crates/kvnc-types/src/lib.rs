@@ -1,4 +1,4 @@
-//! Core types for the Kovanica (KVNC) blockchain.
+//! Core types for the Kovanica (KUNA) blockchain.
 //!
 //! This crate contains all fundamental data structures used across the system:
 //! blocks, transactions, addresses, rounds, committee, etc.

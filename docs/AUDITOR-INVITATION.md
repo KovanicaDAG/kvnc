@@ -32,7 +32,7 @@ Referiraj `AUDIT_REPORT.md` (§2, §3, §4) i `docs/AUDIT-CHECKLIST.md`.
 ### P0 — konsenzus i sigurnost (blokira glavnu mrežu)
 1. **Uncertified DAG (Mysticeti, wave=3)**: provjeriti `kvnc-consensus/src/engine.rs` i `kvnc-dag/src/block_manager.rs` za ispravnost `CommittedSubDag` pravila i odsutnost certifikata; potvrditi da nema regresije na `k=3`.
 2. **WASMI deterministički izvršavanje**: `kvnc-execution/src/lib.rs` + `kvnc-runtime` — potvrditi da svaki ugovor (HTLC, Vault, Multisig, Token) daje identičan rezultat na istom ulazu; provjeriti plin (gas) metering (`docs/EXECUTION-GAS-SKELETON.md`).
-3. **Tokenomics invarijante**: tvrdi cap 90 200 000 KVNC (`9_020_000_000_000_000` atoma); `subsidy / 500_000` fee floor; 75% burn / 25% producer; maturity 100 blokova (`docs/AUDIT-CHECKLIST.md` §2).
+3. **Tokenomics invarijante**: tvrdi cap 90 200 000 KUNA (`9_020_000_000_000_000` atoma); `subsidy / 500_000` fee floor; 75% burn / 25% producer; maturity 100 blokova (`docs/AUDIT-CHECKLIST.md` §2).
 4. **Ed25519 kripto**: `kvnc-crypto` — formalni pregled (key derivation, address format, replay protection, signature verification). Ključevi moraju ostati isključivo klijentski (`node` ne prima `seed` ili `private_key`).
 
 ### P1 — P2P, mreža, otpornost (blokira testnet stabilnost)
@@ -41,7 +41,7 @@ Referiraj `AUDIT_REPORT.md` (§2, §3, §4) i `docs/AUDIT-CHECKLIST.md`.
 7. **Eclipse / Sybil otpornost**: provjeriti `peer` ograničenja, `ping` timeout, `ban` pravila (`service.rs` linije 33–40); preporuka: dodati eksplicitnu `Sybil` / `eclipse` simulaciju.
 
 ### P2 — staking, upravljanje, operacija (blokira Phase 18 / 25)
-8. **Staking ekonomija**: `crates/kvnc-staking/src/lib.rs` — `bond`/`unbond`/`commission`/`slash` pravila; potvrditi da `MIN_VALIDATOR_STAKE = 50_000 KVNC` i `UNBONDING_ROUNDS` ne dozvoljavaju napade na aktivni skup (15–21).
+8. **Staking ekonomija**: `crates/kvnc-staking/src/lib.rs` — `bond`/`unbond`/`commission`/`slash` pravila; potvrditi da `MIN_VALIDATOR_STAKE = 50_000 KUNA` i `UNBONDING_ROUNDS` ne dozvoljavaju napade na aktivni skup (15–21).
 9. **Governance (Phase 25)**: `docs/GOVERNANCE.md` + `docs/B-TREASURY-PROPOSAL.md` — provjeriti da `TreasuryProposal` i `vote_on_proposal()` ne mijenjaju konsenzus pravila (trenutno `docs-only` / `client-only`); aktivacija tek nakon Phase 18.
 10. **CLI delegate / claim**: `kvnc-cli/src/main.rs` (`delegate_skeleton`, `claim_rewards_skeleton`); potvrditi da `HTLC` claim (`A8.2-DELEGATION-SKELETON.md`) ne uvodi neodređenost.
 

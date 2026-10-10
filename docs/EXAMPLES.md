@@ -1,7 +1,7 @@
-# KVNC Contract Examples
+# KUNA Contract Examples
 
 Worked end-to-end flows for the four contract crates. All amounts are in
-**atoms** (base units): `1 KVNC = 1_000_000_000 atoms` (9 decimals).
+**atoms** (base units): `1 KUNA = 1_000_000_000 atoms` (9 decimals).
 
 > **CLI status.** `kvnc-cli` is currently a skeleton (`keygen`, `info`,
 > `transfer` only). The commands below are the planned CLI surface for the
@@ -15,11 +15,11 @@ Worked end-to-end flows for the four contract crates. All amounts are in
 
 ## HTLC atomic swap (KVP-104)
 
-Alice locks KVNC for Bob; Bob claims with the preimage before expiry, or
+Alice locks KUNA for Bob; Bob claims with the preimage before expiry, or
 Alice refunds after expiry.
 
 ```bash
-# 1. Alice locks 100 KVNC for Bob.
+# 1. Alice locks 100 KUNA for Bob.
 #    hash-lock = BLAKE3-256(preimage) as hex; expiry = unix timestamp.
 kvnc htlc create \
   --claimer <Bob-address> \

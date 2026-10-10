@@ -54,8 +54,8 @@ pub struct PruningConfig {
 impl Default for PruningConfig {
     fn default() -> Self {
         Self {
-            keep_recent: 1000,  // Keep last 1000 committed leaders
-            max_state_roots: 2000,  // Keep up to 2000 state roots
+            keep_recent: 1000,     // Keep last 1000 committed leaders
+            max_state_roots: 2000, // Keep up to 2000 state roots
         }
     }
 }
@@ -593,10 +593,7 @@ impl StateStore {
 
     /// Prune old state roots beyond the configured retention.
     /// Keeps the most recent `max_state_roots` entries.
-    pub fn prune_state_roots(
-        &self,
-        txn: &WriteTransaction,
-    ) -> Result<u64, StateStoreError> {
+    pub fn prune_state_roots(&self, txn: &WriteTransaction) -> Result<u64, StateStoreError> {
         let mut table = txn.open_table(crate::tables::STATE_ROOT)?;
         let mut roots: Vec<u64> = table
             .iter()?

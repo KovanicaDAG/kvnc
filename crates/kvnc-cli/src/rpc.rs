@@ -1,4 +1,4 @@
-//! Minimal async JSON-RPC 2.0 client for a KVNC node.
+//! Minimal async JSON-RPC 2.0 client for a Kovanica node.
 //!
 //! Only the surface the CLI needs is implemented: a single `call` that posts a
 //! JSON-RPC request to `/rpc` and unwraps the `result`, translating an `error`
