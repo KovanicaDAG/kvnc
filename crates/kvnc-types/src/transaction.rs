@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Kind of native transaction.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TransactionKind {
-    /// Simple transfer of KVNC.
+    /// Simple transfer of KUNA.
     Transfer {
         /// Recipient address.
         to: Address,

@@ -9,7 +9,9 @@ use kvnc_types::{
     hash::Hash,
     AuthorityIndex, Round,
 };
-use redb::{CommitError, ReadTransaction, ReadableTable, TableError, WriteTransaction};
+use redb::{
+    CommitError, ReadTransaction, ReadableTable, TableDefinition, TableError, WriteTransaction,
+};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -35,20 +37,35 @@ pub enum DagStoreError {
     RedbStorage(#[from] redb::StorageError),
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
+    #[error(
+        "Round {round} already decided for a different leader (existing {existing:?}, new {new})"
+    )]
+    ConflictingDecision {
+        round: Round,
+        existing: Vec<Hash>,
+        new: Hash,
+    },
 }
+
+/// Durable prune boundary: every DAG round strictly below the stored value
+/// has been pruned. Written in the same redb write transaction as the pruning
+/// itself, so the boundary and the deletion are atomic.
+const DAG_PRUNE_BOUNDARY: TableDefinition<&str, u64> = TableDefinition::new("dag_prune_boundary");
+const DAG_PRUNE_BOUNDARY_KEY: &str = "round";
 
 /// DAG store for high-level DAG operations.
 #[derive(Clone)]
 pub struct DagStore {
     storage: Arc<Storage>,
+    /// Test-only instrumentation: number of `get_block` calls.
+    #[cfg(test)]
+    get_block_calls: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DagStore {
     /// Create a new DAG store.
     pub fn new(storage: Storage) -> Result<Self, DagStoreError> {
-        Ok(Self {
-            storage: Arc::new(storage),
-        })
+        Ok(Self::from_storage(Arc::new(storage)))
     }
 
     /// Wrap an existing shared [`Storage`] handle.
@@ -58,7 +75,49 @@ impl DagStore {
     /// `DagStore` over it without reopening the database (handy for tests and
     /// for exposing the DAG view alongside the state view).
     pub fn from_storage(storage: Arc<Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            #[cfg(test)]
+            get_block_calls: Arc::default(),
+        }
+    }
+
+    /// Test-only: number of `get_block` calls made so far.
+    #[cfg(test)]
+    pub(crate) fn get_block_calls(&self) -> u64 {
+        self.get_block_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Durable prune boundary: every round strictly below it has been pruned
+    /// (0 if nothing was ever pruned). Survives restarts.
+    pub fn prune_boundary(&self) -> Result<Round, DagStoreError> {
+        let txn = self.storage.begin_read()?;
+        let table = match txn.open_table(DAG_PRUNE_BOUNDARY) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let boundary = table.get(DAG_PRUNE_BOUNDARY_KEY)?.map(|v| v.value());
+        Ok(boundary.unwrap_or(0))
+    }
+
+    /// Raise (never lower) the prune boundary inside `txn`, i.e. in the same
+    /// transaction as the pruning it describes.
+    fn raise_prune_boundary(
+        &self,
+        txn: &WriteTransaction,
+        boundary: Round,
+    ) -> Result<(), DagStoreError> {
+        let mut table = txn.open_table(DAG_PRUNE_BOUNDARY)?;
+        let current = table
+            .get(DAG_PRUNE_BOUNDARY_KEY)?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        if boundary > current {
+            table.insert(DAG_PRUNE_BOUNDARY_KEY, boundary)?;
+        }
+        Ok(())
     }
 
     /// Get a block by hash.
@@ -68,6 +127,9 @@ impl DagStore {
     /// tolerates a pruned/absent block can match on the same variant — the
     /// in-memory DAG implementations used in tests behave the same way.
     pub fn get_block(&self, hash: &Hash) -> Result<StatementBlock, DagStoreError> {
+        #[cfg(test)]
+        self.get_block_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let txn = self.storage.begin_read()?;
         match self.storage.consensus().get_dag_block(&txn, hash) {
             Ok(block) => Ok(block),
@@ -290,10 +352,73 @@ impl DagStore {
         Ok(height)
     }
 
+    /// Atomically mark `round` decided for `leader_hash` and advance the
+    /// committed leader height / last committed leader, in ONE redb write
+    /// transaction: after a crash either both are durable or neither is.
+    ///
+    /// The "already decided" check runs inside the same write transaction:
+    /// - round already decided with the SAME hash: no-op, returns the current
+    ///   committed leader height (no increment);
+    /// - round already decided with a DIFFERENT hash:
+    ///   [`DagStoreError::ConflictingDecision`], nothing written.
+    pub fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        let txn = self.storage.begin_write()?;
+        let existing: Vec<Hash> = {
+            let table = txn.open_table(tables::DECIDED_ROUNDS)?;
+            let value = table.get(round)?;
+            value
+                .map(|v| {
+                    let hashes: Vec<[u8; 32]> =
+                        BincodeSerialize::from_bytes(&v.value()).unwrap_or_default();
+                    hashes.into_iter().map(Hash).collect()
+                })
+                .unwrap_or_default()
+        };
+        if existing.contains(leader_hash) {
+            let table = txn.open_table(tables::COMMITTED_LEADER_HEIGHT)?;
+            let height = table.get("height")?.map(|v| v.value()).unwrap_or(0);
+            drop(table);
+            // Read-only use of the write transaction; nothing to persist.
+            txn.abort()?;
+            return Ok(height);
+        }
+        if !existing.is_empty() {
+            txn.abort()?;
+            return Err(DagStoreError::ConflictingDecision {
+                round,
+                existing,
+                new: *leader_hash,
+            });
+        }
+        self.storage
+            .consensus()
+            .mark_round_decided(&txn, round, leader_hash)?;
+        #[cfg(test)]
+        if fault::crash_between_steps() {
+            // Simulated crash: the transaction is dropped uncommitted.
+            return Err(DagStoreError::NotFound("injected crash".into()));
+        }
+        let height = self
+            .storage
+            .consensus()
+            .increment_committed_leader_height(&txn)?;
+        self.storage
+            .consensus()
+            .set_last_committed(&txn, leader_hash)?;
+        txn.commit()?;
+        Ok(height)
+    }
+
     /// Prune DAG blocks below a certain round.
     pub fn prune_below(&self, min_round: Round) -> Result<u64, DagStoreError> {
         let txn = self.storage.begin_write()?;
         let pruned = self.storage.consensus().prune_dag_below(&txn, min_round)?;
+        // `prune_dag_below` removes rounds <= min_round.
+        self.raise_prune_boundary(&txn, min_round.saturating_add(1))?;
         txn.commit()?;
         Ok(pruned)
     }
@@ -415,6 +540,8 @@ impl DagStore {
             .storage
             .consensus()
             .prune_dag_below(&txn, max_round_to_prune)?;
+        // Same transaction: rounds <= max_round_to_prune are gone.
+        self.raise_prune_boundary(&txn, max_round_to_prune + 1)?;
 
         // The committed_leader_height counter is not changed here because
         // it represents the total number of committed leaders ever, not just recent ones.
@@ -525,8 +652,7 @@ impl DagStore {
                     .get((round, author))?
                     .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
                     .unwrap_or_default();
-                let filtered: Vec<[u8; 32]> =
-                    existing.into_iter().filter(|h| *h != key).collect();
+                let filtered: Vec<[u8; 32]> = existing.into_iter().filter(|h| *h != key).collect();
                 if filtered.is_empty() {
                     table.remove((round, author))?;
                 } else {
@@ -539,8 +665,7 @@ impl DagStore {
                     .get((author, round))?
                     .map(|v| BincodeSerialize::from_bytes(&v.value()).unwrap_or_default())
                     .unwrap_or_default();
-                let filtered: Vec<[u8; 32]> =
-                    existing.into_iter().filter(|h| *h != key).collect();
+                let filtered: Vec<[u8; 32]> = existing.into_iter().filter(|h| *h != key).collect();
                 if filtered.is_empty() {
                     table.remove((author, round))?;
                 } else {
@@ -556,52 +681,43 @@ impl DagStore {
     ///
     /// The mergeset is the set of all blocks reachable from the leader that
     /// have not yet been included in any previously committed sub-DAG.
-    /// We compute this by BFS from the leader via parent links, stopping when
-    /// we reach a block whose round is <= the last committed leader's round
-    /// (or more precisely, when the round is already decided).
+    /// We compute this by BFS from the leader via parent links, stopping at
+    /// blocks in [`Self::committed_before`] the leader's round (the actual
+    /// committed set from the decided-leader index, not a round cutoff).
     pub fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        let leader_round = match self.get_block(leader) {
+            Ok(block) => block.round,
+            Err(DagStoreError::NotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        // Cutoff = the actual committed set (decided leaders of lower rounds
+        // and their histories), not the last committed leader's round: a
+        // late block below that round that no earlier leader referenced is
+        // still uncommitted and must enter this batch. Works when the last
+        // committed block itself has been pruned.
+        let committed = self.committed_before(leader_round)?;
+
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-
-        // Get the last committed leader's round to know where to stop.
-        // If there's no committed leader yet, we don't stop at any round.
-        let committed_leader_round = match self.get_last_committed()? {
-            Some(last_committed_hash) => match self.get_block(&last_committed_hash) {
-                Ok(block) => Some(block.round),
-                // Tolerate a pruned last-committed block: fall back to "no stop
-                // round" rather than failing the whole mergeset walk.
-                Err(DagStoreError::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            },
-            None => None, // No committed leaders yet - don't stop
-        };
-
         queue.push_back(*leader);
         visited.insert(*leader);
 
         while let Some(current) = queue.pop_front() {
+            if current != *leader && committed.contains(&current) {
+                // Already delivered; its history is committed too.
+                continue;
+            }
             // A pruned block can still be referenced by a surviving child's
             // parent list; skip the dangling edge instead of failing (M2).
-            let block = match self.get_block(&current) {
-                Ok(block) => block,
+            match self.get_block(&current) {
+                Ok(_) => {}
                 Err(DagStoreError::NotFound(_)) => continue,
                 Err(e) => return Err(e),
-            };
-
-            // If there's a committed leader and this block's round is <= committed_leader_round,
-            // it's already in a previous sub-DAG. Don't include it and don't traverse further.
-            if current != *leader {
-                if let Some(committed_round) = committed_leader_round {
-                    if block.round <= committed_round {
-                        continue;
-                    }
-                }
             }
 
             result.push(current);
 
-            // Traverse parents
             let parents = match self.get_parents(&current) {
                 Ok(parents) => parents,
                 Err(DagStoreError::NotFound(_)) => continue,
@@ -615,6 +731,50 @@ impl DagStore {
         }
 
         Ok(result)
+    }
+
+    /// Blocks already delivered by commits of rounds strictly below `round`:
+    /// every decided leader of such a round plus its (stored) causal history.
+    /// Derived only from the durable decided-leader index, the same rule as
+    /// `kvnc_consensus::uncommitted_history`, so it is identical live and
+    /// after a restart. Relies on pruning being downward-closed by round.
+    pub fn committed_before(&self, round: Round) -> Result<HashSet<Hash>, DagStoreError> {
+        let mut committed = HashSet::new();
+        if round == 0 {
+            return Ok(committed);
+        }
+        for decided_round in self.get_decided_rounds(round - 1)? {
+            if decided_round >= round {
+                continue;
+            }
+            for prev in self.get_decided_leaders(decided_round)? {
+                if !committed.insert(prev) {
+                    continue;
+                }
+                committed.extend(self.get_ancestors(&prev, 0)?);
+            }
+        }
+        Ok(committed)
+    }
+}
+
+/// Test-only fault injection: simulate a process crash between the
+/// decided-round mark and the committed-leader update.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CRASH_BETWEEN_STEPS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn arm() {
+        CRASH_BETWEEN_STEPS.with(|c| c.set(true));
+    }
+
+    /// Returns true (once) when a crash was armed.
+    pub(crate) fn crash_between_steps() -> bool {
+        CRASH_BETWEEN_STEPS.with(|c| c.replace(false))
     }
 }
 
@@ -774,5 +934,80 @@ mod tests {
             .mergeset(&child.digest)
             .expect("mergeset walk tolerates pruned parents");
         assert_eq!(mergeset, vec![child.digest]);
+    }
+
+    #[test]
+    fn mark_decided_and_commit_leader_is_atomic_across_crash_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dag.redb");
+        let leader = make_block(1, 3, Vec::new(), "atomic-leader");
+        {
+            let store = DagStore::new(Storage::new(&path).unwrap()).unwrap();
+            store.put_block(&leader).unwrap();
+            fault::arm();
+            let res = store.mark_decided_and_commit_leader(3, &leader.digest);
+            assert!(res.is_err(), "injected crash must surface");
+        } // "process" dies here
+
+        let store = DagStore::new(Storage::new(&path).unwrap()).unwrap();
+        let decided = store.is_round_decided(3).unwrap();
+        let height = store.get_committed_leader_height().unwrap();
+        let last = store.get_last_committed().unwrap();
+        let committed = height == 1 && last == Some(leader.digest);
+        let not_committed = height == 0 && last.is_none();
+        assert!(
+            (decided && committed) || (!decided && not_committed),
+            "inconsistent durable state after crash: decided={decided}, height={height}, last={last:?}"
+        );
+
+        // A retry after restart completes both steps exactly once.
+        let h = store
+            .mark_decided_and_commit_leader(3, &leader.digest)
+            .unwrap();
+        assert_eq!(h, 1);
+        assert!(store.is_round_decided(3).unwrap());
+        assert_eq!(store.get_last_committed().unwrap(), Some(leader.digest));
+    }
+
+    #[test]
+    fn mark_decided_and_commit_leader_double_call_does_not_increase_height() {
+        let (_dir, store) = store();
+        let leader = make_block(1, 3, Vec::new(), "idem-leader");
+        store.put_block(&leader).unwrap();
+        assert_eq!(
+            store
+                .mark_decided_and_commit_leader(3, &leader.digest)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .mark_decided_and_commit_leader(3, &leader.digest)
+                .unwrap(),
+            1,
+            "second call with the same hash must be a no-op"
+        );
+        assert_eq!(store.get_committed_leader_height().unwrap(), 1);
+        assert_eq!(store.get_decided_leaders(3).unwrap(), vec![leader.digest]);
+    }
+
+    #[test]
+    fn mark_decided_and_commit_leader_rejects_different_hash_for_decided_round() {
+        let (_dir, store) = store();
+        let a = make_block(1, 3, Vec::new(), "leader-a");
+        let b = make_block(2, 3, Vec::new(), "leader-b");
+        store.put_block(&a).unwrap();
+        store.put_block(&b).unwrap();
+        store.mark_decided_and_commit_leader(3, &a.digest).unwrap();
+        let err = store
+            .mark_decided_and_commit_leader(3, &b.digest)
+            .expect_err("different hash for a decided round must fail");
+        assert!(
+            matches!(err, DagStoreError::ConflictingDecision { round: 3, .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(store.get_committed_leader_height().unwrap(), 1);
+        assert_eq!(store.get_decided_leaders(3).unwrap(), vec![a.digest]);
+        assert_eq!(store.get_last_committed().unwrap(), Some(a.digest));
     }
 }

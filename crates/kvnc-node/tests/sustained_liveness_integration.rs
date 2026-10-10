@@ -25,10 +25,12 @@
 //!
 //! # Ports
 //!
-//! The live Docker quorum currently holds RPC `127.0.0.1:8545-8548` and P2P
-//! `9000`-ish, so this test uses a **disjoint** range: RPC `8630-8633`, P2P
-//! `9230-9233` (see the `*_BASE_PORT` constants). It never touches Docker or the
-//! running quorum.
+//! Each run picks a random port block in `PORT_RANGE_START..PORT_RANGE_END`
+//! (well below the Linux ephemeral range 32768+ and away from the live Docker
+//! quorum at RPC 8545-8548 / P2P ~9000), and verifies every RPC and P2P port in
+//! the block is free (bind then drop) before starting. A busy block is skipped
+//! and another one is tried, so a stale node or a parallel run on the same
+//! host cannot make the test fail at startup.
 //!
 //! # Running
 //!
@@ -54,6 +56,7 @@
 //! `live_vote_integration` convention of a plain `#[tokio::test]` (no
 //! `#[ignore]`).
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -62,6 +65,7 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use kvnc_crypto::generate_keypair;
 use kvnc_staking::MIN_VALIDATOR_STAKE;
+use kvnc_storage::Storage;
 use kvnc_types::{Address, PublicKey};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -86,11 +90,13 @@ const ROUND_DURATION_MS: u64 = 1000;
 /// leader (observed stall at height 4).
 const TARGET_HEIGHT: u64 = 20;
 
-/// RPC base port. Chosen to avoid the live Docker quorum (8545-8548).
-const RPC_BASE_PORT: u16 = 8630;
+/// Random per-run port blocks are drawn from this range (exclusive end).
+/// Each block holds `NODES` RPC ports followed by `NODES` P2P ports.
+const PORT_RANGE_START: u16 = 20_000;
+const PORT_RANGE_END: u16 = 30_000;
 
-/// P2P base port. Chosen to avoid the live Docker quorum (~9000).
-const P2P_BASE_PORT: u16 = 9230;
+/// How many random port blocks to try before giving up.
+const PORT_ATTEMPTS: usize = 32;
 
 /// How long to wait for a freshly started node's JSON-RPC to answer.
 const RPC_READY_TIMEOUT_SECS: u64 = 30;
@@ -102,7 +108,7 @@ const PEER_TIMEOUT_SECS: u64 = 30;
 const REACH_TARGET_TIMEOUT_SECS: u64 = 120;
 
 /// Bounded window for all four nodes to agree on a height.
-const SETTLE_TIMEOUT_SECS: u64 = 30;
+const SETTLE_TIMEOUT_SECS: u64 = 60;
 
 /// Bounded window for observing commits *after* the target (proves the commit
 /// loop no longer stalls on a dangling `last_committed`).
@@ -123,8 +129,8 @@ const POLL_INTERVAL_MS: u64 = 500;
 struct QuorumNode {
     index: usize,
     child: Child,
-    /// Kept alive purely for RAII: dropping it removes the node's data dir.
-    #[allow(dead_code)]
+    /// Dropping it removes the node's data dir; also read after shutdown for
+    /// the committed-leader agreement check.
     data_dir: TempDir,
     /// Where the node writes stdout+stderr while it runs (inside `data_dir`).
     temp_log_path: PathBuf,
@@ -504,13 +510,68 @@ async fn wait_until(
     }
 }
 
-/// True when every node reports the same height and that height is `>= min`.
-fn all_equal_and_at_least(sample: &[Option<u64>], min: u64) -> bool {
+/// Minimum height across all nodes, or `None` if any node is unreachable.
+fn min_height(sample: &[Option<u64>]) -> Option<u64> {
     let heights: Option<Vec<u64>> = sample.iter().copied().collect();
-    match heights {
-        Some(v) if !v.is_empty() => v.iter().all(|h| *h == v[0]) && v[0] >= min,
-        _ => false,
+    heights.and_then(|v| v.into_iter().min())
+}
+
+/// True when every node answers and the lowest height is `>= min`.
+fn all_at_least(sample: &[Option<u64>], min: u64) -> bool {
+    min_height(sample).is_some_and(|h| h >= min)
+}
+
+/// `true` if `port` can be bound on 127.0.0.1 right now (listener dropped
+/// immediately).
+fn port_is_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Pick a random block of `2 * NODES` consecutive free ports (RPC block then
+/// P2P block) and return the two base ports.
+///
+/// Random per run (seeded from time + pid, no extra dependency) so parallel
+/// runs or a leftover node from a crashed run do not collide; every port is
+/// probed with bind-then-drop so a busy block is skipped. A small race remains
+/// between the probe and the node binding, which the random base makes
+/// unlikely.
+fn pick_free_ports() -> Result<(u16, u16)> {
+    let span = (2 * NODES) as u64;
+    let blocks = (PORT_RANGE_END - PORT_RANGE_START) as u64 / span;
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ ((std::process::id() as u64) << 32);
+    for _ in 0..PORT_ATTEMPTS {
+        // xorshift64
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let base = PORT_RANGE_START + ((seed % blocks) * span) as u16;
+        if (0..span as u16).all(|offset| port_is_free(base + offset)) {
+            return Ok((base, base + NODES as u16));
+        }
     }
+    bail!("no free block of {span} ports found in {PORT_RANGE_START}..{PORT_RANGE_END}")
+}
+
+/// Committed leader sequence of a stopped node, read from its consensus DB:
+/// decided rounds in ascending order, flattened. Entry `H - 1` is the leader
+/// committed at height `H`.
+fn committed_leaders(data_dir: &Path) -> Result<Vec<[u8; 32]>> {
+    let path = data_dir.join("consensus.redb");
+    let storage =
+        Storage::new(&path).with_context(|| format!("open consensus db {}", path.display()))?;
+    let txn = storage.begin_read()?;
+    let consensus = storage.consensus();
+    let mut leaders = Vec::new();
+    for round in consensus.get_decided_rounds(&txn, u64::MAX)? {
+        for hash in consensus.get_decided_leaders(&txn, round)? {
+            leaders.push(hash.0);
+        }
+    }
+    Ok(leaders)
 }
 
 /// Max height observed in a sample (0 if none).
@@ -613,13 +674,19 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
 
     // Start nodes sequentially so each new node dials already-running peers;
     // the network layer also retries bootstrap dials, so late nodes converge.
+    let (rpc_base_port, p2p_base_port) = pick_free_ports()?;
+    eprintln!(
+        "[sustained_liveness] ports: rpc {rpc_base_port}-{}, p2p {p2p_base_port}-{}",
+        rpc_base_port + NODES as u16 - 1,
+        p2p_base_port + NODES as u16 - 1
+    );
     let mut quorum: Vec<QuorumNode> = Vec::with_capacity(NODES);
     for (i, (sk, pk, addr)) in validators.iter().cloned().enumerate() {
-        let rpc_port = RPC_BASE_PORT + i as u16;
-        let p2p_port = P2P_BASE_PORT + i as u16;
+        let rpc_port = rpc_base_port + i as u16;
+        let p2p_port = p2p_base_port + i as u16;
         let bootnodes = (0..NODES)
             .filter(|j| *j != i)
-            .map(|j| format!("127.0.0.1:{}", P2P_BASE_PORT + j as u16))
+            .map(|j| format!("127.0.0.1:{}", p2p_base_port + j as u16))
             .collect::<Vec<_>>();
 
         let node = QuorumNode::start(
@@ -669,69 +736,48 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
         "target committed height reached"
     );
 
-    // --- Phase B: all four nodes agree -------------------------------------
-    let converged = wait_until(
+    // --- Phase B: every node has committed at least TARGET_HEIGHT -----------
+    // Nodes advance at slightly different times, so equal heights at one poll
+    // instant are not required; the agreement check on committed leader hashes
+    // at a fixed height happens after shutdown (see the final check).
+    let settled = wait_until(
         &client,
         &mut quorum,
         Duration::from_secs(SETTLE_TIMEOUT_SECS),
         &mut monotonic,
-        |s| all_equal_and_at_least(s, TARGET_HEIGHT),
+        |s| all_at_least(s, TARGET_HEIGHT),
     )
     .await
-    .context("nodes did not converge on an equal committed height at/after the target")?;
-
-    let base = converged[0];
-    assert!(
-        converged.iter().all(|h| *h == base),
-        "all four nodes must report the same committed height, got {converged:?}"
-    );
+    .context("not every node reached the target committed height")?;
+    let base = *settled.iter().min().expect("NODES > 0");
     assert!(
         base >= TARGET_HEIGHT,
-        "converged height {base} is below the target {TARGET_HEIGHT}"
+        "min committed height {base} is below the target {TARGET_HEIGHT} ({settled:?})"
     );
-    info!(height = base, "all four nodes converged on an equal height");
+    info!(heights = ?settled, min = base, "all four nodes at/after the target");
 
     // --- Phase C: keep committing past the target --------------------------
-    // If pruning left `last_committed` dangling, the height freezes at `base`
-    // and this phase times out.
+    // If pruning left `last_committed` dangling, the height freezes and this
+    // phase times out. Requires the *slowest* node to move past `base`.
     let grown = wait_until(
         &client,
         &mut quorum,
         Duration::from_secs(GROWTH_TIMEOUT_SECS),
         &mut monotonic,
-        |s| max_height(s) > base,
+        |s| min_height(s).is_some_and(|h| h > base),
     )
     .await
     .context(
-        "no further commits after reaching the target: the commit loop stalled \
-         (suspected dangling last_committed after pruning)",
+        "no further commits on every node after reaching the target: the commit \
+         loop stalled (suspected dangling last_committed after pruning)",
     )?;
+    let final_min = *grown.iter().min().expect("NODES > 0");
+    assert!(
+        final_min > base,
+        "committed height must keep growing on every node after the target \
+         (base={base}, heights={grown:?})"
+    );
     info!(heights = ?grown, from = base, "commit loop advanced past the target");
-
-    // --- Final: re-converge and confirm strictly-positive sustained growth --
-    let final_heights = wait_until(
-        &client,
-        &mut quorum,
-        Duration::from_secs(SETTLE_TIMEOUT_SECS),
-        &mut monotonic,
-        |s| all_equal_and_at_least(s, base + 1),
-    )
-    .await
-    .context("nodes failed to re-converge after advancing past the target")?;
-
-    let final_height = final_heights[0];
-    assert!(
-        final_heights.iter().all(|h| *h == final_height),
-        "final committed heights must be equal across all nodes, got {final_heights:?}"
-    );
-    assert!(
-        final_height > base,
-        "committed height must keep growing after the target (base={base}, final={final_height})"
-    );
-    info!(
-        final_height,
-        base, "sustained liveness confirmed past pruning boundary"
-    );
 
     // End-of-test liveness snapshot for every node (pid + exited/running).
     for node in quorum.iter_mut() {
@@ -743,6 +789,35 @@ async fn four_validators_sustain_commits_past_pruning_boundary() -> Result<()> {
     for node in quorum.iter_mut() {
         node.stop();
     }
+
+    // --- Final: committed leader agreement at a fixed height ----------------
+    // H = TARGET_HEIGHT <= base <= every node's height, so every node must
+    // have a committed leader at H and they must all be the same block.
+    let fixed_height = TARGET_HEIGHT;
+    let mut leader_at_h: Vec<[u8; 32]> = Vec::with_capacity(NODES);
+    for (i, node) in quorum.iter().enumerate() {
+        let leaders = committed_leaders(node.data_dir.path())
+            .with_context(|| format!("node {i}: read committed leaders"))?;
+        let leader = leaders.get(fixed_height as usize - 1).with_context(|| {
+            format!(
+                "node {i} has only {} committed leaders, need height {fixed_height}",
+                leaders.len()
+            )
+        })?;
+        leader_at_h.push(*leader);
+    }
+    assert!(
+        leader_at_h.iter().all(|h| *h == leader_at_h[0]),
+        "committed leader at height {fixed_height} differs across nodes: {:?}",
+        leader_at_h.iter().map(hex::encode).collect::<Vec<_>>()
+    );
+    info!(
+        height = fixed_height,
+        leader = %hex::encode(leader_at_h[0]),
+        min = final_min,
+        base,
+        "sustained liveness confirmed: same committed leader on all nodes"
+    );
     eprintln!(
         "[sustained_liveness] node logs archived under: {}",
         log_dir.display()

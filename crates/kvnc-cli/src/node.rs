@@ -95,7 +95,7 @@ pub async fn status(client: &RpcClient, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-/// `kvnc balance <address>` — native KVNC balance in atoms.
+/// `kvnc balance <address>` — native KUNA balance in atoms.
 pub async fn balance(client: &RpcClient, address: &str, json_output: bool) -> Result<()> {
     let address = parse_address(address, "address")?;
     let value = client

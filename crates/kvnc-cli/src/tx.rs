@@ -1,6 +1,6 @@
 //! Offline transaction construction and encoding.
 //!
-//! A KVNC [`Transaction`] carries a cached `hash` and an Ed25519 `signature`
+//! A Kovanica [`Transaction`] carries a cached `hash` and an Ed25519 `signature`
 //! over that hash. The CLI uses `Transaction::signing_hash` (signature format v1,
 //! see `docs/SIGNATURE_FORMAT.md`; commits to the `chain_id`) and signs it offline — private keys never
 //! leave the machine.

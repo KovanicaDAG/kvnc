@@ -1,4 +1,4 @@
-# KVNC Architecture Overview
+# KUNA Architecture Overview
 
 ## High-level flow
 

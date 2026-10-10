@@ -20,7 +20,7 @@ pub mod metrics;
 pub mod mysticghost;
 pub mod types;
 
-pub use committer::{BaseCommitter, UniversalCommitter};
+pub use committer::{uncommitted_history, BaseCommitter, UniversalCommitter};
 pub use engine::{
     BlockBroadcaster, ConsensusConfig, ConsensusEngine, ConsensusError, ValidatorState,
     VoteBroadcaster, VoteRejection,
