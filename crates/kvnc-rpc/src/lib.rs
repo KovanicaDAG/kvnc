@@ -30,11 +30,13 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 mod chain_methods;
+pub mod health;
 mod openapi;
 mod rpc_methods;
 mod rpc_middleware;
 mod subscriptions;
 pub use chain_methods::*;
+pub use health::{ComponentState, HealthSnapshot, NodeHealth};
 pub use openapi::{generate_openapi_spec, write_openapi_json, write_openapi_yaml};
 pub use rpc_methods::*;
 pub use rpc_middleware::{
@@ -128,6 +130,8 @@ pub struct RpcState {
     pub committee: CommitteeInfo,
     /// Shared distinct connected-peer count maintained by the network service.
     pub peer_count: Arc<AtomicUsize>,
+    /// Execution / consensus liveness reported by the node's background tasks.
+    pub health: NodeHealth,
     /// Fan-out bus for WebSocket subscription events.
     pub events: EventBus,
     /// Rate limiter state
@@ -382,15 +386,30 @@ async fn rpc_handler(
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
+    /// `ok`, or `degraded` once execution or consensus has stopped.
     status: &'static str,
     peer_count: usize,
+    #[serde(flatten)]
+    detail: HealthSnapshot,
 }
 
-async fn health_check(Extension(peer_count): Extension<Arc<AtomicUsize>>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        peer_count: peer_count.load(Ordering::Relaxed),
-    })
+/// `/health`: HTTP 200 while the node is healthy, 503 once the execution
+/// worker or the consensus engine has stopped, so health checks fail loudly.
+async fn health_check(Extension(state): Extension<RpcState>) -> (StatusCode, Json<HealthResponse>) {
+    let detail = state.health.snapshot();
+    let (code, status) = if detail.healthy {
+        (StatusCode::OK, "ok")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "degraded")
+    };
+    (
+        code,
+        Json(HealthResponse {
+            status,
+            peer_count: state.peer_count.load(Ordering::Relaxed),
+            detail,
+        }),
+    )
 }
 
 /// Prometheus /metrics endpoint (text format).
@@ -473,24 +492,79 @@ async fn execute_contract_call(
 mod tests {
     use super::*;
 
+    fn health_state(peers: usize) -> (tempfile::TempDir, RpcState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::new(dir.path().join("state.redb")).expect("storage"));
+        let authority = kvnc_consensus::AuthorityInfo {
+            index: 0,
+            stake: kvnc_staking::MIN_VALIDATOR_STAKE,
+            public_key: kvnc_types::PublicKey([7u8; 32]),
+            address: kvnc_types::Address([9u8; 32]),
+            network_address: "127.0.0.1:9000".to_string(),
+        };
+        let state = RpcState {
+            health: NodeHealth::new(),
+            consensus_store: Arc::new(kvnc_dag::DagStore::from_storage(storage.clone())),
+            mempool: Arc::new(Mempool::new(
+                kvnc_mempool::MempoolConfig::default(),
+                storage.clone(),
+            )),
+            storage,
+            staking: Arc::new(RwLock::new(StakingState::new())),
+            committee: CommitteeInfo::try_new(0, vec![authority]).expect("committee"),
+            peer_count: Arc::new(AtomicUsize::new(peers)),
+            events: EventBus::new(),
+            rate_limiter: Arc::new(RateLimiterState::new(RateLimitConfig::default())),
+            auth_config: Arc::new(AuthConfig::default()),
+        };
+        (dir, state)
+    }
+
     #[tokio::test]
     async fn health_is_ok_with_zero_peers() {
-        let peer_count = Arc::new(AtomicUsize::new(0));
-        let Json(response) = health_check(Extension(peer_count)).await;
+        let (_dir, state) = health_state(0);
+        let (code, Json(response)) = health_check(Extension(state)).await;
         let response = serde_json::to_value(response).expect("health response serializes");
 
+        assert_eq!(code, StatusCode::OK);
         assert_eq!(response["status"], "ok");
         assert_eq!(response["peer_count"], 0);
     }
 
     #[tokio::test]
     async fn health_reports_nonzero_peer_count() {
-        let peer_count = Arc::new(AtomicUsize::new(3));
-        let Json(response) = health_check(Extension(peer_count)).await;
+        let (_dir, state) = health_state(3);
+        let (_, Json(response)) = health_check(Extension(state)).await;
         let response = serde_json::to_value(response).expect("health response serializes");
 
         assert_eq!(response["status"], "ok");
         assert_eq!(response["peer_count"], 3);
+    }
+
+    #[tokio::test]
+    async fn health_degrades_when_execution_fails() {
+        let (_dir, state) = health_state(2);
+        state.health.execution_progress(41);
+        state.health.execution_failed("state root mismatch");
+        let (code, Json(response)) = health_check(Extension(state)).await;
+        let response = serde_json::to_value(response).expect("health response serializes");
+
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["status"], "degraded");
+        assert_eq!(response["healthy"], false);
+        assert_eq!(response["execution"]["state"], "failed");
+        assert_eq!(response["execution"]["last_executed_round"], 41);
+        assert_eq!(response["last_error"], "execution: state root mismatch");
+    }
+
+    #[tokio::test]
+    async fn health_degrades_when_consensus_stops() {
+        let (_dir, state) = health_state(2);
+        state.health.consensus_stopped();
+        let (code, Json(response)) = health_check(Extension(state)).await;
+        let response = serde_json::to_value(response).expect("health response serializes");
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response["consensus"]["state"], "stopped");
     }
 
     // ------------------------------------------------------------------
@@ -526,6 +600,7 @@ mod tests {
             events: EventBus::new(),
             rate_limiter: Arc::new(RateLimiterState::new(rate.clone())),
             auth_config: Arc::new(auth.clone()),
+            health: NodeHealth::new(),
         }
     }
 
@@ -707,6 +782,7 @@ mod tests {
                 events: _,
                 rate_limiter: _,
                 auth_config: _,
+                health: _,
             } = s;
         };
     }
