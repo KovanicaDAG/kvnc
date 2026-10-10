@@ -427,6 +427,11 @@ impl DagStore {
     ///
     /// Deletes all blocks from the committed wave that are NOT in the blue set.
     /// Keeps blue blocks and previous tips needed for future colouring.
+    ///
+    /// Deprecated (#13, variant A): the committer no longer calls this. Red
+    /// blocks are reported in `CommittedSubDag::non_blue` and removed only by
+    /// round pruning (`prune_waves_before`). Kept for compatibility; do not
+    /// add new callers.
     pub fn prune_non_blue(
         &self,
         blue_hashes: &[Hash],
