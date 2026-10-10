@@ -958,8 +958,17 @@ fn handle_network_event(
         },
         NetworkEvent::VoteReceived { peer, vote } => {
             debug!(%peer, leader_round = vote.leader_round, %vote.leader_hash, "processing received vote");
-            if let Err(e) = engine.process_vote(vote.leader_round, vote.voter, vote.leader_hash) {
-                warn!(%peer, %e, "failed to process received vote");
+            // `process_vote` authenticates the vote against the committee key.
+            match engine.process_vote(&vote) {
+                Ok(()) => {}
+                Err(kvnc_consensus::ConsensusError::VoteRejected(
+                    reason @ (kvnc_consensus::VoteRejection::Duplicate { .. }
+                    | kvnc_consensus::VoteRejection::UnknownLeaderRound(_)),
+                )) => {
+                    // Expected under gossip (re-delivery, vote before block).
+                    debug!(%peer, %reason, "ignored received vote");
+                }
+                Err(e) => warn!(%peer, %e, "rejected received vote"),
             }
         }
         NetworkEvent::PeerConnected(peer) => info!(%peer, "peer connected"),
@@ -1840,7 +1849,14 @@ mod tests {
             merkle_root: Default::default(),
         };
         engine.process_block(&block).unwrap();
-        engine.process_vote(leader_round, 0, digest).unwrap();
+        let mut vote = kvnc_types::Vote {
+            leader_round,
+            leader_hash: digest,
+            voter: 0,
+            signature: kvnc_types::Signature([0; 64]),
+        };
+        vote.signature = kvnc_crypto::sign(&signing_key, &vote.signature_data());
+        engine.process_vote(&vote).unwrap();
 
         let mut committed_height = 0;
         for _ in 0..100 {

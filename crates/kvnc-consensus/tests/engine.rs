@@ -3,8 +3,9 @@
 
 mod common;
 
+use common::signed_vote;
 use common::{committee, make_engine};
-use kvnc_consensus::{ConsensusConfig, ConsensusError};
+use kvnc_consensus::{ConsensusConfig, ConsensusError, VoteRejection};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,10 +113,10 @@ fn test_competing_author_blocks_commit_the_scheduled_leader_in_either_arrival_or
         assert!(dag.contains(&non_leader.digest));
         assert!(dag.contains(&scheduled_leader.digest));
         engine
-            .process_vote(3, 0, scheduled_leader.digest)
+            .process_vote(&signed_vote(3, 0, scheduled_leader.digest))
             .expect("first valid vote");
         engine
-            .process_vote(3, 1, scheduled_leader.digest)
+            .process_vote(&signed_vote(3, 1, scheduled_leader.digest))
             .expect("quorum vote");
 
         let committed = receiver.try_recv().expect("leader slot commits");
@@ -141,36 +142,60 @@ fn test_competing_author_blocks_commit_the_scheduled_leader_in_either_arrival_or
 }
 
 #[test]
-fn test_engine_ignores_invalid_votes_without_counting_them() {
+fn test_engine_rejects_invalid_votes_without_counting_them() {
     let (engine, _dag, manager) = make_engine(0, committee(3), ConsensusConfig::default());
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     engine.set_commit_sender(sender);
     let block = common::make_block(0, 3, Vec::new(), "round-3-scheduled-leader");
     engine.process_block(&block).expect("process_block");
 
-    // Malformed/unactionable votes are accepted by this local bookkeeping API
-    // but ignored; it has no authentication proof and does not handle wire votes.
-    assert!(
-        engine.process_vote(3, 99, block.digest).is_ok(),
-        "unknown authority is ignored"
+    let rejection = |vote: kvnc_types::Vote| match engine.process_vote(&vote) {
+        Err(ConsensusError::VoteRejected(reason)) => reason,
+        other => panic!("expected a vote rejection, got {other:?}"),
+    };
+
+    // Unknown authority (signed with some key; membership is checked first).
+    assert_eq!(
+        rejection(common::vote_signed_with(
+            &common::validator_signing_key(99),
+            3,
+            99,
+            block.digest
+        )),
+        VoteRejection::UnknownVoter(99)
     );
-    assert!(
-        engine.process_vote(99, 2, block.digest).is_ok(),
-        "unknown leader round is ignored"
+    // Not a leader round.
+    assert_eq!(
+        rejection(signed_vote(4, 2, block.digest)),
+        VoteRejection::NotLeaderRound(4)
     );
-    assert!(
-        engine
-            .process_vote(3, 2, kvnc_types::hash::Hash::new(b"wrong-vote-hash"))
-            .is_ok(),
-        "hash-mismatched vote is ignored"
+    // Leader round with no registered leader block.
+    assert_eq!(
+        rejection(signed_vote(99, 2, block.digest)),
+        VoteRejection::UnknownLeaderRound(99)
+    );
+    // Hash that is not the registered leader block.
+    assert_eq!(
+        rejection(signed_vote(
+            3,
+            2,
+            kvnc_types::hash::Hash::new(b"wrong-vote-hash")
+        )),
+        VoteRejection::LeaderHashMismatch(3)
     );
 
-    // The unknown-round vote must not be retained for a future proposal, and
-    // the invalid authority/hash votes must not contribute stake.
-    assert!(engine.process_vote(3, 0, block.digest).is_ok());
-    assert!(engine.process_vote(3, 1, block.digest).is_ok());
+    // None of the rejected votes contributed stake: quorum (3 of 3) still
+    // needs every valid vote.
+    engine
+        .process_vote(&signed_vote(3, 0, block.digest))
+        .unwrap();
+    engine
+        .process_vote(&signed_vote(3, 1, block.digest))
+        .unwrap();
     assert!(receiver.try_recv().is_err(), "two votes are below quorum");
-    assert!(engine.process_vote(3, 2, block.digest).is_ok());
+    engine
+        .process_vote(&signed_vote(3, 2, block.digest))
+        .unwrap();
     assert_eq!(receiver.try_recv().unwrap().leader.digest, block.digest);
 
     assert_eq!(
