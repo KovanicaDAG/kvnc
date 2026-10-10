@@ -175,9 +175,11 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
             method,
             args,
             gas_limit,
+            value,
         } => json!({
             "type": "call",
             "contract": contract.to_string(),
+            "value": value,
             "method": method,
             "args": to_hex(args),
             "gas_limit": quantity(*gas_limit),
@@ -815,9 +817,7 @@ mod tests {
                 signature: Signature([0; 64]),
                 hash: Hash::zero(),
             };
-            let signing_hash = tx.signing_hash(&kvnc_types::SigningContext::new(
-                kvnc_types::signing::chain_id::LOCAL,
-            ));
+            let signing_hash = tx.signing_hash(&state.mempool.signing_context());
             tx.signature = kvnc_crypto::sign(sk, signing_hash.as_ref());
             tx.hash = signing_hash;
             tx
