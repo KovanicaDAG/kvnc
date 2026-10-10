@@ -5,14 +5,6 @@
 //! (htlc/vault/multisig/token). All commands support `--json` for
 //! machine-readable output and `--rpc-url` to target a specific node.
 
-mod contracts;
-mod node;
-mod output;
-mod rpc;
-mod stake;
-mod tx;
-pub mod wallet;
-
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -22,10 +14,13 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
-use contracts::{ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand};
+use kvnc_cli::contracts::{
+    ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand,
+};
+use kvnc_cli::rpc::RpcClient;
+use kvnc_cli::{contracts, node, output, rpc, tx, wallet};
 use kvnc_types::transaction::TransactionKind;
 use kvnc_types::{crypto::PublicKey, crypto::SigningKey, Address};
-use rpc::RpcClient;
 use zeroize::Zeroizing;
 
 const UNSAFE_SIGN_WARNING: &str = "WARNING: arbitrary message signing is unsafe and cross-context; signatures may be replayed or misinterpreted by other protocols.";
