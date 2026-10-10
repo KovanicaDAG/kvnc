@@ -681,52 +681,43 @@ impl DagStore {
     ///
     /// The mergeset is the set of all blocks reachable from the leader that
     /// have not yet been included in any previously committed sub-DAG.
-    /// We compute this by BFS from the leader via parent links, stopping when
-    /// we reach a block whose round is <= the last committed leader's round
-    /// (or more precisely, when the round is already decided).
+    /// We compute this by BFS from the leader via parent links, stopping at
+    /// blocks in [`Self::committed_before`] the leader's round (the actual
+    /// committed set from the decided-leader index, not a round cutoff).
     pub fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
+        let leader_round = match self.get_block(leader) {
+            Ok(block) => block.round,
+            Err(DagStoreError::NotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        // Cutoff = the actual committed set (decided leaders of lower rounds
+        // and their histories), not the last committed leader's round: a
+        // late block below that round that no earlier leader referenced is
+        // still uncommitted and must enter this batch. Works when the last
+        // committed block itself has been pruned.
+        let committed = self.committed_before(leader_round)?;
+
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-
-        // Get the last committed leader's round to know where to stop.
-        // If there's no committed leader yet, we don't stop at any round.
-        let committed_leader_round = match self.get_last_committed()? {
-            Some(last_committed_hash) => match self.get_block(&last_committed_hash) {
-                Ok(block) => Some(block.round),
-                // Tolerate a pruned last-committed block: fall back to "no stop
-                // round" rather than failing the whole mergeset walk.
-                Err(DagStoreError::NotFound(_)) => None,
-                Err(e) => return Err(e),
-            },
-            None => None, // No committed leaders yet - don't stop
-        };
-
         queue.push_back(*leader);
         visited.insert(*leader);
 
         while let Some(current) = queue.pop_front() {
+            if current != *leader && committed.contains(&current) {
+                // Already delivered; its history is committed too.
+                continue;
+            }
             // A pruned block can still be referenced by a surviving child's
             // parent list; skip the dangling edge instead of failing (M2).
-            let block = match self.get_block(&current) {
-                Ok(block) => block,
+            match self.get_block(&current) {
+                Ok(_) => {}
                 Err(DagStoreError::NotFound(_)) => continue,
                 Err(e) => return Err(e),
-            };
-
-            // If there's a committed leader and this block's round is <= committed_leader_round,
-            // it's already in a previous sub-DAG. Don't include it and don't traverse further.
-            if current != *leader {
-                if let Some(committed_round) = committed_leader_round {
-                    if block.round <= committed_round {
-                        continue;
-                    }
-                }
             }
 
             result.push(current);
 
-            // Traverse parents
             let parents = match self.get_parents(&current) {
                 Ok(parents) => parents,
                 Err(DagStoreError::NotFound(_)) => continue,
@@ -740,6 +731,50 @@ impl DagStore {
         }
 
         Ok(result)
+    }
+
+    /// Blocks already delivered by commits of rounds strictly below `round`:
+    /// every decided leader of such a round plus its (stored) causal history.
+    /// Derived only from the durable decided-leader index, the same rule as
+    /// `kvnc_consensus::uncommitted_history`, so it is identical live and
+    /// after a restart. Relies on pruning being downward-closed by round.
+    pub fn committed_before(&self, round: Round) -> Result<HashSet<Hash>, DagStoreError> {
+        let mut committed = HashSet::new();
+        if round == 0 {
+            return Ok(committed);
+        }
+        for decided_round in self.get_decided_rounds(round - 1)? {
+            if decided_round >= round {
+                continue;
+            }
+            for prev in self.get_decided_leaders(decided_round)? {
+                if !committed.insert(prev) {
+                    continue;
+                }
+                committed.extend(self.get_ancestors(&prev, 0)?);
+            }
+        }
+        Ok(committed)
+    }
+}
+
+/// Test-only fault injection: simulate a process crash between the
+/// decided-round mark and the committed-leader update.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CRASH_BETWEEN_STEPS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn arm() {
+        CRASH_BETWEEN_STEPS.with(|c| c.set(true));
+    }
+
+    /// Returns true (once) when a crash was armed.
+    pub(crate) fn crash_between_steps() -> bool {
+        CRASH_BETWEEN_STEPS.with(|c| c.replace(false))
     }
 }
 
