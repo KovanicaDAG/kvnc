@@ -331,8 +331,11 @@ impl UniversalCommitter {
                 .base
                 .try_indirect_decide(dag_store, leader_info, &decided);
             if status != LeaderStatus::Undecided {
+                // Only a leader's own direct quorum can make it Commit; a
+                // causal link to a later committed leader is not certificate
+                // proof, so the indirect outcome is always recorded as Skip.
                 let mut decided_leader = leader_info.clone();
-                decided_leader.status = status;
+                decided_leader.status = LeaderStatus::Skip;
                 self.mark_decided(round, decided_leader);
             }
         }
@@ -424,51 +427,26 @@ impl UniversalCommitter {
                 continue;
             }
 
-            // Try indirect decision
-            let indirect_status = self
-                .base
-                .try_indirect_decide(dag_store, leader_info, &decided);
-            if indirect_status == LeaderStatus::Commit {
-                // Construct only; candidate-only callers do not publish it.
-                return self
-                    .build_committed_subdag(dag_store, leader_info)
-                    .map(|(subdag, colouring)| (subdag, leader_info.clone(), colouring));
-            } else if indirect_status == LeaderStatus::Skip {
-                let mut skipped = leader_info.clone();
-                skipped.status = LeaderStatus::Skip;
-                self.mark_decided(round, skipped);
-                continue;
-            }
-
-            // Still undecided. A later leader may decide this one only via the
-            // indirect rule: the nearest later leader that is committed
-            // (directly, by quorum, or already decided Commit) acts as anchor.
-            // Commit if this leader is in the anchor's causal history, Skip
-            // otherwise. Without an anchor we stop here: no commit may ever
-            // pass over an undecided round leader.
-            let anchor = leaders.range_after(round).into_iter().find(|later| {
+            // Still undecided. A leader without its OWN direct quorum is never
+            // committed (votes are not DAG references, so causal history is
+            // not certificate proof). Once a later leader is committed
+            // (direct quorum or already decided Commit) this one is decided
+            // as an explicit Skip. Without such a later leader we stop here:
+            // no commit may ever pass over an undecided round leader.
+            let has_later_commit = leaders.range_after(round).into_iter().any(|later| {
                 later.block_hash.is_some()
-                    && (self.base.try_direct_decide(dag_store, later) == LeaderStatus::Commit
+                    && (self.base.try_direct_decide(dag_store, &later) == LeaderStatus::Commit
                         || decided
                             .get(&later.round)
                             .map(|d| d.status == LeaderStatus::Commit)
                             .unwrap_or(false))
             });
-            let Some(anchor) = anchor else {
+            if !has_later_commit {
                 break;
-            };
-            if self.base.has_path(dag_store, leader_info, &anchor) {
-                debug!(
-                    "Indirect commit: leader round {} in history of committed leader round {}",
-                    round, anchor.round
-                );
-                return self
-                    .build_committed_subdag(dag_store, leader_info)
-                    .map(|(subdag, colouring)| (subdag, leader_info.clone(), colouring));
             }
             debug!(
-                "Indirect skip: leader round {} not in history of committed leader round {}",
-                round, anchor.round
+                "Skip: leader round {} has no direct quorum and a later leader is committed",
+                round
             );
             let mut skipped = leader_info.clone();
             skipped.status = LeaderStatus::Skip;
@@ -1256,17 +1234,38 @@ mod tests {
     }
 
     #[test]
-    fn commit_order_no_commit_over_undecided_gap_earlier_decided_indirectly() {
-        let (dag, committer, earlier, _) = gap_fixture(true);
-        let first = committer
-            .try_commit_and_mark_durable(&dag)
-            .expect("no storage error")
-            .expect("something commits");
+    fn commit_order_no_commit_over_undecided_gap_earlier_skipped_not_jumped() {
+        for in_history in [true, false] {
+            let (dag, committer, _, _) = gap_fixture(in_history);
+            let first = committer
+                .try_commit_and_mark_durable(&dag)
+                .expect("no storage error")
+                .expect("later quorum leader commits");
+            assert_eq!(first.leader_round, 6);
+            assert_eq!(
+                committer.get_all_decided_leaders().get(&5).map(|l| l.status),
+                Some(LeaderStatus::Skip),
+                "the gap (round 5) must be closed by an explicit Skip before round 6 commits, in_history={in_history}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_order_no_quorum_leader_in_history_of_committed_is_skip_never_commit() {
+        let (dag, committer, earlier, later) = gap_fixture(true);
+        assert!(dag
+            .get_ancestors(&later.digest, 5)
+            .unwrap()
+            .contains(&earlier.digest));
+        let seq = drain(&committer, &dag);
+        assert!(!seq.contains(&5), "round 5 has no own quorum: {seq:?}");
         assert_eq!(
-            first.leader_round, 5,
-            "earlier leader in later's history must be indirectly committed first, not jumped over"
+            committer
+                .get_all_decided_leaders()
+                .get(&5)
+                .map(|l| l.status),
+            Some(LeaderStatus::Skip)
         );
-        assert_eq!(first.leader.digest, earlier.digest);
     }
 
     #[test]
@@ -1301,7 +1300,7 @@ mod tests {
                     );
                 }
             }
-            if !in_history {
+            {
                 assert_eq!(
                     decided.get(&5).map(|l| l.status),
                     Some(LeaderStatus::Skip),
@@ -1319,6 +1318,13 @@ mod tests {
             seq.windows(2).all(|w| w[0] < w[1]),
             "commit sequence must be strictly increasing by round: {seq:?}"
         );
-        assert_eq!(seq, vec![5, 6], "both leaders committed, in round order");
+        assert_eq!(seq, vec![6], "only the quorum leader commits");
+        let decided = committer.get_all_decided_leaders();
+        for round in [5, 6] {
+            assert!(
+                decided.contains_key(&round),
+                "every leader up to the last commit is decided: round {round} missing"
+            );
+        }
     }
 }

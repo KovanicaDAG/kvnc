@@ -13,10 +13,7 @@
 //!    committed at most once, and `last_decided_round` tracks the highest
 //!    decided round.
 //! 4. **Threshold soundness** — a commit implies >= quorum (2f+1) stake
-//!    voting *for the committed leader block* (direct rule), or that the
-//!    leader is in the causal history of a later leader that has such a
-//!    quorum (indirect rule, Task #3). The leader block must exist in the
-//!    store.
+//!    voting *for the committed leader block*, which must exist in the store.
 //! 5. **Linearizer idempotence / totality** — replay yields no duplicates and
 //!    the same block set; output is a topological order with the leader last.
 //! 6. **Faulty-vote robustness** — vote targets (foreign hashes), double
@@ -33,7 +30,6 @@ mod common;
 use common::{
     block_ref, committee_with_stakes, drive_try_commit, genesis, leader_info, make_block, MockDag,
 };
-use kvnc_consensus::engine::DagStoreTrait;
 use kvnc_consensus::{
     CommittedSubDag, CommitteeInfo, LeaderInfo, LeaderStatus, Linearizer, UniversalCommitter,
 };
@@ -357,31 +353,10 @@ proptest! {
                 .filter(|(_, h)| **h == subdag.leader.digest)
                 .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
                 .sum();
-            let direct = stake_for_leader >= committee.quorum_threshold();
-            // Indirect rule: some later leader with a direct quorum for its
-            // own block has this leader in its causal history.
-            let indirect = !direct
-                && committer.get_all_leaders().values().any(|later| {
-                    let Some(later_hash) = later.block_hash else {
-                        return false;
-                    };
-                    let later_stake: Stake = later
-                        .votes
-                        .iter()
-                        .filter(|(_, h)| **h == later_hash)
-                        .map(|(voter, _)| committee.stake_of(*voter).unwrap_or(0))
-                        .sum();
-                    later.round > round
-                        && later_stake >= committee.quorum_threshold()
-                        && dag
-                            .get_ancestors(&later_hash, round)
-                            .map(|a| a.contains(&subdag.leader.digest))
-                            .unwrap_or(false)
-                });
             prop_assert!(
-                direct || indirect,
+                stake_for_leader >= committee.quorum_threshold(),
                 "round {round} committed with only {stake_for_leader} stake voting for the \
-                 leader block (quorum {}) and no later quorum leader descends from it",
+                 leader block (quorum {})",
                 committee.quorum_threshold()
             );
 
