@@ -315,6 +315,19 @@ impl UniversalCommitter {
         self.leaders.read().get(&round).cloned()
     }
 
+    /// Whether `round` already has a decision recorded locally (committed or
+    /// skipped).
+    ///
+    /// A decided round is final on this node: once the committer has written a
+    /// decision, the commit cursor will never revisit that round. Nodes must
+    /// therefore not cast fresh votes for a decided round — doing so can only
+    /// mint a certificate that some lagging peer will act on while this node
+    /// (and every other already-decided node) will not, producing divergent
+    /// committed sequences. See `late_join_integration`.
+    pub fn is_decided(&self, round: Round) -> bool {
+        self.decided_leaders.read().contains_key(&round)
+    }
+
     /// Get all decided leaders.
     pub fn get_decided_leaders(&self) -> HashMap<Round, LeaderInfo> {
         self.decided_leaders.read().clone()
@@ -1238,6 +1251,41 @@ mod tests {
             Some(LeaderStatus::Commit)
         );
         assert_eq!(committer.last_decided_round(), 3);
+    }
+
+    #[test]
+    fn is_decided_reports_skips_and_commits_but_not_undecided_rounds() {
+        let genesis = make_block(0, 0, vec![], "genesis");
+        let leader_block = make_block(1, 3, vec![block_ref(&genesis)], "leader-3");
+        let leader_block_6 = make_block(1, 6, vec![block_ref(&genesis)], "leader-6");
+        let mut dag = RecordingDag::default();
+        dag.insert(genesis.clone());
+        dag.insert(leader_block.clone());
+        dag.insert(leader_block_6.clone());
+        dag.set_ancestors(leader_block.digest, vec![genesis.digest]);
+        dag.set_ancestors(leader_block_6.digest, vec![genesis.digest]);
+
+        let committer = UniversalCommitter::new(committee(4), false, 100);
+        // Nothing is decided yet.
+        assert!(!committer.is_decided(3));
+        assert!(!committer.is_decided(6));
+
+        // A provisional skip still counts as decided: the timeout already
+        // resolved the round locally.
+        committer.register_skip(3, 1);
+        assert!(committer.is_decided(3));
+        assert!(!committer.is_decided(6));
+
+        // A commit at another round is decided too.
+        committer.update_leader(leader(6, 1, Some(leader_block_6.digest)));
+        for voter in [0u16, 1, 2] {
+            committer.add_vote(6, voter, leader_block_6.digest);
+        }
+        let committed = committer
+            .try_commit_and_mark_durable(&dag)
+            .expect("no storage error");
+        assert!(committed.is_some(), "round 6 must commit");
+        assert!(committer.is_decided(6));
     }
 
     #[test]

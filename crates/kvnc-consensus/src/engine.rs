@@ -164,6 +164,20 @@ pub struct ConsensusConfig {
     pub prune_window_waves: u64,
     /// Leader timeout in milliseconds; skip leader if no block arrives.
     pub leader_timeout_ms: u64,
+    /// How many rounds behind its own current round a node may still cast a
+    /// vote for a leader round.
+    ///
+    /// Votes only count toward a leader round while the network is still near
+    /// that round. Without a bound, a lagging validator (e.g. a late joiner
+    /// that starts its local round clock at 0 instead of adopting the network
+    /// round) can gather fresh votes from peers that have long since decided
+    /// the round, commit it locally, and then diverge from the sequence every
+    /// already-decided peer committed — see `late_join_integration`.
+    ///
+    /// Must be at least `2 * Δ` in rounds (Δ = message delay) so a block and
+    /// its votes can still traverse the network and reach quorum.
+    /// Default: one wave (`kvnc_types::WAVE_LENGTH`, 3 rounds).
+    pub late_vote_window_rounds: Round,
 }
 
 impl Default for ConsensusConfig {
@@ -175,6 +189,7 @@ impl Default for ConsensusConfig {
             use_mysticghost: false,
             prune_window_waves: 100,
             leader_timeout_ms: 3000,
+            late_vote_window_rounds: kvnc_types::WAVE_LENGTH,
         }
     }
 }
@@ -510,6 +525,19 @@ where
     /// If the leader block is not known yet nothing is recorded, so a later
     /// call can still vote.
     fn vote_for_leader(&self, leader_round: Round) -> Result<bool, ConsensusError> {
+        // Never help certify a round this node already decided: the decision is
+        // final and the commit cursor will not revisit the round. A late vote
+        // for it would only let a lagging peer commit a round every
+        // already-decided node skipped, producing divergent committed
+        // sequences (see `late_join_integration`).
+        if self.committer.is_decided(leader_round) {
+            debug!(
+                "Leader round {} already decided locally; not voting",
+                leader_round
+            );
+            return Ok(false);
+        }
+
         if self.scheduled_leader_for_round(leader_round).is_none() {
             debug!("No leader scheduled for round {}", leader_round);
             return Ok(false);
@@ -570,11 +598,27 @@ where
     /// Late vote: the leader block of `round` arrived after our vote round
     /// (`round + 1`) already passed, so the round loop could not vote for it.
     fn vote_if_late(&self, round: Round) -> Result<(), ConsensusError> {
-        if *self.current_round.read() > round && self.vote_for_leader(round)? {
+        let current = *self.current_round.read();
+        if current <= round {
+            return Ok(());
+        }
+        // Only vote while the round is still recent. A leader block for a round
+        // the network has already moved far past cannot be turned into a
+        // certificate all nodes honour: ahead nodes have decided the round as
+        // Skip and can never revisit it, so a certificate they co-sign would be
+        // acted on only by the lagging node. Refusing the vote keeps every node
+        // on the same committed sequence (see `late_vote_window_rounds`).
+        if current - round > self.config.late_vote_window_rounds {
+            debug!(
+                "Not voting for stale leader round {} (current round {}, window {})",
+                round, current, self.config.late_vote_window_rounds
+            );
+            return Ok(());
+        }
+        if self.vote_for_leader(round)? {
             info!(
                 "Late vote for leader round {} (current round {})",
-                round,
-                *self.current_round.read()
+                round, current
             );
         }
         Ok(())
@@ -1858,6 +1902,152 @@ mod tests {
             *sent.lock(),
             vec![3, 6, 9],
             "exactly one (late) vote per leader round"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Late-vote bounds (late_join_integration regression guards)
+    // -----------------------------------------------------------------
+
+    /// Engine that is authority 0 of a 4-validator committee with a recording
+    /// vote broadcaster. Returns the committee and the broadcast leader rounds.
+    fn late_vote_engine() -> (
+        CommitteeInfo,
+        ConsensusEngine<TestDag, TestBlockManager>,
+        Arc<Mutex<Vec<Round>>>,
+    ) {
+        let (key, public_key) = kvnc_crypto::generate_keypair();
+        let others: Vec<_> = (1..4).map(|_| kvnc_crypto::generate_keypair()).collect();
+        let mut authorities = vec![AuthorityInfo {
+            index: 0,
+            stake: 1,
+            public_key,
+            address: Address::default(),
+            network_address: String::new(),
+        }];
+        for (i, (_, pk)) in others.iter().enumerate() {
+            authorities.push(AuthorityInfo {
+                index: (i + 1) as AuthorityIndex,
+                stake: 1,
+                public_key: *pk,
+                address: Address::default(),
+                network_address: String::new(),
+            });
+        }
+        let committee = CommitteeInfo::try_new(0, authorities).expect("committee");
+        let dag = Arc::new(TestDag::default());
+        let manager = Arc::new(RwLock::new(TestBlockManager {
+            dag: dag.clone(),
+            key: RwLock::new(key.clone()),
+            set_key_calls: AtomicUsize::new(0),
+        }));
+        let engine = ConsensusEngine::new(
+            ConsensusConfig::default(),
+            committee.clone(),
+            dag,
+            manager,
+            key,
+            None,
+            TEST_CTX,
+        );
+        let sent: Arc<Mutex<Vec<Round>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        engine.set_vote_broadcaster(Arc::new(move |v: &kvnc_types::Vote| {
+            sink.lock().push(v.leader_round)
+        }));
+        (committee, engine, sent)
+    }
+
+    fn registered_leader(round: Round, author: AuthorityIndex, seed: u8) -> LeaderInfo {
+        LeaderInfo {
+            round,
+            author,
+            block_hash: Some(kvnc_types::hash::Hash([seed; 32])),
+            status: LeaderStatus::Undecided,
+            votes: HashMap::new(),
+        }
+    }
+
+    /// A leader block arriving more than `late_vote_window_rounds` behind the
+    /// node's own round must not be voted for. The network has already moved
+    /// past the round, so a fresh certificate could only be acted on by the
+    /// lagging node, producing a divergent committed sequence
+    /// (`late_join_integration`). Exactly at the window boundary the vote is
+    /// still cast.
+    #[test]
+    fn vote_is_refused_outside_the_late_vote_window() {
+        let (committee, engine, sent) = late_vote_engine();
+        let window = engine.config.late_vote_window_rounds;
+        assert!(window >= 1, "window must allow in-flight votes");
+
+        // Stale: one round beyond the window.
+        let stale_round: Round = 3;
+        engine.committer.update_leader(registered_leader(
+            stale_round,
+            committee.leader(stale_round),
+            1,
+        ));
+        *engine.current_round.write() = stale_round + window + 1;
+        engine.vote_if_late(stale_round).expect("no error");
+        assert!(
+            sent.lock().is_empty(),
+            "a leader block {} rounds behind must not be voted for",
+            window + 1
+        );
+
+        // Boundary: exactly at the window, the vote is still cast.
+        let edge_round: Round = 6;
+        engine.committer.update_leader(registered_leader(
+            edge_round,
+            committee.leader(edge_round),
+            2,
+        ));
+        *engine.current_round.write() = edge_round + window;
+        engine.vote_if_late(edge_round).expect("no error");
+        assert_eq!(
+            sent.lock().last().copied(),
+            Some(edge_round),
+            "a leader block exactly {} rounds behind must still be voted for",
+            window
+        );
+    }
+
+    /// A round this node already decided is final: no vote may be cast for it,
+    /// even inside the window. Here the round was resolved by a timeout skip.
+    #[test]
+    fn vote_is_refused_for_an_already_decided_round() {
+        let (committee, engine, sent) = late_vote_engine();
+        let round: Round = 3;
+        let author = committee.leader(round);
+        engine
+            .committer
+            .update_leader(registered_leader(round, author, 3));
+        // The leader timeout resolved the round locally.
+        engine.committer.register_skip(round, author);
+        assert!(engine.committer.is_decided(round));
+
+        // Inside the window: only the decided guard can stop the vote.
+        *engine.current_round.write() = round + 1;
+        engine.vote_if_late(round).expect("no error");
+        assert!(
+            sent.lock().is_empty(),
+            "no vote may be cast for an already decided round"
+        );
+        assert!(!engine.vote_for_leader(round).expect("no error"));
+
+        // Control: an undecided round inside the window still gets a vote.
+        let live_round: Round = 6;
+        engine.committer.update_leader(registered_leader(
+            live_round,
+            committee.leader(live_round),
+            4,
+        ));
+        *engine.current_round.write() = live_round + 1;
+        engine.vote_if_late(live_round).expect("no error");
+        assert_eq!(
+            sent.lock().last().copied(),
+            Some(live_round),
+            "an undecided in-window round must still be voted for"
         );
     }
 }

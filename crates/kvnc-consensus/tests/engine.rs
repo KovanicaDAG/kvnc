@@ -17,6 +17,7 @@ fn fast_config() -> ConsensusConfig {
         max_pending_rounds: 100,
         use_mysticghost: true,
         leader_timeout_ms: 3000,
+        late_vote_window_rounds: kvnc_types::WAVE_LENGTH,
         prune_window_waves: 100,
     }
 }
