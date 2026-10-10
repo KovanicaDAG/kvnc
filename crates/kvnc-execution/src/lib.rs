@@ -662,7 +662,7 @@ impl ExecutionContext {
         if let Some(validator_addr) = validator {
             // Claim rewards for specific validator
             let shares = self.staking.reward_share(validator_addr, 0, 0); // We'll compute actual rewards
-            // For now, just emit event - actual reward distribution happens via staking module
+                                                                          // For now, just emit event - actual reward distribution happens via staking module
             for (addr, _share) in shares {
                 if addr == *from {
                     events.push(ContractEvent {
