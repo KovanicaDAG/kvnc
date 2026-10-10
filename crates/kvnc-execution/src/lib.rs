@@ -88,6 +88,27 @@ pub enum ExecutionError {
     NonceMismatch { expected: u64, actual: u64 },
     #[error("Execution failed: {0}")]
     Other(String),
+    /// The state sync gate rejected the sub-DAG: this node must state-sync
+    /// first. Nothing was written to the store.
+    #[error("degraded: needs state sync")]
+    NeedsStateSync,
+}
+
+/// Startup sync signals, filled in by kvnc-node (contract agreed with
+/// Network). Consensus's `is_genesis_subdag` is passed separately per call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartupSyncState {
+    /// The node's store was empty when it started.
+    pub store_was_empty: bool,
+    /// The network is ahead of this node.
+    pub network_ahead: bool,
+}
+
+impl StartupSyncState {
+    /// Execute only if `!network_ahead && (!store_was_empty || is_genesis_subdag)`.
+    pub fn allows(&self, is_genesis_subdag: bool) -> bool {
+        !self.network_ahead && (!self.store_was_empty || is_genesis_subdag)
+    }
 }
 
 // `ContractError` is `no_std`-friendly and does not implement
@@ -217,6 +238,26 @@ impl ExecutionContext {
                 .map_err(StorageError::Commit)
                 .map_err(ExecutionError::from)
         })
+    }
+
+    /// [`Self::execute_committed_subdag`] behind the state sync gate.
+    ///
+    /// If `startup.allows(is_genesis_subdag)` is false this returns
+    /// [`ExecutionError::NeedsStateSync`] before opening a write transaction:
+    /// no staking save, no executed-leader mark, no receipts, and the
+    /// in-memory staking state is untouched. Otherwise it is exactly
+    /// `execute_committed_subdag` (idempotent restart replay included).
+    pub fn execute_committed_subdag_gated(
+        &mut self,
+        subdag: &CommittedSubDag,
+        storage: &Storage,
+        startup: &StartupSyncState,
+        is_genesis_subdag: bool,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        if !startup.allows(is_genesis_subdag) {
+            return Err(ExecutionError::NeedsStateSync);
+        }
+        self.execute_committed_subdag(subdag, storage)
     }
 
     fn execute_committed_subdag_with_commit(
@@ -2917,5 +2958,143 @@ mod tests {
         let a = go();
         assert_eq!(a.2, 400);
         assert_eq!(a, go());
+    }
+
+    // --- state sync gate (StartupSyncState, contract agreed with Network) ---
+    mod sync_gate {
+        use super::*;
+
+        const PAYOUT: Address = Address([9u8; 32]);
+
+        fn genesis_storage() -> (tempfile::TempDir, Storage, ExecutionContext) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("g.redb")).expect("storage");
+            let mut ctx = ExecutionContext::new();
+            ctx.staking
+                .join_validator(
+                    Address([1u8; 32]),
+                    kvnc_staking::MIN_VALIDATOR_STAKE,
+                    0,
+                    Some(PAYOUT),
+                    None,
+                )
+                .expect("join");
+            let txn = storage.begin_write().expect("w");
+            storage
+                .state()
+                .save_staking_state(&txn, &ctx.staking)
+                .expect("save");
+            txn.commit().expect("commit");
+            (dir, storage, ctx)
+        }
+
+        fn subdag(round: u64) -> CommittedSubDag {
+            let leader = sample_block_at(0, round);
+            CommittedSubDag {
+                leader: leader.clone(),
+                blocks: vec![leader],
+                leader_round: round,
+                leader_author: 0,
+            }
+        }
+
+        fn count<K: redb::Key + 'static, V: redb::Value + 'static>(
+            storage: &Storage,
+            def: TableDefinition<K, V>,
+        ) -> usize {
+            let r = storage.begin_read().expect("r");
+            match r.open_table(def) {
+                Ok(t) => t.iter().expect("iter").count(),
+                Err(_) => 0,
+            }
+        }
+
+        fn persisted_staking(storage: &Storage) -> Vec<u8> {
+            let r = storage.begin_read().expect("r");
+            let t = r
+                .open_table(kvnc_storage::tables::STAKING_STATE)
+                .expect("t");
+            t.get("staking").expect("get").expect("some").value()
+        }
+
+        #[test]
+        fn all_eight_combinations() {
+            for store_was_empty in [false, true] {
+                for network_ahead in [false, true] {
+                    for is_genesis in [false, true] {
+                        let expected = !network_ahead && (!store_was_empty || is_genesis);
+                        let startup = StartupSyncState {
+                            store_was_empty,
+                            network_ahead,
+                        };
+                        assert_eq!(startup.allows(is_genesis), expected);
+                        let (_d, storage, mut ctx) = genesis_storage();
+                        let staking_before = persisted_staking(&storage);
+                        let mem_before = staking_state_bytes(&ctx.staking);
+                        let case = format!("{startup:?} genesis={is_genesis}");
+                        let r = ctx.execute_committed_subdag_gated(
+                            &subdag(1),
+                            &storage,
+                            &startup,
+                            is_genesis,
+                        );
+                        if expected {
+                            assert!(r.expect(&case).reward.is_some(), "{case}");
+                            assert_eq!(count(&storage, EXECUTED_SUBDAGS), 1, "{case}");
+                        } else {
+                            let err = r.expect_err(&case);
+                            assert!(matches!(err, ExecutionError::NeedsStateSync), "{case}");
+                            assert_eq!(err.to_string(), "degraded: needs state sync");
+                            // Zero writes: no mark, no receipts, no staking save, no reward.
+                            assert_eq!(count(&storage, EXECUTED_SUBDAGS), 0, "{case}");
+                            assert_eq!(count(&storage, TX_RECEIPTS), 0, "{case}");
+                            assert_eq!(persisted_staking(&storage), staking_before, "{case}");
+                            assert_eq!(read_balance(&storage, &PAYOUT), 0, "{case}");
+                            assert_eq!(staking_state_bytes(&ctx.staking), mem_before, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn restart_replay_stays_idempotent_through_gate() {
+            let (_d, storage, mut ctx) = genesis_storage();
+            let fresh = StartupSyncState {
+                store_was_empty: true,
+                network_ahead: false,
+            };
+            ctx.execute_committed_subdag_gated(&subdag(1), &storage, &fresh, true)
+                .expect("genesis");
+            for round in 2..=3 {
+                ctx.execute_committed_subdag_gated(&subdag(round), &storage, &fresh, false)
+                    .expect_err("non-genesis on empty store is gated");
+                ctx.execute_committed_subdag(&subdag(round), &storage)
+                    .expect("ungated for setup");
+            }
+            let balance = read_balance(&storage, &PAYOUT);
+
+            // Restart: non-empty store, network not ahead, same staking as run_execution loads.
+            let restart = StartupSyncState::default();
+            let mut ctx2 = ExecutionContext::new();
+            ctx2.staking = {
+                let r = storage.begin_read().expect("r");
+                storage.state().load_staking_state(&r).expect("load")
+            };
+            for round in 1..=3 {
+                let r = ctx2
+                    .execute_committed_subdag_gated(&subdag(round), &storage, &restart, false)
+                    .expect("replay");
+                assert!(r.reward.is_none() && r.receipts.is_empty(), "no-op replay");
+            }
+            assert_eq!(read_balance(&storage, &PAYOUT), balance);
+            assert_eq!(count(&storage, EXECUTED_SUBDAGS), 3);
+            assert_eq!(count(&storage, TX_RECEIPTS), 3);
+            let r = ctx2
+                .execute_committed_subdag_gated(&subdag(4), &storage, &restart, false)
+                .expect("next");
+            assert!(r.reward.is_some());
+            assert_eq!(ctx2.staking.committed_leader_height, 4);
+        }
     }
 }
