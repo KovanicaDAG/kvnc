@@ -1,9 +1,8 @@
 # KUNA Signature Format v1 (SPEC — FINAL)
 
-Status: **FINAL spec**. Implemented in `kvnc-types`, `kvnc-crypto`, `kvnc-cli` and `kvnc-faucet`
-(branch `bot/exec-foundation/sig-v1-migration`); the golden vectors in §4 are unit tests there.
-The other crates still call the old API and **do not compile until their owners switch**, see
-[Call-site checklist](#call-site-checklist). All crates must switch in the same release.
+Status: **FINAL, implemented and merged on `main`** at `8170a82` as one release:
+#31 Foundation (`1a172cd`), #36 Execution (`6b18aef`), #37 Network (`a3ab81d`), #34 Consensus (`8170a82`).
+All crates use the v1 API; the golden vectors in §4 are unit tests in `kvnc-types`. CI on `8170a82` is green.
 Owner: Exec-Foundation (kvnc-types / kvnc-crypto). Format decisions: Main.
 Address format (`kvnc…dag`) and `docs/TOKENOMICS.md` are not affected. Domain tags use the ticker **KUNA**. Crate, binary and address names keep `kvnc`.
 
@@ -53,7 +52,7 @@ take chain_id or epoch from the network message.
 The API contract is now `verify_vote_signature(ctx: &SigningContext, vote: &Vote, pubkey: &PublicKey) -> Result<(), SigError>`
 (`SigningContext { chain_id, epoch }` lives in `kvnc_types::signing`, together with the `chain_id` registry constants).
 
-Current PROVISIONAL format for comparison: `leader_round u64 LE ‖ leader_hash` (40 bytes).
+Former (pre-v1) PROVISIONAL format, for reference: `leader_round u64 LE ‖ leader_hash` (40 bytes).
 
 ## 2. Transaction signing hash v1
 
@@ -91,7 +90,7 @@ rename KVNC → KUNA). The migration must update `Hash::DOMAIN_TX`. The in-preim
 *layout*, so a future v2 changes the tag without touching the hashing primitives. `Transaction.hash`
 stays equal to `signing_hash` (checked in `kvnc-dag/src/block_manager.rs:358`).
 
-Current PROVISIONAL format for comparison: the same preimage **without** the first 24 bytes (tag + chain_id)
+Former (pre-v1) PROVISIONAL format, for reference: the same preimage **without** the first 24 bytes (tag + chain_id)
 and without `Call.value`. In v1 `kind` is byte-identical to PROVISIONAL **except** `Call`, which gains `value`.
 
 ## 3. `value: u64` in `TransactionKind::Call` (decided: IN v1)
@@ -139,40 +138,39 @@ signing_hash = 9b76e7fc940641c6e11226b537841ace9ceb000a3943f6b3923b3cf2c6f4f794
 sig          = ce4e4d5dcc49159d2b6f72faa3210fe4db5b040e93eadbe315a159afe61f32ff66fc0abf9591c902500a1ce4e02d3816dbae80b8f1721725f03ed52b119f6608
 ```
 
-When the spec is implemented, these vectors become golden tests in `kvnc-types`.
+These vectors are golden tests in `kvnc-types`.
 
 ## Migration
 
 This is a hard fork of the signed bytes. Every node must switch at the same release, with no dual-acceptance
 window (accepting both formats would bring back the cross-chain replay that v1 removes).
-These must change **in the same release**:
+These changed **in the same release** (done, see status above):
 
 - **kvnc-types** (Foundation): `Vote::signature_data(ctx)`, `Transaction::signing_hash(ctx)`, `SigningContext { chain_id, epoch }`, `Hash::DOMAIN_TX` → `"KUNA-TX-v1"`, golden vectors. `TransactionKind::Call.value: u64`.
 - **kvnc-crypto** (Foundation): `verify_vote_signature(ctx, vote, pubkey)`.
 - **kvnc-consensus** (Consensus): `engine.rs:510` signs `vote.signature_data()`. `engine.rs:532` has a **duplicate** `vote_signature_data(leader_round, leader_hash)` helper with the old encoding. It must be deleted, not updated, so there is only one encoder. Vote verification must use the kvnc-crypto API.
 - **kvnc-execution** (Execution): signing-hash callers (`lib.rs:904`), removal of the test-signature shortcut (`lib.rs:304-307`), and `Call.value` semantics (transfer `value` to the contract; insufficient balance = reject).
-- **Open PRs with vote signature verification: #3 (consensus) and #4 (network)** must verify against v1 `signature_data` (via the kvnc-crypto API with `SigningContext`) before or together with the migration. Merging them with the PROVISIONAL 40-byte encoding would add a third encoder to remove.
 - **kvnc-network / kvnc-rpc / kvnc-node** (Network): votes and txs on the wire stay the same shape except for `Call.value`. `chain_id` must be in node config and checked against genesis, and RPC `chain_methods.rs:795` must verify with the context.
 - **kvnc-mempool** (`lib.rs:410,451`), **kvnc-dag** (`block_manager.rs:358`), **kvnc-cli**, **kvnc-faucet** (`main.rs:341`), and test helpers in `kvnc-node/tests/live_vote_integration.rs:215`: pass the `chain_id`.
 - Genesis/config: add `chain_id`. Existing devnets must be reset (old signatures do not verify).
 
-### Call-site checklist
+### Call-site checklist (DONE, all merged in `8170a82`)
 
 Implemented API (kvnc-types / kvnc-crypto): `Vote::signature_data(&ctx)`, `Transaction::signing_hash(&ctx)`,
 `Transaction::verify_signature(&ctx)`, `kvnc_crypto::verify_vote_signature(&ctx, &vote, &pubkey)`,
 `TransactionKind::Call { contract, value, method, args, gas_limit }`, `Hash::DOMAIN_TX = "KUNA-TX-v1"`.
 `SigningContext::new(chain_id).with_epoch(epoch)` builds a context; the verifier must create it from its **own**
 config and epoch. `kvnc-cli` and `kvnc-faucet` need `--chain-id` (no default).
-Line numbers are against `main` at the time of the migration PR.
+Line numbers are historical (against `main` at the time of the migration PR); every row below is done.
 
-| Owner | File:line | Change |
-|-------|-----------|--------|
-| Consensus | `kvnc-consensus/src/engine.rs:510` | sign `vote.signature_data(&ctx)` |
-| Consensus | `engine.rs:532` | delete the duplicate `vote_signature_data` encoder |
-| Consensus | `engine.rs:636` | verify via `verify_vote_signature(&ctx, ..)` |
-| Consensus | `engine.rs:1058`, `tests/common/mod.rs:71` | test signers use a ctx |
-| Network | `kvnc-network/src/validation.rs:53,138,182`, `service.rs:1392` | verify and sign with ctx; `chain_id` in config |
-| Network | `kvnc-node/src/main.rs:2003`, `kvnc-node/tests/live_vote_integration.rs:233` | ctx; check `chain_id` against genesis |
-| Network | `kvnc-rpc/src/chain_methods.rs:173,814` | `Call.value` field; `signing_hash(&ctx)` |
-| Network | `kvnc-mempool/src/lib.rs:272,282,682,723`, `kvnc-dag/src/block_manager.rs:358` | `signing_hash(&ctx)` / `verify_signature(&ctx)` |
-| Execution | `kvnc-execution/src/lib.rs:381,904` | `Call.value` semantics; `signing_hash(&ctx)` |
+| Owner | File:line | Change | Status |
+|-------|-----------|--------|--------|
+| Consensus | `kvnc-consensus/src/engine.rs:510` | sign `vote.signature_data(&ctx)` | done |
+| Consensus | `engine.rs:532` | delete the duplicate `vote_signature_data` encoder | done |
+| Consensus | `engine.rs:636` | verify via `verify_vote_signature(&ctx, ..)` | done |
+| Consensus | `engine.rs:1058`, `tests/common/mod.rs:71` | test signers use a ctx | done |
+| Network | `kvnc-network/src/validation.rs:53,138,182`, `service.rs:1392` | verify and sign with ctx; `chain_id` in config | done |
+| Network | `kvnc-node/src/main.rs:2003`, `kvnc-node/tests/live_vote_integration.rs:233` | ctx; check `chain_id` against genesis | done |
+| Network | `kvnc-rpc/src/chain_methods.rs:173,814` | `Call.value` field; `signing_hash(&ctx)` | done |
+| Network | `kvnc-mempool/src/lib.rs:272,282,682,723`, `kvnc-dag/src/block_manager.rs:358` | `signing_hash(&ctx)` / `verify_signature(&ctx)` | done |
+| Execution | `kvnc-execution/src/lib.rs:381,904` | `Call.value` semantics; `signing_hash(&ctx)` | done |
