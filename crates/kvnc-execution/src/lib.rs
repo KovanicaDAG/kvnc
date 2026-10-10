@@ -53,7 +53,7 @@ const PENDING_REWARDS: TableDefinition<[u8; 64], u64> =
 const PROCESSED_EVIDENCE: TableDefinition<[u8; 40], u8> =
     TableDefinition::new("staking_processed_evidence");
 
-/// Supply accounting counters kept by execution (e.g. `"slashed_burned"`).
+/// Supply accounting counters kept by execution (e.g. `"slashed_to_treasury"`).
 const SUPPLY_COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("supply_counters");
 
 fn reward_key(delegator: &Address, validator: &Address) -> [u8; 64] {
@@ -822,9 +822,14 @@ impl ExecutionContext {
     /// Apply double-sign evidence: slash 5% (SLASH_PCT_BPS) of the
     /// validator's self-stake and of each delegation, once per evidence.
     ///
-    /// Destination: **burned**. Slashed stake is removed from circulation and
-    /// recorded in `supply_counters["slashed_burned"]`; no tokenomics doc
-    /// assigns it to the treasury, so it is not credited anywhere.
+    /// Destination: **treasury**. The slashed amount moves from staked to the
+    /// real account balance of the configured treasury address
+    /// (`TreasuryState::treasury_address`, the same account `claim_treasury`
+    /// credits). Nothing is burned, total supply is unchanged, and the
+    /// treasury vesting schedule (`vested`/`claimed`) is NOT touched.
+    /// Cumulative total in `supply_counters["slashed_to_treasury"]`.
+    /// Without a configured treasury the evidence is rejected and nothing
+    /// changes.
     /// Opens its own write transaction: call only between sub-DAGs.
     pub fn apply_double_sign_evidence(
         &mut self,
@@ -836,15 +841,20 @@ impl ExecutionContext {
         if txn.open_table(PROCESSED_EVIDENCE)?.get(id)?.is_some() {
             return Err(StakingError::EvidenceProcessed.into());
         }
+        let treasury = self
+            .staking
+            .treasury_address()
+            .ok_or_else(|| ExecutionError::Other("treasury not configured".into()))?;
         let mut candidate = snapshot_staking(&self.staking);
         let slashed = candidate.slash(evidence)?;
+        storage.state().add_balance(&txn, &treasury, slashed)?;
         {
             let mut counters = txn.open_table(SUPPLY_COUNTERS)?;
             let cur = counters
-                .get("slashed_burned")?
+                .get("slashed_to_treasury")?
                 .map(|v| v.value())
                 .unwrap_or(0);
-            counters.insert("slashed_burned", cur.saturating_add(slashed))?;
+            counters.insert("slashed_to_treasury", cur.saturating_add(slashed))?;
         }
         txn.open_table(PROCESSED_EVIDENCE)?.insert(id, 1)?;
         storage.state().save_staking_state(&txn, &candidate)?;
@@ -2466,15 +2476,48 @@ mod tests {
         assert!(!r[0].success);
     }
 
+    const TREASURY: Address = Address([0x7E; 32]);
+
+    /// Validator [3;32] (50k self) + one 10k delegation, treasury configured.
+    fn slash_fixture(storage: &Storage) -> ExecutionContext {
+        let mut ctx = setup_funded_sender(storage, &Address([9u8; 32]), 0);
+        ctx.init_treasury(TREASURY);
+        ctx.staking
+            .delegate(Address([9u8; 32]), Address([3u8; 32]), 10_000 * K)
+            .expect("delegate");
+        ctx
+    }
+
+    fn slashed_counter(storage: &Storage) -> Option<u64> {
+        let txn = storage.begin_read().expect("r");
+        let t = txn.open_table(SUPPLY_COUNTERS).ok()?;
+        let v = t.get("slashed_to_treasury").expect("g").map(|x| x.value());
+        v
+    }
+
+    /// liquid (treasury + delegator) + staked + unbonding.
+    fn total_supply(ctx: &ExecutionContext, storage: &Storage) -> u64 {
+        read_balance(storage, &TREASURY)
+            + read_balance(storage, &Address([9u8; 32]))
+            + ctx.staking.total_staked
+            + ctx
+                .staking
+                .unbonding_queue
+                .iter()
+                .map(|e| e.amount)
+                .sum::<u64>()
+    }
+
+    // Old behaviour: slashed stake was burned, treasury got nothing.
     #[test]
-    fn double_sign_evidence_slashes_once_and_burns() {
+    fn double_sign_slash_moves_stake_to_treasury_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
-        let mut ctx = setup_funded_sender(&storage, &Address([9u8; 32]), 0);
+        let mut ctx = slash_fixture(&storage);
         let v = Address([3u8; 32]);
-        ctx.staking
-            .delegate(Address([9u8; 32]), v, 10_000 * K)
-            .expect("delegate");
+        let supply_before = total_supply(&ctx, &storage);
+        let treasury_before = read_balance(&storage, &TREASURY);
+        let vesting_before = bincode::serialize(&ctx.staking.treasury).expect("t");
         let ev = kvnc_staking::DoubleSignEvidence {
             validator: v,
             height: 1,
@@ -2483,7 +2526,20 @@ mod tests {
             .apply_double_sign_evidence(ev.clone(), &storage)
             .expect("slash");
         assert_eq!(slashed, 3_000 * K);
+        assert_eq!(read_balance(&storage, &TREASURY), treasury_before + slashed);
+        assert_eq!(
+            total_supply(&ctx, &storage),
+            supply_before,
+            "nothing burned"
+        );
         assert_eq!(ctx.staking.total_staked, 57_000 * K);
+        assert_eq!(slashed_counter(&storage), Some(slashed));
+        assert_eq!(
+            bincode::serialize(&ctx.staking.treasury).expect("t"),
+            vesting_before,
+            "vesting schedule untouched"
+        );
+        // Same evidence twice: rejected, nothing moves.
         let err = ctx
             .apply_double_sign_evidence(ev, &storage)
             .expect_err("dup");
@@ -2491,19 +2547,53 @@ mod tests {
             err,
             ExecutionError::Staking(StakingError::EvidenceProcessed)
         ));
-        assert_eq!(ctx.staking.total_staked, 57_000 * K);
-        let txn = storage.begin_read().expect("r");
-        let burned = txn
-            .open_table(SUPPLY_COUNTERS)
-            .expect("t")
-            .get("slashed_burned")
-            .expect("g")
-            .map(|x| x.value());
-        assert_eq!(burned, Some(3_000 * K));
+        assert_eq!(read_balance(&storage, &TREASURY), treasury_before + slashed);
+        assert_eq!(total_supply(&ctx, &storage), supply_before);
         assert_eq!(
             staking_state_bytes(&load_staking_state(&storage)),
             staking_state_bytes(&ctx.staking)
         );
+    }
+
+    #[test]
+    fn slash_without_treasury_is_rejected_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+        let mut ctx = setup_funded_sender(&storage, &Address([9u8; 32]), 0);
+        let before = staking_state_bytes(&ctx.staking);
+        let ev = kvnc_staking::DoubleSignEvidence {
+            validator: Address([3u8; 32]),
+            height: 1,
+        };
+        assert!(ctx.apply_double_sign_evidence(ev, &storage).is_err());
+        assert_eq!(staking_state_bytes(&ctx.staking), before);
+        assert_eq!(slashed_counter(&storage), None);
+    }
+
+    #[test]
+    fn slash_to_treasury_replay_is_deterministic() {
+        let go = || {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Storage::new(dir.path().join("t.redb")).expect("storage");
+            let mut ctx = slash_fixture(&storage);
+            let mut out = Vec::new();
+            for h in [1u64, 2, 2, 5] {
+                let ev = kvnc_staking::DoubleSignEvidence {
+                    validator: Address([3u8; 32]),
+                    height: h,
+                };
+                out.push(ctx.apply_double_sign_evidence(ev, &storage).ok());
+            }
+            (
+                out,
+                staking_state_bytes(&ctx.staking),
+                read_balance(&storage, &TREASURY),
+                slashed_counter(&storage),
+            )
+        };
+        let a = go();
+        assert_eq!(a.0[2], None, "duplicate evidence rejected");
+        assert_eq!(a, go());
     }
 
     #[test]
