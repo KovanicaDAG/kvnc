@@ -68,7 +68,12 @@ pub fn vote_signed_with(
         voter,
         signature: Signature([0u8; 64]),
     };
-    vote.signature = kvnc_crypto::sign(key, &vote.signature_data());
+    vote.signature = kvnc_crypto::sign(
+        key,
+        &vote.signature_data(&kvnc_types::SigningContext::new(
+            kvnc_types::signing::chain_id::LOCAL,
+        )),
+    );
     vote
 }
 
@@ -527,6 +532,7 @@ pub fn make_engine(
         manager.clone(),
         signing_key,
         None, // No mempool for tests
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
     );
     (engine, dag, manager)
 }

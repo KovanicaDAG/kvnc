@@ -28,9 +28,13 @@ pub struct Dag {
 
 impl Dag {
     /// Create a new DAG with the given storage.
-    pub fn new(storage: Storage) -> Result<Self, DagError> {
+    // TODO(owner): source chain_id/epoch from node config
+    pub fn new(
+        storage: Storage,
+        signing_ctx: kvnc_types::SigningContext,
+    ) -> Result<Self, DagError> {
         let store = DagStore::new(storage)?;
-        let manager = BlockManager::new(Arc::new(store.clone()));
+        let manager = BlockManager::new(Arc::new(store.clone()), signing_ctx);
         Ok(Self { store, manager })
     }
 
@@ -66,6 +70,10 @@ mod tests {
     fn test_dag_creation() {
         let dir = tempdir().unwrap();
         let storage = Storage::new(dir.path().join("test.db")).unwrap();
-        let _dag = Dag::new(storage).unwrap();
+        let _dag = Dag::new(
+            storage,
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
+        )
+        .unwrap();
     }
 }

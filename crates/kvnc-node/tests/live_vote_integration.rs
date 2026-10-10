@@ -230,7 +230,9 @@ fn create_transfer_tx(
         hash: Hash::zero(),
     };
     // Sign it using kvnc_crypto::sign
-    let msg = tx.signing_hash();
+    let msg = tx.signing_hash(&kvnc_types::SigningContext::new(
+        kvnc_types::signing::chain_id::LOCAL,
+    ));
     let sig = crypto_sign(signing_key, &msg.0);
     Transaction {
         signature: sig,

@@ -46,11 +46,15 @@ impl fmt::Display for Rejection {
 }
 
 /// Verify that `vote` is signed by its claimed voter under `keys`.
-pub fn verify_vote(keys: &AuthorityKeys, vote: &Vote) -> Result<(), Rejection> {
+pub fn verify_vote(
+    keys: &AuthorityKeys,
+    vote: &Vote,
+    ctx: &kvnc_types::SigningContext,
+) -> Result<(), Rejection> {
     let key = keys
         .get(&vote.voter)
         .ok_or(Rejection::UnknownAuthority(vote.voter))?;
-    kvnc_crypto::verify(key, &vote.signature_data(), &vote.signature)
+    kvnc_crypto::verify(key, &vote.signature_data(ctx), &vote.signature)
         .map_err(|_| Rejection::BadSignature(vote.voter))
 }
 
@@ -102,8 +106,16 @@ impl GossipValidator {
             .is_empty()
     }
 
-    pub(crate) fn verify_vote(&self, vote: &Vote) -> Result<(), Rejection> {
-        verify_vote(&self.keys.read().unwrap_or_else(|e| e.into_inner()), vote)
+    pub(crate) fn verify_vote(
+        &self,
+        vote: &Vote,
+        ctx: &kvnc_types::SigningContext,
+    ) -> Result<(), Rejection> {
+        verify_vote(
+            &self.keys.read().unwrap_or_else(|e| e.into_inner()),
+            vote,
+            ctx,
+        )
     }
 
     pub(crate) fn verify_block(&self, block: &StatementBlock) -> Result<(), Rejection> {
@@ -114,6 +126,8 @@ impl GossipValidator {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    pub(crate) const TEST_CTX: kvnc_types::SigningContext =
+        kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL);
     use kvnc_types::{Hash, Signature};
 
     /// Deterministic committee of `n` keys (seed byte = index + 1).
@@ -135,7 +149,7 @@ pub(crate) mod test_support {
             voter,
             signature: Signature([0; 64]),
         };
-        vote.signature = kvnc_crypto::sign(signer, &vote.signature_data());
+        vote.signature = kvnc_crypto::sign(signer, &vote.signature_data(&TEST_CTX));
         vote
     }
 
@@ -163,7 +177,10 @@ mod tests {
     #[test]
     fn valid_vote_is_accepted() {
         let (signers, keys) = committee(4);
-        assert_eq!(verify_vote(&keys, &signed_vote(&signers[2], 2)), Ok(()));
+        assert_eq!(
+            verify_vote(&keys, &signed_vote(&signers[2], 2), &TEST_CTX),
+            Ok(())
+        );
     }
 
     #[test]
@@ -171,7 +188,10 @@ mod tests {
         let (signers, keys) = committee(4);
         let mut vote = signed_vote(&signers[1], 1);
         vote.signature = Signature([7; 64]);
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
     }
 
     #[test]
@@ -179,8 +199,11 @@ mod tests {
         let (signers, keys) = committee(4);
         // Validator 0 signs but claims to be validator 3.
         let mut vote = signed_vote(&signers[0], 3);
-        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data());
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(3)));
+        vote.signature = kvnc_crypto::sign(&signers[0], &vote.signature_data(&TEST_CTX));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(3))
+        );
     }
 
     #[test]
@@ -188,10 +211,16 @@ mod tests {
         let (signers, keys) = committee(4);
         let mut vote = signed_vote(&signers[1], 1);
         vote.leader_hash = Hash::new(b"other leader");
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
         let mut vote = signed_vote(&signers[1], 1);
         vote.leader_round += 1;
-        assert_eq!(verify_vote(&keys, &vote), Err(Rejection::BadSignature(1)));
+        assert_eq!(
+            verify_vote(&keys, &vote, &TEST_CTX),
+            Err(Rejection::BadSignature(1))
+        );
     }
 
     #[test]
@@ -199,7 +228,7 @@ mod tests {
         let (signers, keys) = committee(4);
         let vote = signed_vote(&signers[0], 9);
         assert_eq!(
-            verify_vote(&keys, &vote),
+            verify_vote(&keys, &vote, &TEST_CTX),
             Err(Rejection::UnknownAuthority(9))
         );
     }
@@ -250,7 +279,9 @@ mod tests {
         let (signers, _) = committee(1);
         let validator = GossipValidator::default();
         assert!(!validator.is_configured());
-        assert!(validator.verify_vote(&signed_vote(&signers[0], 0)).is_err());
+        assert!(validator
+            .verify_vote(&signed_vote(&signers[0], 0), &TEST_CTX)
+            .is_err());
         assert!(validator
             .verify_block(&signed_block(&signers[0], 0))
             .is_err());
