@@ -1,10 +1,10 @@
-# KVNC Signature Format v1 (SPEC — FINAL)
+# KUNA Signature Format v1 (SPEC — FINAL)
 
 Status: **FINAL spec, ready for migration** (approved by Main/owner). Not yet implemented: The signing code on `main`
 (`Vote::signature_data`, `Transaction::signing_hash`) is unchanged and remains
 **PROVISIONAL** until all crates listed in [Migration](#migration) switch together.
 Owner: Exec-Foundation (kvnc-types / kvnc-crypto). Format decisions: Main.
-Address format (`kvnc…dag`) and `docs/TOKENOMICS.md` are not affected.
+Address format (`kvnc…dag`) and `docs/TOKENOMICS.md` are not affected. Domain tags use the ticker **KUNA**. Crate, binary and address names keep `kvnc`.
 
 ## Goals
 
@@ -37,7 +37,7 @@ Registry (**final**): `1` = mainnet, `2` = testnet, `3` = devnet, `1337` = local
 
 | Offset | Size | Field          | Encoding                                  |
 |-------:|-----:|----------------|-------------------------------------------|
-| 0      | 16   | domain tag     | `DomainTag16("KVNC/vote/v1")`             |
+| 0      | 16   | domain tag     | `DomainTag16("KUNA/vote/v1")`             |
 | 16     | 8    | chain_id       | u64 LE                                    |
 | 24     | 8    | epoch          | u64 LE (committee epoch; `0` until epochs are live) |
 | 32     | 2    | voter          | u16 LE (`AuthorityIndex` = u16)           |
@@ -61,7 +61,7 @@ Preimage:
 
 | Size | Field        | Encoding                                       |
 |-----:|--------------|------------------------------------------------|
-| 16   | domain tag   | `DomainTag16("KVNC/tx/v1")`                    |
+| 16   | domain tag   | `DomainTag16("KUNA/tx/v1")`                    |
 | 8    | chain_id     | u64 LE                                         |
 | 32   | sender       | `Address.0` (raw pubkey)                        |
 | 8    | nonce        | u64 LE                                         |
@@ -82,11 +82,12 @@ Preimage:
 | ClaimRewards   | 6      | `0x00` (None) or `0x01` + `validator` 32 B |
 
 ```
-signing_hash = BLAKE3_keyed(key = pad32("KVNC-TX-v1"), preimage)   // = Hash::new_keyed(Hash::DOMAIN_TX, preimage)
+signing_hash = BLAKE3_keyed(key = pad32("KUNA-TX-v1"), preimage)   // = Hash::new_keyed(b"KUNA-TX-v1", preimage)
 signature    = Ed25519.sign(sk_sender, signing_hash)                // 32-byte message
 ```
 
-The keyed-hash key (`Hash::DOMAIN_TX`) is kept as it is. The in-preimage tag `KVNC/tx/v1` versions the
+The keyed-hash key changes from the PROVISIONAL `Hash::DOMAIN_TX = "KVNC-TX-v1"` to **`"KUNA-TX-v1"`** (ticker
+rename KVNC → KUNA). The migration must update `Hash::DOMAIN_TX`. The in-preimage tag `KUNA/tx/v1` versions the
 *layout*, so a future v2 changes the tag without touching the hashing primitives. `Transaction.hash`
 stays equal to `signing_hash` (checked in `kvnc-dag/src/block_manager.rs:358`).
 
@@ -95,7 +96,7 @@ and without `Call.value`. In v1 `kind` is byte-identical to PROVISIONAL **except
 
 ## 3. `value: u64` in `TransactionKind::Call` (decided: IN v1)
 
-Requested by Exec-Execution and decided by Main. `Call` carries a signed `value: u64`, the native KVNC
+Requested by Exec-Execution and decided by Main. `Call` carries a signed `value: u64`, the native KUNA
 transferred to the contract. Position: right after `contract`, before `method`, 8 bytes u64 LE, **always present**
 (`0` when unused). There is no optional flag, so the encoding has a fixed shape. Adding the field to
 `TransactionKind::Call` is part of the v1 migration.
@@ -110,32 +111,32 @@ Ed25519 is deterministic, so the signatures can be reproduced.
 ### V1: Vote (chain_id=2, epoch=7, voter=3, leader_round=42, leader_hash=`11`×32)
 ```
 len      = 74
-preimage = 4b564e432f766f74652f7631000000000200000000000000070000000000000003002a000000000000001111111111111111111111111111111111111111111111111111111111111111
-sig      = 379fbdd70d376ef255a8e5cbd02fb5ab0eeedad2a960ab4c09640d3d535f84fd331bfcced53ccb2303c494526b7809b66099179073fbf23b62757d79ea2c0602
+preimage = 4b554e412f766f74652f7631000000000200000000000000070000000000000003002a000000000000001111111111111111111111111111111111111111111111111111111111111111
+sig      = 04edabde7c75345b9c4e12a793b2a4f05948c6edb5cbd197056fd68ef87d2a4c5311ff5df6eb6322c8fc229097079410873af37dceb4b43af66722005415a70b
 ```
 
 ### T1: Transfer (chain_id=2, nonce=5, to=`22`×32, amount=1000000, fee=1000)
 ```
 len          = 113
-preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c050000000000000000222222222222222222222222222222222222222222222222222222222222222240420f0000000000e803000000000000
-signing_hash = 0aae8c1832e09bf7da6f897d20b8bc6a017aaeefd50ea10015218a5c4a54c21d
-sig          = c24cd02ec98045a34e4b3102a1cafe70883a83763d5915528554b54797b139df1768cad71220e78bcb6702b109f37bb79513c1f768bacab4bf6e96f4e16cdf06
+preimage     = 4b554e412f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c050000000000000000222222222222222222222222222222222222222222222222222222222222222240420f0000000000e803000000000000
+signing_hash = 4acde0e0a120d6c03eaa197c082238fefadaf36f4f40bc1364ae8b3faa067798
+sig          = 2413f8c3a1508e2b1b2809c5cc9cc74982118d47e8a8e9afaab2d2719349724265b8f80d67359b579001b9c4845723edb9530372a79da9f4093d2f7228820d0e
 ```
 
 ### T2: Call, value=0 (chain_id=2, nonce=6, contract=`33`×32, value=0, method="transfer", args=010203, gas_limit=100000, fee=10)
 ```
 len          = 148
-preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333000000000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
-signing_hash = e6ee05c494bc9197cdbf32f02558a36c0bf9f9ce92d7aceff99b65fa7ee3df92
-sig          = 938f46f0d12493a4a9f6b12b6b2270d519b3704006db70f1406f844d51d79a9e89169816863e2c9d3a86680a01ca09593ca63d53c350b133156e3c5a73f2b904
+preimage     = 4b554e412f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333000000000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
+signing_hash = 439e1830573896f46dc642cedb37605c1e478880f417f0cfae5126eaca48026a
+sig          = 0ff9438c1ea9e8a70e3b491d873c712e8e7d0339b637b00def16d42eea4eed3301454ef10f61b958bf37c95351a89f01270fe194ab8fa046b45373ee54e47f07
 ```
 
 ### T3: Call, value=500 (otherwise identical to T2)
 ```
 len          = 148
-preimage     = 4b564e432f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333f40100000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
-signing_hash = 616a96c5e4568b1e165670cd9c4afb4c8d2dd603dbf5b61142f7187a93d29df7
-sig          = 48b532f19c6867e21907f829614864ca5cc54baf0177eab1dc4bbbc48b192d48507acdbd97731621c76498e33fb68ccfc37979cd0f17a959a14b94d159606c0b
+preimage     = 4b554e412f74782f76310000000000000200000000000000ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0600000000000000043333333333333333333333333333333333333333333333333333333333333333f40100000000000008000000000000007472616e736665720300000000000000010203a0860100000000000a00000000000000
+signing_hash = 9b76e7fc940641c6e11226b537841ace9ceb000a3943f6b3923b3cf2c6f4f794
+sig          = ce4e4d5dcc49159d2b6f72faa3210fe4db5b040e93eadbe315a159afe61f32ff66fc0abf9591c902500a1ce4e02d3816dbae80b8f1721725f03ed52b119f6608
 ```
 
 When the spec is implemented, these vectors become golden tests in `kvnc-types`.
@@ -146,7 +147,7 @@ This is a hard fork of the signed bytes. Every node must switch at the same rele
 window (accepting both formats would bring back the cross-chain replay that v1 removes).
 These must change **in the same release**:
 
-- **kvnc-types** (Foundation): `Vote::signature_data(ctx)`, `Transaction::signing_hash(ctx)`, `SigningContext { chain_id, epoch }`, golden vectors. `TransactionKind::Call.value: u64`.
+- **kvnc-types** (Foundation): `Vote::signature_data(ctx)`, `Transaction::signing_hash(ctx)`, `SigningContext { chain_id, epoch }`, `Hash::DOMAIN_TX` → `"KUNA-TX-v1"`, golden vectors. `TransactionKind::Call.value: u64`.
 - **kvnc-crypto** (Foundation): `verify_vote_signature(ctx, vote, pubkey)`.
 - **kvnc-consensus** (Consensus): `engine.rs:510` signs `vote.signature_data()`. `engine.rs:532` has a **duplicate** `vote_signature_data(leader_round, leader_hash)` helper with the old encoding. It must be deleted, not updated, so there is only one encoder. Vote verification must use the kvnc-crypto API.
 - **kvnc-execution** (Execution): signing-hash callers (`lib.rs:904`), removal of the test-signature shortcut (`lib.rs:304-307`), and `Call.value` semantics (transfer `value` to the contract; insufficient balance = reject).
