@@ -1306,11 +1306,12 @@ fn recover_committed_subdags(
                 subdags.push(subdag);
             } else {
                 // Original linearizer path (bit-identical to current behaviour)
-                let history = dag_store
-                    .get_ancestors(&leader_hash, 0)?
-                    .into_iter()
-                    .map(|hash| dag_store.get_block(&hash))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // Same not-yet-committed history as the live committer, so
+                // replay never re-delivers a block from an earlier commit.
+                let node_store = NodeDagStore {
+                    inner: Arc::new(dag_store.clone()),
+                };
+                let history = kvnc_consensus::uncommitted_history(&node_store, &leader)?;
                 subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
             }
         }
@@ -1670,6 +1671,54 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].leader.digest, digest);
         assert_eq!(recovered[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn committed_subdag_recovery_never_replays_a_block_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let mut parents = Vec::new();
+        let mut chain = Vec::new();
+        for round in 1..=5u64 {
+            let digest = StatementBlock::compute_digest(0, round, &parents, &[]);
+            let block = StatementBlock {
+                author: 0,
+                round,
+                parents: parents.clone(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: Signature([0; 64]),
+                digest,
+                merkle_root: Default::default(),
+            };
+            dag.put_block(&block).unwrap();
+            parents = vec![kvnc_types::block::BlockReference {
+                author: 0,
+                round,
+                digest,
+            }];
+            chain.push(block);
+        }
+        // Leaders committed at rounds 1, 3 and 5.
+        for i in [0usize, 2, 4] {
+            dag.mark_round_decided(chain[i].round, &chain[i].digest)
+                .unwrap();
+        }
+
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
+        assert_eq!(recovered.len(), 3);
+        let delivered: Vec<Hash> = recovered
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.digest))
+            .collect();
+        let unique: std::collections::HashSet<Hash> = delivered.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            delivered.len(),
+            "replayed twice: {delivered:?}"
+        );
+        assert_eq!(unique.len(), 5);
     }
 
     #[test]

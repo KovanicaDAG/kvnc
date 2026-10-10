@@ -126,6 +126,49 @@ impl BaseCommitter {
     }
 }
 
+/// Causal history of `leader` that has NOT been delivered by an earlier
+/// commit.
+///
+/// "Already committed" is derived only from the durable decided-leader index:
+/// a block is committed iff it is a decided leader of a round strictly below
+/// `leader.round`, or in such a leader's causal history. The result therefore
+/// depends only on the persisted DAG + decided index, so the live committer
+/// and restart recovery (kvnc-node `recover_committed_subdags`) produce the
+/// same batch and no block is delivered twice across commits.
+///
+/// Returned in `get_ancestors` order (the linearizer canonicalises order);
+/// excludes `leader` itself.
+pub fn uncommitted_history<D: DagStoreTrait + ?Sized>(
+    dag_store: &D,
+    leader: &StatementBlock,
+) -> Result<Vec<StatementBlock>, kvnc_dag::DagStoreError> {
+    let mut committed: HashSet<Hash> = HashSet::new();
+    if leader.round > 0 {
+        for round in dag_store.get_decided_rounds(leader.round - 1)? {
+            if round >= leader.round {
+                continue;
+            }
+            for prev in dag_store.get_decided_leaders(round)? {
+                if prev == leader.digest || !committed.insert(prev) {
+                    continue;
+                }
+                // NotFound-tolerant: a pruned previous leader contributes
+                // nothing (its history is pruned too).
+                committed.extend(dag_store.get_ancestors(&prev, 0)?);
+            }
+        }
+    }
+
+    let mut history = Vec::new();
+    for hash in dag_store.get_ancestors(&leader.digest, 0)? {
+        if hash == leader.digest || committed.contains(&hash) {
+            continue;
+        }
+        history.push(dag_store.get_block(&hash)?);
+    }
+    Ok(history)
+}
+
 /// Universal committer that also handles indirect decisions.
 pub struct UniversalCommitter {
     base: BaseCommitter,
@@ -579,14 +622,8 @@ impl UniversalCommitter {
         dag_store: &D,
         leader_block: &StatementBlock,
     ) -> Option<CommittedSubDag> {
-        // Get all ancestors of this leader (causal history)
-        let ancestors = dag_store.get_ancestors(&leader_block.digest, 0).ok()?;
-
-        // Get the actual blocks for ancestors
-        let mut history = Vec::new();
-        for hash in ancestors {
-            history.push(dag_store.get_block(&hash).ok()?);
-        }
+        // Only the not-yet-committed part of the leader's causal history.
+        let history = uncommitted_history(dag_store, leader_block).ok()?;
 
         // Linearize the sub-DAG
         let linearizer = crate::linearizer::Linearizer::new();
