@@ -175,9 +175,11 @@ fn kind_to_json(kind: &TransactionKind) -> Value {
             method,
             args,
             gas_limit,
+            value,
         } => json!({
             "type": "call",
             "contract": contract.to_string(),
+            "value": value,
             "method": method,
             "args": to_hex(args),
             "gas_limit": quantity(*gas_limit),
@@ -369,7 +371,7 @@ pub async fn handle_get_transaction_by_hash(
 // Account methods
 // ============================================================================
 
-/// `kvnc_getBalance(address)` — native KVNC balance in atoms.
+/// `kvnc_getBalance(address)` — native KUNA balance in atoms.
 pub async fn handle_get_balance(params: Value, state: RpcState) -> Result<Value, RpcError> {
     let args = params_vec(&params);
     let address = parse_address(required(&args, 0, "address")?, "address")?;
@@ -615,6 +617,7 @@ mod tests {
             network_address: "127.0.0.1:9000".to_string(),
         };
         RpcState {
+            health: crate::NodeHealth::new(),
             consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
             mempool: Arc::new(Mempool::new(
                 MempoolConfig::default(),
@@ -815,9 +818,7 @@ mod tests {
                 signature: Signature([0; 64]),
                 hash: Hash::zero(),
             };
-            let signing_hash = tx.signing_hash(&kvnc_types::SigningContext::new(
-                kvnc_types::signing::chain_id::LOCAL,
-            ));
+            let signing_hash = tx.signing_hash(&state.mempool.signing_context());
             tx.signature = kvnc_crypto::sign(sk, signing_hash.as_ref());
             tx.hash = signing_hash;
             tx

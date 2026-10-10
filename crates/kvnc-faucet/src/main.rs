@@ -1,11 +1,11 @@
-//! KVNC Faucet Service
+//! Kovanica (KUNA) Faucet Service
 //!
-//! Rate-limited faucet that dispenses test KVNC to addresses.
+//! Rate-limited faucet that dispenses test KUNA to addresses.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -16,8 +16,10 @@ use axum::{
 use clap::Parser;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 use ed25519_dalek::{Signer, SigningKey};
 use kvnc_cli::wallet;
@@ -34,10 +36,6 @@ struct FaucetConfig {
     max_requests_per_window: usize,
     /// RPC endpoint of the node
     rpc_url: String,
-    /// Faucet keystore path
-    keystore_path: String,
-    /// Faucet keystore passphrase
-    passphrase: String,
     /// Network signing context (signature format v1): every dispensed
     /// transaction commits to this `chain_id`.
     signing_ctx: kvnc_types::SigningContext,
@@ -92,15 +90,16 @@ struct FaucetResponse {
 
 #[derive(Parser)]
 #[command(name = "kvnc-faucet")]
-#[command(about = "KVNC Faucet Service")]
+#[command(about = "Kovanica (KUNA) Faucet Service")]
 struct Cli {
     /// Faucet keystore path
     #[arg(long, default_value = "faucet.keystore")]
     keystore: String,
-    /// Faucet keystore passphrase
-    #[arg(long, default_value = "faucet-passphrase")]
-    passphrase: String,
-    /// Amount to dispense per request (in KVNC)
+    /// File containing the keystore passphrase (unix: must be 0600 or 0400).
+    /// Alternatives: env KVNC_FAUCET_PASSPHRASE, or an interactive prompt on a TTY.
+    #[arg(long)]
+    passphrase_file: Option<PathBuf>,
+    /// Amount to dispense per request (in KUNA)
     #[arg(long, default_value = "10")]
     dispense_kvnc: u64,
     /// Rate limit window (seconds)
@@ -138,25 +137,27 @@ async fn main() -> Result<()> {
     // Load faucet keystore
     let keystore = wallet::load(std::path::Path::new(&cli.keystore))
         .with_context(|| format!("loading faucet keystore {}", cli.keystore))?;
-    let passphrase = if keystore.encrypted {
-        Some(cli.passphrase.as_str())
+    // The passphrase is only needed to decrypt the seed; it is wiped right
+    // after and never stored in config/state or logged.
+    let cli_passphrase = if keystore.encrypted {
+        Some(resolve_passphrase(cli.passphrase_file.as_deref())?)
     } else {
         None
     };
+    let passphrase = cli_passphrase.as_ref().map(|p| p.as_str());
     let seed =
         wallet::secret_seed(&keystore, passphrase).with_context(|| "decrypting faucet keystore")?;
     let signer = SigningKey::from_bytes(&seed);
+    drop(cli_passphrase);
     let faucet_address = Address::from_public_key(&PublicKey::from(signer.verifying_key()));
 
     info!(faucet_address = %faucet_address, "faucet identity loaded");
 
     let config = FaucetConfig {
-        dispense_amount: cli.dispense_kvnc * 1_000_000_000, // KVNC to atoms
+        dispense_amount: cli.dispense_kvnc * 1_000_000_000, // KUNA to atoms
         rate_limit_window: cli.rate_limit_window,
         max_requests_per_window: cli.max_requests,
         rpc_url: cli.rpc_url.clone(),
-        keystore_path: cli.keystore,
-        passphrase: cli.passphrase,
         signing_ctx: kvnc_types::SigningContext::new(cli.chain_id),
     };
 
@@ -242,7 +243,7 @@ async fn faucet_handler(
     }
 
     // Get faucet nonce from RPC
-    let nonce = match get_nonce(&state.config.rpc_url, &state.faucet_address).await {
+    let nonce = match get_nonce(&state.client, &state.config.rpc_url, &state.faucet_address).await {
         Ok(n) => n,
         Err(e) => {
             warn!("Failed to get faucet nonce: {}", e);
@@ -262,7 +263,7 @@ async fn faucet_handler(
     let tx = Transaction {
         sender: state.faucet_address,
         nonce,
-        fee: 1_000_000, // 0.001 KVNC fee
+        fee: 1_000_000, // 0.001 KUNA fee
         kind: TransactionKind::Transfer {
             to: to_address,
             amount: state.config.dispense_amount,
@@ -289,7 +290,7 @@ async fn faucet_handler(
     };
 
     // Submit transaction
-    match submit_transaction(&state.config.rpc_url, &signed_tx).await {
+    match submit_transaction(&state.client, &state.config.rpc_url, &signed_tx).await {
         Ok(tx_hash) => {
             info!(to = %to_address, amount = state.config.dispense_amount, tx_hash = %tx_hash, "faucet dispensed");
             (
@@ -297,7 +298,7 @@ async fn faucet_handler(
                 Json(FaucetResponse {
                     success: true,
                     message: format!(
-                        "Dispensed {} KVNC",
+                        "Dispensed {} KUNA",
                         state.config.dispense_amount / 1_000_000_000
                     ),
                     tx_hash: Some(tx_hash),
@@ -334,8 +335,7 @@ fn parse_address(s: &str) -> Result<Address> {
     Ok(Address(arr))
 }
 
-async fn get_nonce(rpc_url: &str, address: &Address) -> Result<u64> {
-    let client = reqwest::Client::new();
+async fn get_nonce(client: &reqwest::Client, rpc_url: &str, address: &Address) -> Result<u64> {
     let req = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "kvnc_getNonce",
@@ -363,8 +363,11 @@ fn sign_transaction(
     Ok(tx)
 }
 
-async fn submit_transaction(rpc_url: &str, tx: &Transaction) -> Result<String> {
-    let client = reqwest::Client::new();
+async fn submit_transaction(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    tx: &Transaction,
+) -> Result<String> {
     let raw = bincode::serialize(tx)?;
     let req = serde_json::json!({
         "jsonrpc": "2.0",
@@ -378,4 +381,151 @@ async fn submit_transaction(rpc_url: &str, tx: &Transaction) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("invalid tx submit response"))?;
     Ok(result.to_string())
+}
+
+/// Environment variable holding the faucet keystore passphrase.
+const PASSPHRASE_ENV: &str = "KVNC_FAUCET_PASSPHRASE";
+
+/// Resolve the keystore passphrase without ever taking it from argv.
+///
+/// Order: `--passphrase-file`, then `KVNC_FAUCET_PASSPHRASE`, then an
+/// interactive no-echo prompt if stdin is a TTY. Errors if none is available.
+fn resolve_passphrase(file: Option<&Path>) -> Result<Zeroizing<String>> {
+    let env = std::env::var(PASSPHRASE_ENV).ok().map(Zeroizing::new);
+    resolve_passphrase_from(file, env, || {
+        if std::io::stdin().is_terminal() {
+            let p = rpassword::prompt_password("Faucet keystore passphrase: ")
+                .context("reading passphrase from TTY")?;
+            Ok(Some(Zeroizing::new(p)))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn resolve_passphrase_from<F>(
+    file: Option<&Path>,
+    env: Option<Zeroizing<String>>,
+    prompt: F,
+) -> Result<Zeroizing<String>>
+where
+    F: FnOnce() -> Result<Option<Zeroizing<String>>>,
+{
+    if let Some(path) = file {
+        return read_passphrase_file(path);
+    }
+    if let Some(p) = env {
+        if !p.is_empty() {
+            return Ok(p);
+        }
+    }
+    if let Some(p) = prompt()? {
+        return Ok(p);
+    }
+    bail!(
+        "keystore is encrypted but no passphrase source is available: \
+         use --passphrase-file <path>, set {PASSPHRASE_ENV}, or run on a TTY"
+    )
+}
+
+fn read_passphrase_file(path: &Path) -> Result<Zeroizing<String>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("reading metadata of passphrase file {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "refusing passphrase file {}: permissions {:o} are too broad (use 0600 or 0400)",
+                path.display(),
+                mode
+            );
+        }
+    }
+    let mut raw = Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading passphrase file {}", path.display()))?,
+    );
+    while raw.ends_with('\n') || raw.ends_with('\r') {
+        raw.pop();
+    }
+    if raw.is_empty() {
+        bail!("passphrase file {} is empty", path.display());
+    }
+    Ok(raw)
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_file(contents: &str, mode: u32) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        f
+    }
+
+    fn no_prompt() -> Result<Option<Zeroizing<String>>> {
+        Ok(None)
+    }
+
+    #[test]
+    fn file_trims_trailing_newline_and_wins_over_env() {
+        let f = write_file("s3cret\r\n", 0o600);
+        let env = Some(Zeroizing::new("from-env".to_string()));
+        let p = resolve_passphrase_from(Some(f.path()), env, no_prompt).unwrap();
+        assert_eq!(p.as_str(), "s3cret");
+    }
+
+    #[test]
+    fn file_0400_is_accepted() {
+        let f = write_file("pw\n", 0o400);
+        assert_eq!(read_passphrase_file(f.path()).unwrap().as_str(), "pw");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_with_broad_permissions_is_refused() {
+        let f = write_file("pw\n", 0o644);
+        let err = read_passphrase_file(f.path()).unwrap_err().to_string();
+        assert!(err.contains("too broad"), "{err}");
+        assert!(!err.contains("pw\n"));
+    }
+
+    #[test]
+    fn env_used_when_no_file() {
+        let env = Some(Zeroizing::new("from-env".to_string()));
+        let p = resolve_passphrase_from(None, env, no_prompt).unwrap();
+        assert_eq!(p.as_str(), "from-env");
+    }
+
+    #[test]
+    fn prompt_used_as_last_resort() {
+        let p =
+            resolve_passphrase_from(None, None, || Ok(Some(Zeroizing::new("typed".to_string()))))
+                .unwrap();
+        assert_eq!(p.as_str(), "typed");
+    }
+
+    #[test]
+    fn errors_clearly_when_no_source() {
+        let err = resolve_passphrase_from(None, Some(Zeroizing::new(String::new())), no_prompt)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--passphrase-file") && err.contains(PASSPHRASE_ENV),
+            "{err}"
+        );
+    }
 }

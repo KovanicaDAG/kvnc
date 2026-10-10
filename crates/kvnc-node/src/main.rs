@@ -47,7 +47,9 @@ use kvnc_network::{
     BlockSyncRequest, BlockSyncResponse, NetworkConfig, NetworkEvent, NetworkService,
     StateSyncResponse,
 };
-use kvnc_rpc::{AuthConfig, EventBus, RateLimitConfig, RateLimiterState, RpcServer, RpcState};
+use kvnc_rpc::{
+    AuthConfig, EventBus, NodeHealth, RateLimitConfig, RateLimiterState, RpcServer, RpcState,
+};
 
 /// Wrapper around EventBus to implement LogPublisher.
 struct EventLogPublisher(EventBus);
@@ -69,7 +71,7 @@ use kvnc_types::{
 /// Command line arguments.
 #[derive(Parser, Debug)]
 #[command(name = "kvnc-node")]
-#[command(about = "Kovanica (KVNC) full node", long_about = None)]
+#[command(about = "Kovanica (KUNA) full node", long_about = None)]
 #[command(subcommand_required = false, arg_required_else_help = false)]
 struct Args {
     #[command(subcommand)]
@@ -96,7 +98,7 @@ struct GenesisArgs {
     #[arg(long, value_name = "HEX")]
     treasury_address: String,
 
-    /// Founder premine address (32-byte hex, receives 200,000 KVNC)
+    /// Founder premine address (32-byte hex, receives 200,000 KUNA)
     #[arg(long, value_name = "HEX")]
     founder_address: String,
 
@@ -159,7 +161,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
     let mut staking = StakingState::new();
     staking.init_treasury(treasury);
 
-    // Founder premine (200,000 KVNC) - included in genesis allocations output
+    // Founder premine (200,000 KUNA) - included in genesis allocations output
     // Actual balance set when genesis block is executed on first run
 
     // Join each validator
@@ -229,6 +231,7 @@ fn run_genesis(args: GenesisArgs) -> Result<()> {
             "founder_address_bytes": hex::encode(founder.0),
             "founder_premine_atoms": FOUNDER_PREMINE,
             "founder_premine_kvnc": FOUNDER_PREMINE / ONE_KVNC,
+            "founder_premine_kuna": FOUNDER_PREMINE / ONE_KVNC,
             "validators": staking.validators.iter().map(|v| serde_json::json!({
                 "address_hex": hex::encode(v.address.0),
                 "stake": v.stake,
@@ -395,6 +398,8 @@ where
     // ------------------------------------------------------------------
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data directory {}", config.data_dir.display()))?;
+    check_chain_id(&config)?;
+    info!(chain_id = config.chain_id, "chain id verified");
 
     // The DAG/consensus store and the account/staking store live in separate
     // redb files: `kvnc-dag::DagStore` owns its `Storage`, while the mempool and
@@ -412,10 +417,6 @@ where
     // ------------------------------------------------------------------
     // 3. Mempool + validator identity
     // ------------------------------------------------------------------
-    let mempool = Arc::new(Mempool::new(
-        MempoolConfig::default(),
-        state_storage.clone(),
-    ));
     let (signing_key, public_key) =
         load_validator_key(config.validator_key.as_deref(), config.run_validator)?;
     let validator_address = Address::from_public_key(&public_key);
@@ -438,6 +439,17 @@ where
         .map(|a| a.public_key)
         .collect();
     kvnc_crypto::set_validator_keys_from_public(committee_keys);
+
+    // v1 signing context: chain id from config (verified against genesis),
+    // epoch from the committee. NOTE: the committee is currently always built
+    // for epoch 0 (no epoch rotation wired into the committee yet).
+    let signing_ctx =
+        kvnc_types::SigningContext::new(config.chain_id).with_epoch(committee.epoch());
+    let mempool = Arc::new(Mempool::new(
+        MempoolConfig::default(),
+        state_storage.clone(),
+        signing_ctx,
+    ));
     info!(
         committee = committee.authorities().len(),
         "committee public keys registered with batch verifier"
@@ -483,6 +495,8 @@ where
     // loop so broadcast commands never re-enter `start` or rebuild listeners.
     // Votes and blocks are authenticated against the committee at the network
     // edge before they are forwarded or handed to consensus.
+    // Vote signatures are checked through the injected VoteVerifier.
+    network.set_vote_verifier(Arc::new(kvnc_network::Ed25519VoteVerifier));
     network.set_authority_keys(
         committee
             .authorities()
@@ -509,8 +523,11 @@ where
     let events = EventBus::new();
     let rate_limit_config =
         RateLimitConfig::from_requests_per_minute(config.rpc_rate_limit_per_min);
+    // Liveness of the execution worker and consensus engine, surfaced on /health.
+    let node_health = NodeHealth::new();
     let auth_config = rpc_auth_config_from_env();
     let rpc_state = RpcState {
+        health: node_health.clone(),
         storage: state_storage.clone(),
         consensus_store: dag_store.clone(),
         mempool: mempool.clone(),
@@ -535,7 +552,7 @@ where
     // ------------------------------------------------------------------
     // The node-provided validator identity remains authoritative in the block
     // manager; consensus does not generate or replace a signing key.
-    let block_manager = Arc::new(BlockManager::new(dag_store.clone()));
+    let block_manager = Arc::new(BlockManager::new(dag_store.clone(), signing_ctx));
     if config.run_validator {
         block_manager.set_authority(our_authority);
         block_manager.set_signing_key(signing_key.clone());
@@ -588,6 +605,7 @@ where
         } else {
             None
         },
+        signing_ctx,
     ));
 
     // Set the round watch receiver on the block manager so it can track the current round
@@ -637,13 +655,21 @@ where
         state_storage.clone(),
         events.clone(),
         Some(mempool.clone()),
+        signing_ctx,
         shutdown_rx.clone(),
+        node_health.clone(),
     ));
 
     let engine_for_task = engine.clone();
+    let engine_health = node_health.clone();
     let engine_task = tokio::spawn(async move {
-        if let Err(e) = engine_for_task.start().await {
-            error!(error = %e, "consensus engine stopped with an error");
+        engine_health.consensus_running();
+        match engine_for_task.start().await {
+            Ok(()) => engine_health.consensus_stopped(),
+            Err(e) => {
+                error!(error = %e, "consensus engine stopped with an error");
+                engine_health.consensus_failed(&e.to_string());
+            }
         }
     });
 
@@ -783,7 +809,7 @@ fn init_genesis(config: &NodeConfig, dag_store: &DagStore, state_storage: &Stora
     // Begin write transaction early (needed for premine + staking save)
     let txn = state_storage.begin_write()?;
 
-    // Founder premine (200_000 KVNC) — write to state store if founder file present.
+    // Founder premine (200_000 KUNA) — write to state store if founder file present.
     let premine_path = config.data_dir.join("founder_premine.hex");
     if premine_path.exists() {
         let hex = std::fs::read_to_string(&premine_path)?.trim().to_string();
@@ -1073,9 +1099,12 @@ async fn run_execution(
     state_storage: Arc<Storage>,
     events: EventBus,
     mempool: Option<Arc<Mempool>>,
+    signing_ctx: kvnc_types::SigningContext,
     mut shutdown: watch::Receiver<bool>,
+    health: NodeHealth,
 ) {
-    let mut ctx = ExecutionContext::new();
+    // Execution verifies tx signatures with the node's configured chain id.
+    let mut ctx = ExecutionContext::with_signing_context(signing_ctx);
     ctx.log_publisher = Some(Box::new(EventLogPublisher(events.clone())));
     match state_storage.begin_read() {
         Ok(txn) => match state_storage.state().load_staking_state(&txn) {
@@ -1105,6 +1134,7 @@ async fn run_execution(
                             debug!(removed, "pruned committed transactions from mempool");
                         }
                         events.publish_committed_leader(&subdag);
+                        health.execution_progress(subdag.leader_round);
                     }
                     Err(e) => {
                         error!(
@@ -1112,10 +1142,14 @@ async fn run_execution(
                             round = subdag.leader_round,
                             "execution failed; stopping worker so committed decisions replay after restart"
                         );
+                        health.execution_failed(&format!("round {}: {e}", subdag.leader_round));
                         break;
                     }
                 },
-                None => break,
+                None => {
+                    warn!("committed sub-DAG channel closed; execution worker stopping");
+                    break;
+                }
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1124,6 +1158,7 @@ async fn run_execution(
             }
         }
     }
+    health.execution_stopped();
 }
 
 /// Adapter implementing [`DagStoreTrait`] over the concrete [`DagStore`].
@@ -1178,6 +1213,15 @@ impl DagStoreTrait for NodeDagStore {
 
     fn mark_round_decided(&self, round: Round, leader_hash: &Hash) -> Result<(), DagStoreError> {
         self.inner.mark_round_decided(round, leader_hash)
+    }
+
+    fn mark_decided_and_commit_leader(
+        &self,
+        round: Round,
+        leader_hash: &Hash,
+    ) -> Result<u64, DagStoreError> {
+        self.inner
+            .mark_decided_and_commit_leader(round, leader_hash)
     }
 
     fn mergeset(&self, leader: &Hash) -> Result<Vec<Hash>, DagStoreError> {
@@ -1319,11 +1363,12 @@ fn recover_committed_subdags(
                 subdags.push(subdag);
             } else {
                 // Original linearizer path (bit-identical to current behaviour)
-                let history = dag_store
-                    .get_ancestors(&leader_hash, 0)?
-                    .into_iter()
-                    .map(|hash| dag_store.get_block(&hash))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // Same not-yet-committed history as the live committer, so
+                // replay never re-delivers a block from an earlier commit.
+                let node_store = NodeDagStore {
+                    inner: Arc::new(dag_store.clone()),
+                };
+                let history = kvnc_consensus::uncommitted_history(&node_store, &leader)?;
                 subdags.push(kvnc_consensus::Linearizer::new().linearize(leader, history));
             }
         }
@@ -1524,9 +1569,94 @@ struct GenesisValidatorEntry {
 }
 
 /// Top-level shape of `genesis_validators.toml` (`[[validator]]` array of tables).
+///
+/// Example:
+///
+/// ```toml
+/// chain_id = 2            # mandatory for 1 (mainnet) and 2 (testnet)
+///
+/// [[validator]]
+/// address = "<32-byte hex>"
+/// stake = 50000000000000
+/// public_key = "<32-byte hex>"
+/// ```
 #[derive(Debug, Deserialize)]
 struct GenesisValidatorsFile {
+    /// Chain id of this genesis. Mandatory when the node is configured for
+    /// mainnet (1) or testnet (2); optional for devnet (3) / local (1337).
+    /// When present it must equal the node's configured `chain_id`.
+    #[serde(default)]
+    chain_id: Option<u64>,
     validator: Vec<GenesisValidatorEntry>,
+}
+
+/// Name of the per-data-dir marker recording the chain id the database was
+/// created for.
+const CHAIN_ID_MARKER: &str = "chain_id";
+
+/// Verify `config.chain_id` against the genesis and the data directory.
+///
+/// * `genesis_validators.toml` may carry `chain_id = N`; it must match. For
+///   mainnet (1) and testnet (2) it is **mandatory**: without it (or without
+///   the genesis file) the node refuses to start. Devnet (3) and local (1337)
+///   accept a genesis without `chain_id`.
+/// * `<data_dir>/chain_id` records the chain id the data dir was created for;
+///   it must match on every later start. Written on first start.
+///
+/// Any mismatch is a hard error: signing with the wrong chain id would
+/// produce votes/transactions no other node accepts (or replayable ones).
+fn check_chain_id(config: &NodeConfig) -> Result<()> {
+    let configured = config.chain_id;
+    let genesis_required = matches!(
+        configured,
+        kvnc_types::signing::chain_id::MAINNET | kvnc_types::signing::chain_id::TESTNET
+    );
+    let genesis_path = config.data_dir.join("genesis_validators.toml");
+    if genesis_required && !genesis_path.exists() {
+        anyhow::bail!(
+            "chain_id {configured} requires {} with an explicit chain_id; refusing to start",
+            genesis_path.display()
+        );
+    }
+    if genesis_path.exists() {
+        let text = std::fs::read_to_string(&genesis_path)
+            .with_context(|| format!("reading genesis validators {}", genesis_path.display()))?;
+        let genesis: GenesisValidatorsFile = toml::from_str(&text)
+            .with_context(|| format!("parsing genesis validators {}", genesis_path.display()))?;
+        if genesis.chain_id.is_none() && genesis_required {
+            anyhow::bail!(
+                "chain_id {configured} requires an explicit chain_id in genesis {}; refusing to start",
+                genesis_path.display()
+            );
+        }
+        if let Some(genesis_id) = genesis.chain_id {
+            if genesis_id != configured {
+                anyhow::bail!(
+                    "chain_id mismatch: config has {configured}, genesis {} has {genesis_id}; refusing to start",
+                    genesis_path.display()
+                );
+            }
+        }
+    }
+    let marker = config.data_dir.join(CHAIN_ID_MARKER);
+    if marker.exists() {
+        let text = std::fs::read_to_string(&marker)
+            .with_context(|| format!("reading {}", marker.display()))?;
+        let stored: u64 = text
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid chain id in {}", marker.display()))?;
+        if stored != configured {
+            anyhow::bail!(
+                "chain_id mismatch: config has {configured}, data dir {} was created for {stored}; refusing to start",
+                config.data_dir.display()
+            );
+        }
+    } else {
+        std::fs::write(&marker, format!("{configured}\n"))
+            .with_context(|| format!("writing {}", marker.display()))?;
+    }
+    Ok(())
 }
 
 /// Parse a 32-byte hex public key (PublicKey is [u8; 32]).
@@ -1654,6 +1784,124 @@ mod tests {
         assert!(auth.require_auth_for_writes);
         assert!(rpc_auth_config(false, "").write_tokens.is_empty());
         assert!(!rpc_auth_config(true, "").require_auth_for_writes);
+    }
+
+    fn chain_id_config(dir: &std::path::Path, chain_id: u64) -> NodeConfig {
+        NodeConfig {
+            data_dir: dir.to_path_buf(),
+            run_validator: false,
+            bootnodes: Vec::new(),
+            listen_addr: "127.0.0.1:0".into(),
+            rpc_port: 0,
+            chain_id,
+            ..NodeConfig::default()
+        }
+    }
+
+    fn write_genesis_chain_id(dir: &std::path::Path, chain_id: u64) {
+        std::fs::write(
+            dir.join("genesis_validators.toml"),
+            format!("chain_id = {chain_id}\nvalidator = []\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn chain_id_must_match_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        write_genesis_chain_id(dir.path(), 2);
+        let err = check_chain_id(&chain_id_config(dir.path(), 1337)).unwrap_err();
+        assert!(err.to_string().contains("chain_id mismatch"), "{err:#}");
+        check_chain_id(&chain_id_config(dir.path(), 2)).expect("matching chain id");
+    }
+
+    #[test]
+    fn chain_id_is_pinned_to_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        check_chain_id(&chain_id_config(dir.path(), 3)).expect("first start writes marker");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CHAIN_ID_MARKER))
+                .unwrap()
+                .trim(),
+            "3"
+        );
+        check_chain_id(&chain_id_config(dir.path(), 3)).expect("same chain id restarts");
+        let err = check_chain_id(&chain_id_config(dir.path(), 1337)).unwrap_err();
+        assert!(err.to_string().contains("chain_id mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn genesis_chain_id_optional_only_for_devnet_and_local() {
+        for id in [3, 1337] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("genesis_validators.toml"),
+                "validator = []\n",
+            )
+            .unwrap();
+            check_chain_id(&chain_id_config(dir.path(), id))
+                .unwrap_or_else(|e| panic!("chain {id} without genesis chain_id: {e:#}"));
+            // No genesis file at all is fine too.
+            let dir = tempfile::tempdir().unwrap();
+            check_chain_id(&chain_id_config(dir.path(), id)).expect("no genesis file");
+        }
+    }
+
+    #[test]
+    fn mainnet_and_testnet_require_genesis_chain_id() {
+        for id in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("genesis_validators.toml"),
+                "validator = []\n",
+            )
+            .unwrap();
+            let err = check_chain_id(&chain_id_config(dir.path(), id)).unwrap_err();
+            assert!(
+                err.to_string().contains("requires an explicit chain_id"),
+                "{err:#}"
+            );
+            assert!(!dir.path().join(CHAIN_ID_MARKER).exists());
+
+            let dir = tempfile::tempdir().unwrap();
+            let err = check_chain_id(&chain_id_config(dir.path(), id)).unwrap_err();
+            assert!(err.to_string().contains("requires"), "{err:#}");
+
+            let dir = tempfile::tempdir().unwrap();
+            write_genesis_chain_id(dir.path(), id);
+            check_chain_id(&chain_id_config(dir.path(), id)).expect("explicit chain_id");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_on_mainnet_without_genesis_chain_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("genesis_validators.toml"),
+            "validator = []\n",
+        )
+        .unwrap();
+        let err = run_node(chain_id_config(dir.path(), 1), std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires an explicit chain_id"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_on_chain_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_genesis_chain_id(dir.path(), 1);
+        let err = run_node(chain_id_config(dir.path(), 1337), std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("chain_id mismatch"), "{err:#}");
+        assert!(
+            !dir.path().join("consensus.redb").exists(),
+            "no storage opened before the chain id check"
+        );
     }
     use kvnc_staking::{StakingState, MAX_ACTIVE_VALIDATORS, MIN_VALIDATOR_STAKE, ONE_KVNC};
     use kvnc_storage::BincodeSerialize;
@@ -1787,6 +2035,54 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].leader.digest, digest);
         assert_eq!(recovered[0].blocks.len(), 1);
+    }
+
+    #[test]
+    fn committed_subdag_recovery_never_replays_a_block_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().join("dag.redb")).unwrap();
+        let dag = DagStore::new(storage).unwrap();
+        let mut parents = Vec::new();
+        let mut chain = Vec::new();
+        for round in 1..=5u64 {
+            let digest = StatementBlock::compute_digest(0, round, &parents, &[]);
+            let block = StatementBlock {
+                author: 0,
+                round,
+                parents: parents.clone(),
+                transactions: Vec::new(),
+                statements: Vec::new(),
+                signature: Signature([0; 64]),
+                digest,
+                merkle_root: Default::default(),
+            };
+            dag.put_block(&block).unwrap();
+            parents = vec![kvnc_types::block::BlockReference {
+                author: 0,
+                round,
+                digest,
+            }];
+            chain.push(block);
+        }
+        // Leaders committed at rounds 1, 3 and 5.
+        for i in [0usize, 2, 4] {
+            dag.mark_round_decided(chain[i].round, &chain[i].digest)
+                .unwrap();
+        }
+
+        let recovered = recover_committed_subdags(&dag, false).unwrap();
+        assert_eq!(recovered.len(), 3);
+        let delivered: Vec<Hash> = recovered
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.digest))
+            .collect();
+        let unique: std::collections::HashSet<Hash> = delivered.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            delivered.len(),
+            "replayed twice: {delivered:?}"
+        );
+        assert_eq!(unique.len(), 5);
     }
 
     #[test]
@@ -1982,7 +2278,9 @@ mod tests {
             state_storage.clone(),
             EventBus::new(),
             None,
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
             shutdown_rx,
+            NodeHealth::new(),
         ));
 
         let leader_round = 3;
@@ -2088,14 +2386,19 @@ mod tests {
         drop(exec_tx);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = NodeHealth::new();
         run_execution(
             exec_rx,
             state_storage.clone(),
             EventBus::new(),
             None,
+            kvnc_types::SigningContext::new(kvnc_types::signing::chain_id::LOCAL),
             shutdown_rx,
+            health.clone(),
         )
         .await;
+        assert_eq!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+        assert!(!health.is_healthy());
 
         let read = state_storage.begin_read().unwrap();
         let state = state_storage.state().load_staking_state(&read).unwrap();
@@ -2193,7 +2496,7 @@ mod tests {
         let mut staking = StakingState::new();
         staking.init_treasury(Address([0xaa; 32]));
 
-        // Validator stakes: 100K, 80K, 120K, 60K KVNC (all above MIN_VALIDATOR_STAKE = 50K)
+        // Validator stakes: 100K, 80K, 120K, 60K KUNA (all above MIN_VALIDATOR_STAKE = 50K)
         staking
             .join_validator(addr1, 100_000 * ONE_KVNC, 0, Some(addr1), Some(pk1))
             .unwrap();
