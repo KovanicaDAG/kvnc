@@ -13,12 +13,13 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "dns", "gossipsub", "kad", "ping", "identify", "macros", "request-response"] }
+libp2p = { version = "0.57", features = ["tokio", "tcp", "noise", "yamux", "dns", "gossipsub", "kad", "ping", "identify", "macros", "request-response", "ed25519"] }
 multiaddr = "0.12"
 futures = { workspace = true }
 async-trait = { workspace = true }
 rand = { workspace = true }
 bincode = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 kvnc-storage = { path = "../kvnc-storage" }

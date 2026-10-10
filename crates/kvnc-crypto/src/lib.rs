@@ -1,4 +1,4 @@
-//! Cryptographic operations for KVNC.
+//! Cryptographic operations for Kovanica.
 //! Signing, verification, key generation.
 
 #![deny(unsafe_code)]
@@ -75,6 +75,41 @@ pub fn verify_block_signature(
     signature: &Signature,
 ) -> Result<(), CryptoError> {
     verify(public_key, digest.as_ref(), signature)
+}
+
+/// Errors returned by the vote signature API ([`verify_vote_signature`]).
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigError {
+    /// The public key bytes are not a valid Ed25519 point (or are a weak /
+    /// small-order key rejected by strict verification).
+    #[error("invalid public key")]
+    InvalidPublicKey,
+    /// The signature does not verify over the vote's canonical bytes under
+    /// the given public key.
+    #[error("vote signature verification failed")]
+    VerificationFailed,
+}
+
+/// Verify a consensus vote signature.
+///
+/// API contract (owned by Exec-Foundation):
+/// - The message is exactly [`Vote::signature_data`](kvnc_types::Vote::signature_data),
+///   the canonical vote encoding (`leader_round` u64 LE || `leader_hash`,
+///   40 bytes). The same bytes must be passed to [`sign`] by the producer.
+/// - `vote.signature` is checked with Ed25519 **strict** verification
+///   (`VerifyingKey::verify_strict`): rejects non-canonical `S`, and weak /
+///   small-order public keys. Signatures produced by [`sign`] always pass.
+/// - The caller is responsible for mapping `vote.voter` to the right
+///   committee `pubkey`; `voter` is *not* covered by the signature in the
+///   current (provisional) format.
+///
+/// The vote byte format is **provisional** pending the format agreement led
+/// by Main; this function will follow `Vote::signature_data` if that changes.
+pub fn verify_vote_signature(vote: &kvnc_types::Vote, pubkey: &PublicKey) -> Result<(), SigError> {
+    let vk = VerifyingKey::from_bytes(&pubkey.0).map_err(|_| SigError::InvalidPublicKey)?;
+    let sig = DalekSignature::from_bytes(&vote.signature.0);
+    vk.verify_strict(&vote.signature_data(), &sig)
+        .map_err(|_| SigError::VerificationFailed)
 }
 
 /// Batch verify block signatures, grouped by round (wave).
@@ -161,5 +196,105 @@ mod batch_tests {
             });
         }
         assert!(verify_batch(&blocks).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod vote_sig_tests {
+    use super::*;
+    use kvnc_types::hash::Hash;
+    use kvnc_types::Vote;
+
+    fn signed_vote(sk: &SigningKey) -> Vote {
+        let mut vote = Vote {
+            leader_round: 42,
+            leader_hash: Hash::new("leader-block"),
+            voter: 3,
+            signature: Signature([0u8; 64]),
+        };
+        vote.signature = sign(sk, &vote.signature_data());
+        vote
+    }
+
+    #[test]
+    fn valid_vote_signature_ok() {
+        let (sk, pk) = generate_keypair();
+        let vote = signed_vote(&sk);
+        assert_eq!(verify_vote_signature(&vote, &pk), Ok(()));
+    }
+
+    #[test]
+    fn tampered_round_fails() {
+        let (sk, pk) = generate_keypair();
+        let mut vote = signed_vote(&sk);
+        vote.leader_round += 1;
+        assert_eq!(
+            verify_vote_signature(&vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tampered_hash_fails() {
+        let (sk, pk) = generate_keypair();
+        let mut vote = signed_vote(&sk);
+        vote.leader_hash.0[0] ^= 0x01;
+        assert_eq!(
+            verify_vote_signature(&vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tampered_signature_fails() {
+        let (sk, pk) = generate_keypair();
+        let mut vote = signed_vote(&sk);
+        vote.signature.0[10] ^= 0x01;
+        assert_eq!(
+            verify_vote_signature(&vote, &pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let (sk, _pk) = generate_keypair();
+        let (_other_sk, other_pk) = generate_keypair();
+        let vote = signed_vote(&sk);
+        assert_eq!(
+            verify_vote_signature(&vote, &other_pk),
+            Err(SigError::VerificationFailed)
+        );
+    }
+
+    #[test]
+    fn invalid_public_key_rejected() {
+        let (sk, _pk) = generate_keypair();
+        let vote = signed_vote(&sk);
+        // y = 2 does not decompress to a curve point.
+        let mut bad = [0u8; 32];
+        bad[0] = 2;
+        let res = verify_vote_signature(&vote, &PublicKey(bad));
+        assert!(
+            matches!(
+                res,
+                Err(SigError::InvalidPublicKey) | Err(SigError::VerificationFailed)
+            ),
+            "got {res:?}"
+        );
+    }
+
+    #[test]
+    fn small_order_public_key_rejected() {
+        // Identity point (small order): must never verify under strict mode.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let vote = Vote {
+            leader_round: 1,
+            leader_hash: Hash::new("x"),
+            voter: 0,
+            signature: Signature([0u8; 64]),
+        };
+        assert!(verify_vote_signature(&vote, &PublicKey(identity)).is_err());
     }
 }

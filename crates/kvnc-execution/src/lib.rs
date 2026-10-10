@@ -301,10 +301,10 @@ impl ExecutionContext {
         txn: &mut WriteTransaction,
         committed_height: u64,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        // Validate transaction signature (skip for test signatures)
-        // Test signatures are all 1s (Signature([1u8; 64]))
-        let is_test_signature = tx.signature.0.iter().all(|&b| b == 1);
-        if !is_test_signature && !tx.verify_signature() {
+        // Every transaction must carry a valid Ed25519 signature by its
+        // sender over the signing hash. There is deliberately no bypass:
+        // tests sign with real keypairs (see `tests::signed_tx`).
+        if !tx.verify_signature() {
             return Ok(TransactionReceipt {
                 tx_hash: tx.hash,
                 success: false,
@@ -839,6 +839,7 @@ impl Default for ExecutionContext {
 mod tests {
     use super::*;
 
+    use kvnc_types::crypto::SigningKey;
     use kvnc_types::{Signature, StatementBlock};
 
     fn sample_block(author: u16) -> StatementBlock {
@@ -883,8 +884,39 @@ mod tests {
         }
     }
 
+    /// Deterministic test keypair. The secret bytes are a fixed test-only
+    /// constant and are never logged or printed.
+    fn test_keypair(tag: u8) -> SigningKey {
+        SigningKey::from_bytes(&[tag; 32])
+    }
+
+    /// The account address controlled by a test keypair (address = Ed25519
+    /// public key, unchanged address format).
+    fn address_of(key: &SigningKey) -> Address {
+        Address(key.verifying_key().to_bytes())
+    }
+
+    /// Build a transaction for `kind` and sign it properly with `key`.
+    fn signed_tx(key: &SigningKey, kind: TransactionKind, nonce: u64, fee: u64) -> Transaction {
+        let mut tx = Transaction {
+            sender: address_of(key),
+            nonce,
+            kind,
+            fee,
+            signature: Signature([0u8; 64]),
+            hash: kvnc_types::hash::Hash([0u8; 32]),
+        };
+        tx.hash = tx.signing_hash();
+        tx.signature = kvnc_crypto::sign(key, &tx.signing_hash().0);
+        assert!(
+            tx.verify_signature(),
+            "test helper must produce valid signatures"
+        );
+        tx
+    }
+
     fn create_transfer_tx(
-        sender: &Address,
+        key: &SigningKey,
         recipient: &Address,
         amount: u64,
         nonce: u64,
@@ -894,21 +926,7 @@ mod tests {
             to: *recipient,
             amount,
         };
-        let mut tx = Transaction {
-            sender: *sender,
-            nonce,
-            kind,
-            fee,
-            signature: Signature([0u8; 64]), // Placeholder, will be replaced after hash
-            hash: kvnc_types::hash::Hash([0u8; 32]),
-        };
-        tx.hash = tx.signing_hash();
-        // Sign with a dummy key (in real usage, this would use the sender's private key)
-        // For tests, we'll use a pre-computed valid signature
-        // Note: Since we can't easily sign in tests without the private key,
-        // we'll skip signature verification for test transactions
-        tx.signature = Signature([1u8; 64]); // Dummy signature
-        tx
+        signed_tx(key, kind, nonce, fee)
     }
 
     fn genesis_staking_state() -> StakingState {
@@ -1354,7 +1372,8 @@ mod tests {
         let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
 
         let mut ctx = ExecutionContext::new();
-        let sender = Address([1u8; 32]);
+        let sender_key = test_keypair(1);
+        let sender = address_of(&sender_key);
         let recipient = Address([2u8; 32]);
         let validator = Address([3u8; 32]);
         let payout = Address([4u8; 32]);
@@ -1388,7 +1407,13 @@ mod tests {
             .expect("join validator");
 
         // Create a signed transfer transaction
-        let tx = create_transfer_tx(&sender, &recipient, 100 * kvnc_staking::ONE_KVNC, 0, 1000);
+        let tx = create_transfer_tx(
+            &sender_key,
+            &recipient,
+            100 * kvnc_staking::ONE_KVNC,
+            0,
+            1000,
+        );
         let subdag = CommittedSubDag {
             leader: sample_block(0),
             blocks: vec![sample_block_with_txs(0, vec![tx.clone()])],
@@ -1417,7 +1442,8 @@ mod tests {
         let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
 
         let mut ctx = ExecutionContext::new();
-        let sender = Address([1u8; 32]);
+        let sender_key = test_keypair(1);
+        let sender = address_of(&sender_key);
         let recipient = Address([2u8; 32]);
         let validator = Address([3u8; 32]);
         let payout = Address([4u8; 32]);
@@ -1451,7 +1477,13 @@ mod tests {
             .expect("join validator");
 
         // Create a signed transfer transaction with small fee
-        let tx = create_transfer_tx(&sender, &recipient, 100 * kvnc_staking::ONE_KVNC, 0, 1000);
+        let tx = create_transfer_tx(
+            &sender_key,
+            &recipient,
+            100 * kvnc_staking::ONE_KVNC,
+            0,
+            1000,
+        );
         let subdag = CommittedSubDag {
             leader: sample_block(0),
             blocks: vec![sample_block_with_txs(0, vec![tx.clone()])],
@@ -1472,5 +1504,152 @@ mod tests {
 
         // Check balances: 1000 - 100 (transfer) - 1000 (fee) -> need more balance
         // Let's use a smaller fee
+    }
+
+    /// Fund `address`, register a leader validator and return the context.
+    fn setup_funded_sender(storage: &Storage, address: &Address, balance: u64) -> ExecutionContext {
+        let txn = storage.begin_write().expect("write txn");
+        storage
+            .state()
+            .set_account(
+                &txn,
+                address,
+                &Account {
+                    balance,
+                    nonce: 0,
+                    code_hash: [0u8; 32],
+                    code: Vec::new(),
+                },
+            )
+            .expect("set_account");
+        txn.commit().expect("commit");
+
+        let mut ctx = ExecutionContext::new();
+        ctx.staking
+            .join_validator(
+                Address([3u8; 32]),
+                kvnc_staking::MIN_VALIDATOR_STAKE,
+                0,
+                Some(Address([4u8; 32])),
+                None,
+            )
+            .expect("join validator");
+        ctx
+    }
+
+    fn read_nonce(storage: &Storage, address: &Address) -> u64 {
+        let txn = storage.begin_read().expect("read txn");
+        storage
+            .state()
+            .get_account_or_default(&txn, address)
+            .expect("account")
+            .nonce
+    }
+
+    fn execute_single_tx(
+        ctx: &mut ExecutionContext,
+        storage: &Storage,
+        tx: Transaction,
+    ) -> ExecutionResult {
+        let subdag = CommittedSubDag {
+            leader: sample_block(0),
+            blocks: vec![sample_block_with_txs(0, vec![tx])],
+            leader_round: 1,
+            leader_author: 0,
+        };
+        ctx.execute_committed_subdag(&subdag, storage)
+            .expect("execute")
+    }
+
+    // Regression: the executor used to skip verification for any signature
+    // made of 64 bytes of 0x01, so anyone could forge a transfer from any
+    // account. It must now be rejected and leave all state untouched.
+    #[test]
+    fn all_0x01_signature_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+
+        // Victim account the attacker does NOT hold the key for.
+        let victim = address_of(&test_keypair(1));
+        let attacker = Address([0xAA; 32]);
+        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let mut ctx = setup_funded_sender(&storage, &victim, initial);
+
+        let mut forged = Transaction {
+            sender: victim,
+            nonce: 0,
+            kind: TransactionKind::Transfer {
+                to: attacker,
+                amount: 500 * kvnc_staking::ONE_KVNC,
+            },
+            fee: 1000,
+            signature: Signature([1u8; 64]),
+            hash: kvnc_types::hash::Hash([0u8; 32]),
+        };
+        forged.hash = forged.signing_hash();
+
+        let result = execute_single_tx(&mut ctx, &storage, forged);
+        assert_eq!(result.receipts.len(), 1);
+        let receipt = &result.receipts[0];
+        assert!(!receipt.success, "forged 0x01 signature must be rejected");
+        assert_eq!(receipt.error.as_deref(), Some("Invalid signature"));
+        assert_eq!(read_balance(&storage, &victim), initial, "no fee, no debit");
+        assert_eq!(read_nonce(&storage, &victim), 0, "nonce not consumed");
+        assert_eq!(read_balance(&storage, &attacker), 0);
+    }
+
+    // A real signature by a different key over the same payload is rejected.
+    #[test]
+    fn signature_by_wrong_key_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+
+        let victim = address_of(&test_keypair(1));
+        let attacker_key = test_keypair(2);
+        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let mut ctx = setup_funded_sender(&storage, &victim, initial);
+
+        // Attacker signs a valid tx for its own address, then swaps in the
+        // victim as sender.
+        let mut tx = create_transfer_tx(
+            &attacker_key,
+            &address_of(&attacker_key),
+            500 * kvnc_staking::ONE_KVNC,
+            0,
+            1000,
+        );
+        tx.sender = victim;
+        tx.hash = tx.signing_hash();
+
+        let result = execute_single_tx(&mut ctx, &storage, tx);
+        assert!(!result.receipts[0].success);
+        assert_eq!(
+            result.receipts[0].error.as_deref(),
+            Some("Invalid signature")
+        );
+        assert_eq!(read_balance(&storage, &victim), initial);
+        assert_eq!(read_balance(&storage, &address_of(&attacker_key)), 0);
+    }
+
+    // A properly signed transfer is applied with the exact balance deltas.
+    #[test]
+    fn properly_signed_transfer_moves_exact_amounts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::new(dir.path().join("test.redb")).expect("storage");
+
+        let key = test_keypair(1);
+        let sender = address_of(&key);
+        let recipient = Address([2u8; 32]);
+        let initial = 1000 * kvnc_staking::ONE_KVNC;
+        let amount = 100 * kvnc_staking::ONE_KVNC;
+        let fee = 1000;
+        let mut ctx = setup_funded_sender(&storage, &sender, initial);
+
+        let tx = create_transfer_tx(&key, &recipient, amount, 0, fee);
+        let result = execute_single_tx(&mut ctx, &storage, tx);
+        assert!(result.receipts[0].success, "{:?}", result.receipts[0].error);
+        assert_eq!(read_balance(&storage, &sender), initial - amount - fee);
+        assert_eq!(read_balance(&storage, &recipient), amount);
+        assert_eq!(read_nonce(&storage, &sender), 1);
     }
 }

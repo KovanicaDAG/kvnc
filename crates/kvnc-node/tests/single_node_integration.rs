@@ -71,7 +71,7 @@ fn drive_single_node(use_mysticghost: bool) -> SingleNodeRun {
     // sockets, so the commit is fully deterministic.
     for voter in [0u16, 1, 2] {
         engine
-            .process_vote(3, voter, leader.digest)
+            .process_vote(&common::signed_vote(3, voter, leader.digest))
             .expect("vote accepted");
     }
 

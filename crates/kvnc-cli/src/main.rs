@@ -1,17 +1,9 @@
-//! KVNC command-line interface.
+//! Kovanica (KUNA) command-line interface.
 //!
 //! Wallet operations (keygen/import/export/sign), node operations
 //! (status/balance/staking/governance) and contract subcommands
 //! (htlc/vault/multisig/token). All commands support `--json` for
 //! machine-readable output and `--rpc-url` to target a specific node.
-
-mod contracts;
-mod node;
-mod output;
-mod rpc;
-mod stake;
-mod tx;
-pub mod wallet;
 
 use std::{
     io::{self, Write},
@@ -22,16 +14,19 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::json;
 
-use contracts::{ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand};
+use kvnc_cli::contracts::{
+    ContractCommand, HtlcCommand, MultisigCommand, TokenCommand, VaultCommand,
+};
+use kvnc_cli::rpc::RpcClient;
+use kvnc_cli::{contracts, node, output, rpc, tx, wallet};
 use kvnc_types::transaction::TransactionKind;
 use kvnc_types::{crypto::PublicKey, crypto::SigningKey, Address};
-use rpc::RpcClient;
 use zeroize::Zeroizing;
 
 const UNSAFE_SIGN_WARNING: &str = "WARNING: arbitrary message signing is unsafe and cross-context; signatures may be replayed or misinterpreted by other protocols.";
 
 #[derive(Parser)]
-#[command(name = "kvnc", version, about = "Kovanica (KVNC) CLI", long_about = None)]
+#[command(name = "kvnc", version, about = "Kovanica (KUNA) CLI", long_about = None)]
 struct Cli {
     /// JSON-RPC endpoint of the node
     #[arg(long, global = true, default_value = "http://127.0.0.1:8545")]
@@ -61,7 +56,7 @@ enum Commands {
     Address(AddressArgs),
     /// Sign a message offline and print the signature as hex
     Sign(SignArgs),
-    /// Submit a native KVNC transfer
+    /// Submit a native KUNA transfer
     Transfer(TransferArgs),
     /// Show chain/node status
     Status,
@@ -69,9 +64,9 @@ enum Commands {
     Info,
     /// Query an account balance
     Balance { address: String },
-    /// Stake KVNC (builds and submits a signed Stake transaction)
+    /// Stake KUNA (builds and submits a signed Stake transaction)
     Stake(AmountArgs),
-    /// Unstake KVNC (builds and submits a signed Unstake transaction)
+    /// Unstake KUNA (builds and submits a signed Unstake transaction)
     Unstake(AmountArgs),
     /// Delegate stake to a validator
     Delegate(DelegateArgs),
@@ -513,7 +508,9 @@ async fn cmd_stake(client: &RpcClient, args: AmountArgs, json_output: bool) -> R
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Stake { amount: args.amount },
+        TransactionKind::Stake {
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -540,7 +537,9 @@ async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) ->
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Unstake { amount: args.amount },
+        TransactionKind::Unstake {
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -568,7 +567,10 @@ async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool)
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Delegate { validator, amount: args.amount },
+        TransactionKind::Delegate {
+            validator,
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -593,8 +595,15 @@ async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool)
     Ok(())
 }
 
-async fn cmd_claim_rewards(client: &RpcClient, args: ClaimRewardsArgs, json_output: bool) -> Result<()> {
-    let validator = args.validator.map(|v| v.parse::<kvnc_types::Address>()).transpose()?;
+async fn cmd_claim_rewards(
+    client: &RpcClient,
+    args: ClaimRewardsArgs,
+    json_output: bool,
+) -> Result<()> {
+    let validator = args
+        .validator
+        .map(|v| v.parse::<kvnc_types::Address>())
+        .transpose()?;
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
@@ -698,7 +707,7 @@ fn cmd_migrate(args: MigrateArgs, json_output: bool) -> Result<()> {
 /// `kvnc address --key-file <FILE>` — offline derivation of the canonical
 /// address and public key from a raw 32-byte hex seed. Prints only public
 /// identity material; the seed is never echoed.
-/// 
+///
 /// Security: requires `--allow-raw-hex` flag and key file must have 0600 permissions.
 fn cmd_address(args: AddressArgs, json_output: bool) -> Result<()> {
     if !args.allow_raw_hex {
@@ -861,7 +870,14 @@ mod wallet_cli_security_tests {
         )
         .is_ok());
         std::fs::write(&key_path, "00").unwrap();
-        assert!(cmd_address(AddressArgs { key_file: key_path, allow_raw_hex: true }, false).is_err());
+        assert!(cmd_address(
+            AddressArgs {
+                key_file: key_path,
+                allow_raw_hex: true
+            },
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -917,7 +933,14 @@ mod wallet_cli_security_tests {
     #[test]
     fn stake_and_unstake_accept_keystore_and_fee() {
         let cli = Cli::try_parse_from([
-            "kvnc", "stake", "--amount", "42", "--fee", "3", "--keystore", "wallet.json",
+            "kvnc",
+            "stake",
+            "--amount",
+            "42",
+            "--fee",
+            "3",
+            "--keystore",
+            "wallet.json",
         ])
         .unwrap();
         match cli.command {

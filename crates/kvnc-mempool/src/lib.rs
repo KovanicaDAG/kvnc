@@ -1,4 +1,37 @@
 //! Transaction mempool with fee-based prioritization.
+//!
+//! # Admission
+//!
+//! [`Mempool::add_transaction`] runs the cheap, stateless checks first and the
+//! expensive ones last, so junk is turned away before we pay for a signature
+//! check or a storage read:
+//!
+//! 1. size, gas limit, zero fee, minimum fee rate;
+//! 2. `tx.hash` must equal `tx.signing_hash()` (the hash is the pool key and
+//!    the dedup key, so it must be bound to the signed content);
+//! 3. duplicate hash;
+//! 4. Ed25519 signature;
+//! 5. account state: nonce window, per-sender limit, same-nonce replacement
+//!    (replace-by-fee), cumulative balance of everything the sender has
+//!    pending, and pool capacity (eviction only of lower fee-rate entries).
+//!
+//! # Nonces
+//!
+//! A sender's pending transactions always form one contiguous nonce run that
+//! starts at the account nonce. A new transaction must either extend the run
+//! (`nonce == next`) or replace a queued transaction with the same nonce for a
+//! fee at least [`MempoolConfig::replacement_fee_bump_percent`] higher.
+//!
+//! # Lifecycle
+//!
+//! `queued` → (proposed by [`Mempool::get_next_transactions`]) → `in flight`
+//! → removed by [`Mempool::remove_committed_transactions`] once a block with
+//! it is committed. In-flight entries that are not committed within
+//! [`MempoolConfig::in_flight_timeout`] go back to the queue. Nothing is
+//! dropped silently: every removal updates all indexes and the size total.
+//!
+//! All pool state lives behind a single mutex, so there is no lock ordering
+//! to get wrong.
 
 #![deny(unsafe_code)]
 #![allow(missing_docs)]
@@ -9,29 +42,174 @@ use kvnc_storage::Storage;
 use kvnc_types::{
     hash::Hash,
     transaction::{Transaction, TransactionKind},
+    Address,
 };
-use parking_lot::RwLock;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use parking_lot::Mutex;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{info, warn};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+/// Upper bound on hashes waiting in the propagation queue.
+const MAX_PENDING_PROPAGATION: usize = 10_000;
+
+/// Proposal priority: (fee rate, fee, reversed sender bytes, hash bytes).
+type Priority = (u64, u64, Reverse<[u8; 32]>, [u8; 32]);
+
+/// One tracked transaction.
+#[derive(Clone, Debug)]
+struct Entry {
+    tx: Transaction,
+    size: usize,
+    fee_rate: u64,
+    /// `Some(t)` once handed out for a block proposal at `t`.
+    in_flight_since: Option<Instant>,
+}
+
+/// Everything mutable about the pool, guarded by one lock.
+#[derive(Default)]
+struct PoolState {
+    /// Every tracked transaction (queued and in flight).
+    by_hash: HashMap<Hash, Entry>,
+    /// Queued (not in flight) transactions by fee rate.
+    by_fee_rate: BTreeMap<u64, VecDeque<Hash>>,
+    /// Per-sender nonce → hash, for queued and in-flight transactions.
+    by_sender: HashMap<Address, BTreeMap<u64, Hash>>,
+    /// Transactions not yet propagated (bounded).
+    pending_propagation: VecDeque<Hash>,
+    /// Sum of serialized sizes of every tracked transaction.
+    total_size: usize,
+}
+
+impl PoolState {
+    fn enqueue(&mut self, hash: Hash, fee_rate: u64) {
+        self.by_fee_rate
+            .entry(fee_rate)
+            .or_default()
+            .push_back(hash);
+    }
+
+    fn dequeue(&mut self, hash: &Hash, fee_rate: u64) {
+        if let Some(queue) = self.by_fee_rate.get_mut(&fee_rate) {
+            queue.retain(|h| h != hash);
+            if queue.is_empty() {
+                self.by_fee_rate.remove(&fee_rate);
+            }
+        }
+    }
+
+    fn insert(&mut self, entry: Entry) {
+        let hash = entry.tx.hash;
+        self.enqueue(hash, entry.fee_rate);
+        self.by_sender
+            .entry(entry.tx.sender)
+            .or_default()
+            .insert(entry.tx.nonce, hash);
+        self.total_size += entry.size;
+        self.pending_propagation.push_back(hash);
+        while self.pending_propagation.len() > MAX_PENDING_PROPAGATION {
+            self.pending_propagation.pop_front();
+        }
+        self.by_hash.insert(hash, entry);
+    }
+
+    /// Remove one transaction from every index.
+    fn remove(&mut self, hash: &Hash) -> Option<Entry> {
+        let entry = self.by_hash.remove(hash)?;
+        if entry.in_flight_since.is_none() {
+            self.dequeue(hash, entry.fee_rate);
+        }
+        if let Some(nonces) = self.by_sender.get_mut(&entry.tx.sender) {
+            if nonces.get(&entry.tx.nonce) == Some(hash) {
+                nonces.remove(&entry.tx.nonce);
+            }
+            if nonces.is_empty() {
+                self.by_sender.remove(&entry.tx.sender);
+            }
+        }
+        self.total_size = self.total_size.saturating_sub(entry.size);
+        Some(entry)
+    }
+
+    /// Remove `sender`'s transactions with nonce `>= from` (keeps the run
+    /// contiguous when something in the middle has to go).
+    fn remove_sender_from(&mut self, sender: &Address, from: u64) -> usize {
+        let hashes: Vec<Hash> = self
+            .by_sender
+            .get(sender)
+            .map(|nonces| nonces.range(from..).map(|(_, h)| *h).collect())
+            .unwrap_or_default();
+        hashes.iter().filter(|h| self.remove(h).is_some()).count()
+    }
+
+    /// Remove `sender`'s transactions with nonce `< below` (already used).
+    fn remove_sender_below(&mut self, sender: &Address, below: u64) -> usize {
+        let hashes: Vec<Hash> = self
+            .by_sender
+            .get(sender)
+            .map(|nonces| nonces.range(..below).map(|(_, h)| *h).collect())
+            .unwrap_or_default();
+        hashes.iter().filter(|h| self.remove(h).is_some()).count()
+    }
+
+    /// Lowest fee-rate queued transaction, if any.
+    fn lowest_queued(&self) -> Option<(u64, Hash)> {
+        self.by_fee_rate
+            .iter()
+            .find_map(|(rate, queue)| queue.back().map(|h| (*rate, *h)))
+    }
+
+    /// Put in-flight entries older than `timeout` back in the queue.
+    fn requeue_stale(&mut self, now: Instant, timeout: Duration) -> usize {
+        let stale: Vec<(Hash, u64)> = self
+            .by_hash
+            .iter()
+            .filter(|(_, e)| {
+                e.in_flight_since
+                    .is_some_and(|since| now.duration_since(since) >= timeout)
+            })
+            .map(|(h, e)| (*h, e.fee_rate))
+            .collect();
+        for (hash, fee_rate) in &stale {
+            if let Some(entry) = self.by_hash.get_mut(hash) {
+                entry.in_flight_since = None;
+            }
+            self.enqueue(*hash, *fee_rate);
+        }
+        stale.len()
+    }
+}
 
 /// Mempool implementation with fee-based prioritization.
 pub struct Mempool {
     config: MempoolConfig,
-    #[allow(dead_code)]
     storage: Arc<Storage>,
-    /// Transactions organized by fee rate (highest first).
-    /// Maps fee_rate -> transactions with that fee rate.
-    by_fee_rate: RwLock<BTreeMap<u64, VecDeque<Transaction>>>,
-    /// All transactions by hash for quick lookup.
-    by_hash: RwLock<HashMap<Hash, Transaction>>,
-    /// Transactions in the pending queue (not yet propagated).
-    pending_propagation: RwLock<VecDeque<Hash>>,
+    state: Mutex<PoolState>,
     /// Last time we rebroadcast transactions.
-    last_rebroadcast: RwLock<Instant>,
-    /// Total size in bytes.
-    total_size: RwLock<usize>,
+    last_rebroadcast: Mutex<Instant>,
+}
+
+/// Value moved out of the sender's balance by `kind` at execution time
+/// (mirrors the balance check the mempool already did; no new semantics).
+fn immediate_value(kind: &TransactionKind) -> u64 {
+    match kind {
+        TransactionKind::Transfer { amount, .. } => *amount,
+        TransactionKind::Stake { amount } => *amount,
+        TransactionKind::Unstake { .. } => 0, // funds not returned until unbonding ends
+        TransactionKind::Delegate { amount, .. } => *amount,
+        TransactionKind::ClaimRewards { .. } => 0,
+        TransactionKind::Deploy { .. } => 0,
+        TransactionKind::Call { .. } => 0,
+    }
+}
+
+/// Stake and delegate are fee-free by design; everything else pays a fee.
+fn requires_fee(kind: &TransactionKind) -> bool {
+    !matches!(
+        kind,
+        TransactionKind::Stake { .. } | TransactionKind::Delegate { .. }
+    )
 }
 
 impl Mempool {
@@ -40,17 +218,14 @@ impl Mempool {
         Self {
             config,
             storage,
-            by_fee_rate: RwLock::new(BTreeMap::new()),
-            by_hash: RwLock::new(HashMap::new()),
-            pending_propagation: RwLock::new(VecDeque::new()),
-            last_rebroadcast: RwLock::new(Instant::now()),
-            total_size: RwLock::new(0),
+            state: Mutex::new(PoolState::default()),
+            last_rebroadcast: Mutex::new(Instant::now()),
         }
     }
 
-    /// Get the number of transactions in the mempool.
+    /// Get the number of transactions in the mempool (queued and in flight).
     pub fn len(&self) -> usize {
-        self.by_hash.read().len()
+        self.state.lock().by_hash.len()
     }
 
     /// Check if the mempool is empty.
@@ -60,123 +235,288 @@ impl Mempool {
 
     /// Get a transaction by hash.
     pub fn get(&self, hash: &Hash) -> Option<Transaction> {
-        self.by_hash.read().get(hash).cloned()
+        self.state.lock().by_hash.get(hash).map(|e| e.tx.clone())
     }
 
     /// Check if a transaction exists in the mempool.
     pub fn contains(&self, hash: &Hash) -> bool {
-        self.by_hash.read().contains_key(hash)
+        self.state.lock().by_hash.contains_key(hash)
     }
 
-    /// Add a transaction to the mempool.
+    /// Add a transaction to the mempool. See the module docs for the rules.
     pub fn add_transaction(&self, tx: Transaction) -> Result<(), MempoolError> {
-        // Check if we already have this transaction
-        if self.by_hash.read().contains_key(&tx.hash) {
+        // --- 1. cheap stateless checks ---------------------------------
+        let size = bincode::serialized_size(&tx)? as usize;
+        if size > self.config.max_tx_size {
+            return Err(MempoolError::TransactionTooLarge(size));
+        }
+        if let TransactionKind::Call { gas_limit, .. } = &tx.kind {
+            if *gas_limit > self.config.max_gas_limit {
+                return Err(MempoolError::GasLimitTooHigh);
+            }
+        }
+        let fee_rate = tx.fee / size.max(1) as u64;
+        if requires_fee(&tx.kind) {
+            if tx.fee == 0 {
+                return Err(MempoolError::ZeroFee);
+            }
+            if fee_rate < self.config.min_fee_rate {
+                return Err(MempoolError::FeeTooLow {
+                    fee_rate,
+                    min_fee_rate: self.config.min_fee_rate,
+                });
+            }
+        }
+
+        // --- 2. hash binding --------------------------------------------
+        if tx.hash != tx.signing_hash() {
+            return Err(MempoolError::HashMismatch);
+        }
+
+        // --- 3. duplicate -----------------------------------------------
+        if self.contains(&tx.hash) {
             return Err(MempoolError::AlreadyExists);
         }
 
-        // Validate the transaction
-        self.validate_transaction(&tx)?;
-
-        // Check if we need to evict transactions to make room
-        self.maybe_evict()?;
-
-        // Calculate fee rate
-        let fee_rate = self.calculate_fee_rate(&tx);
-
-        // Add to by_fee_rate (highest fee rate first)
-        {
-            let mut by_fee_rate = self.by_fee_rate.write();
-            by_fee_rate
-                .entry(fee_rate)
-                .or_default()
-                .push_back(tx.clone());
+        // --- 4. signature (expensive) -----------------------------------
+        if !tx.verify_signature() {
+            return Err(MempoolError::InvalidSignature);
         }
 
-        // Add to by_hash
-        self.by_hash.write().insert(tx.hash, tx.clone());
+        // --- 5. account state (storage read, outside the pool lock) -----
+        let account = {
+            let txn = self.storage.begin_read()?;
+            self.storage
+                .state()
+                .get_account_or_default(&txn, &tx.sender)?
+        };
+        if tx.nonce < account.nonce {
+            return Err(MempoolError::InvalidNonce {
+                expected: account.nonce,
+                got: tx.nonce,
+            });
+        }
 
-        // Add to pending propagation
-        self.pending_propagation.write().push_back(tx.hash);
+        let mut state = self.state.lock();
+        if state.by_hash.contains_key(&tx.hash) {
+            return Err(MempoolError::AlreadyExists);
+        }
+        // Anything below the account nonce has been used already.
+        state.remove_sender_below(&tx.sender, account.nonce);
 
-        // Update total size
-        let tx_size = bincode::serialize(&tx).unwrap_or_default().len();
-        *self.total_size.write() += tx_size;
+        let pending = state.by_sender.get(&tx.sender).cloned().unwrap_or_default();
+        let mut replaces = None;
+        if let Some(existing_hash) = pending.get(&tx.nonce) {
+            let existing = &state.by_hash[existing_hash];
+            if existing.in_flight_since.is_some() {
+                return Err(MempoolError::NonceInFlight { nonce: tx.nonce });
+            }
+            let bump = existing
+                .tx
+                .fee
+                .saturating_mul(self.config.replacement_fee_bump_percent)
+                / 100;
+            let min_fee = existing.tx.fee.saturating_add(bump.max(1));
+            if tx.fee < min_fee {
+                return Err(MempoolError::ReplacementUnderpriced {
+                    fee: tx.fee,
+                    min_fee,
+                });
+            }
+            replaces = Some(*existing_hash);
+        } else {
+            let next = pending
+                .last_key_value()
+                .map(|(nonce, _)| nonce + 1)
+                .unwrap_or(account.nonce)
+                .max(account.nonce);
+            if tx.nonce != next {
+                return Err(MempoolError::InvalidNonce {
+                    expected: next,
+                    got: tx.nonce,
+                });
+            }
+            if pending.len() >= self.config.max_txs_per_sender {
+                return Err(MempoolError::TooManyFromSender {
+                    limit: self.config.max_txs_per_sender,
+                });
+            }
+        }
 
-        info!(
-            "Added transaction {} to mempool (fee_rate={}, size={})",
-            tx.hash, fee_rate, tx_size
-        );
+        // Cumulative balance: everything else this sender has pending must
+        // still be payable together with this transaction.
+        let already_pending: u64 = pending
+            .values()
+            .filter(|h| Some(**h) != replaces)
+            .filter_map(|h| state.by_hash.get(h))
+            .map(|e| immediate_value(&e.tx.kind).saturating_add(e.tx.fee))
+            .fold(0u64, u64::saturating_add);
+        let required = already_pending
+            .saturating_add(immediate_value(&tx.kind))
+            .saturating_add(tx.fee);
+        if account.balance < required {
+            return Err(MempoolError::InsufficientBalance {
+                balance: account.balance,
+                required,
+            });
+        }
 
+        // Capacity: only evict strictly cheaper entries from other senders.
+        let freed = replaces
+            .and_then(|h| state.by_hash.get(&h))
+            .map_or(0, |e| e.size);
+        while state.total_size - freed + size > self.config.max_mempool_size {
+            let Some((lowest_rate, victim)) = state.lowest_queued() else {
+                return Err(MempoolError::Full);
+            };
+            let victim_sender = state.by_hash[&victim].tx.sender;
+            if lowest_rate >= fee_rate || victim_sender == tx.sender {
+                return Err(MempoolError::Full);
+            }
+            let victim_nonce = state.by_hash[&victim].tx.nonce;
+            let evicted = state.remove_sender_from(&victim_sender, victim_nonce);
+            warn!(
+                %victim,
+                fee_rate = lowest_rate,
+                evicted,
+                "evicted lower fee-rate transaction(s) from full mempool"
+            );
+        }
+
+        if let Some(old) = replaces {
+            state.remove(&old);
+            debug!(old = %old, new = %tx.hash, nonce = tx.nonce, "replaced pending transaction");
+        }
+        let hash = tx.hash;
+        state.insert(Entry {
+            tx,
+            size,
+            fee_rate,
+            in_flight_since: None,
+        });
+        info!(%hash, fee_rate, size, "added transaction to mempool");
         Ok(())
     }
 
-    /// Get the next transactions for block proposal (up to MAX_TXS_PER_BLOCK).
+    /// Take up to `max_txs` transactions for a block proposal.
+    ///
+    /// Highest fee rate first, but a sender's transactions are only ever
+    /// returned in nonce order and without gaps. Returned transactions move to
+    /// *in flight*: they stay tracked (and keep their nonces reserved) until
+    /// [`Mempool::remove_committed_transactions`] removes them, or go back to
+    /// the queue after [`MempoolConfig::in_flight_timeout`]. Nothing that is
+    /// not returned is lost.
     pub fn get_next_transactions(&self, max_txs: usize) -> Vec<Transaction> {
-        let mut by_fee_rate = self.by_fee_rate.write();
-        // Phase 16.5: conflict-aware selection — collect, filter contiguous nonce per sender, sort by fee
-        let mut all: Vec<Transaction> = Vec::new();
-        for txs in by_fee_rate.values_mut() {
-            while let Some(tx) = txs.pop_front() {
-                all.push(tx);
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let requeued = state.requeue_stale(now, self.config.in_flight_timeout);
+        if requeued > 0 {
+            debug!(requeued, "re-queued uncommitted in-flight transactions");
+        }
+
+        // Per sender: the queued run that directly follows any in-flight
+        // prefix, in nonce order.
+        let mut runs: HashMap<Address, VecDeque<Hash>> = HashMap::new();
+        for (sender, nonces) in &state.by_sender {
+            let mut run = VecDeque::new();
+            let mut expected: Option<u64> = None;
+            for (nonce, hash) in nonces {
+                if expected.is_some_and(|e| e != *nonce) {
+                    break;
+                }
+                expected = Some(nonce + 1);
+                match state.by_hash.get(hash) {
+                    Some(e) if e.in_flight_since.is_some() => {
+                        if !run.is_empty() {
+                            break;
+                        }
+                    }
+                    Some(_) => run.push_back(*hash),
+                    None => break,
+                }
+            }
+            if !run.is_empty() {
+                runs.insert(*sender, run);
             }
         }
-        let mut by_sender: std::collections::BTreeMap<String, Vec<Transaction>> =
-            std::collections::BTreeMap::new();
-        for tx in all {
-            by_sender
-                .entry(format!("{:?}", tx.sender))
-                .or_default()
-                .push(tx);
-        }
-        let mut result = Vec::new();
-        for (_, mut txs) in by_sender {
-            txs.sort_by_key(|tx| tx.nonce);
-            let mut expected = txs.first().map(|t| t.nonce).unwrap_or(0);
-            for tx in txs {
-                if tx.nonce == expected {
-                    result.push(tx);
-                    expected += 1;
+
+        // Merge the runs by fee rate (then fee, then sender bytes for
+        // determinism), always taking a sender's next nonce.
+        let key = |state: &PoolState, hash: &Hash| -> Priority {
+            let e = &state.by_hash[hash];
+            (e.fee_rate, e.tx.fee, Reverse(e.tx.sender.0), hash.0)
+        };
+        let mut heap: BinaryHeap<Priority> = runs
+            .values()
+            .filter_map(|run| run.front())
+            .map(|h| key(&state, h))
+            .collect();
+        let mut selected = Vec::new();
+        while selected.len() < max_txs {
+            let Some((_, _, Reverse(sender), hash)) = heap.pop() else {
+                break;
+            };
+            selected.push(Hash(hash));
+            if let Some(run) = runs.get_mut(&Address(sender)) {
+                run.pop_front();
+                if let Some(next) = run.front() {
+                    heap.push(key(&state, next));
                 }
             }
         }
-        result.sort_by(|a, b| b.fee.cmp(&a.fee).then_with(|| a.sender.0.cmp(&b.sender.0)));
-        result.truncate(max_txs);
+
+        let mut result = Vec::with_capacity(selected.len());
+        for hash in selected {
+            let Some(fee_rate) = state.by_hash.get(&hash).map(|e| e.fee_rate) else {
+                continue;
+            };
+            state.dequeue(&hash, fee_rate);
+            if let Some(entry) = state.by_hash.get_mut(&hash) {
+                entry.in_flight_since = Some(now);
+                result.push(entry.tx.clone());
+            }
+        }
         result
     }
 
     /// Remove transactions that have been included in a committed block.
+    ///
+    /// Prefer [`Mempool::remove_committed_transactions`], which also drops
+    /// pooled transactions made stale by a committed nonce.
     pub fn remove_committed(&self, committed_txs: &[Hash]) {
-        let mut by_fee_rate = self.by_fee_rate.write();
-        let mut by_hash = self.by_hash.write();
-        let mut total_size = self.total_size.write();
-
+        let mut state = self.state.lock();
         for hash in committed_txs {
-            if let Some(tx) = by_hash.remove(hash) {
-                // Remove from by_fee_rate
-                let fee_rate = self.calculate_fee_rate(&tx);
-                if let Some(txs) = by_fee_rate.get_mut(&fee_rate) {
-                    txs.retain(|t| t.hash != *hash);
-                    if txs.is_empty() {
-                        by_fee_rate.remove(&fee_rate);
-                    }
-                }
+            state.remove(hash);
+        }
+    }
 
-                // Update total size
-                let tx_size = bincode::serialize(&tx).unwrap_or_default().len();
-                *total_size = total_size.saturating_sub(tx_size);
+    /// Remove committed transactions and anything they made stale: for each
+    /// committed `(sender, nonce)`, every pooled transaction of that sender
+    /// with a nonce `<=` it is dropped (even a different transaction with the
+    /// same nonce, e.g. one committed via another validator's pool).
+    pub fn remove_committed_transactions(&self, committed: &[Transaction]) -> usize {
+        let mut highest: HashMap<Address, u64> = HashMap::new();
+        for tx in committed {
+            let slot = highest.entry(tx.sender).or_insert(tx.nonce);
+            *slot = (*slot).max(tx.nonce);
+        }
+        let mut state = self.state.lock();
+        let mut removed: HashSet<Hash> = HashSet::new();
+        for tx in committed {
+            if state.remove(&tx.hash).is_some() {
+                removed.insert(tx.hash);
             }
         }
+        let mut stale = 0;
+        for (sender, nonce) in highest {
+            stale += state.remove_sender_below(&sender, nonce.saturating_add(1));
+        }
+        removed.len() + stale
     }
 
     /// Get transactions ready for propagation.
     pub fn get_pending_propagation(&self) -> Vec<Hash> {
-        let mut pending = self.pending_propagation.write();
-        let mut result = Vec::new();
-        while let Some(hash) = pending.pop_front() {
-            result.push(hash);
-        }
-        result
+        self.state.lock().pending_propagation.drain(..).collect()
     }
 
     /// Mark transactions as propagated.
@@ -186,130 +526,36 @@ impl Mempool {
         let _ = hashes;
     }
 
-    /// Rebroadcast pending transactions (called periodically).
+    /// Rebroadcast queued transactions (called periodically).
     pub fn rebroadcast(&self) -> Vec<Transaction> {
-        let mut last_rebroadcast = self.last_rebroadcast.write();
+        let mut last_rebroadcast = self.last_rebroadcast.lock();
         if last_rebroadcast.elapsed() < self.config.rebroadcast_interval {
             return Vec::new();
         }
         *last_rebroadcast = Instant::now();
-
-        // Return all transactions for rebroadcast
-        self.by_hash.read().values().cloned().collect()
-    }
-
-    /// Validate a transaction before adding to mempool.
-    fn validate_transaction(&self, tx: &Transaction) -> Result<(), MempoolError> {
-        // 1. Verify signature
-        if !tx.verify_signature() {
-            return Err(MempoolError::InvalidSignature);
-        }
-
-        // 2. Load sender account from storage
-        let txn = self.storage.begin_read()?;
-        let state = self.storage.state();
-        let account = state.get_account_or_default(&txn, &tx.sender)?;
-
-        // 3. Check nonce (strict sequential for v1)
-        if tx.nonce != account.nonce {
-            return Err(MempoolError::InvalidNonce {
-                expected: account.nonce,
-                got: tx.nonce,
-            });
-        }
-
-        // 4. Reject zero-fee transactions except stake/delegate (fee-free by design).
-        if tx.fee == 0 && !matches!(tx.kind, TransactionKind::Stake { .. } | TransactionKind::Delegate { .. }) {
-            return Err(MempoolError::ZeroFee);
-        }
-
-        // 5. Check balance sufficient for fee + immediate value
-        let immediate_value = match &tx.kind {
-            TransactionKind::Transfer { amount, .. } => *amount,
-            TransactionKind::Stake { amount } => *amount,
-            TransactionKind::Unstake { .. } => 0, // funds not returned until unbonding period ends
-            TransactionKind::Delegate { amount, .. } => *amount,
-            TransactionKind::ClaimRewards { .. } => 0,
-            TransactionKind::Deploy { .. } => 0,
-            TransactionKind::Call { .. } => 0,
-        };
-        let required = immediate_value.saturating_add(tx.fee);
-        if account.balance < required {
-            return Err(MempoolError::InsufficientBalance {
-                balance: account.balance,
-                required,
-            });
-        }
-
-        // 6. Check gas limit (already partially done, but move here for completeness)
-        if let TransactionKind::Call { gas_limit, .. } = &tx.kind {
-            if *gas_limit > self.config.max_gas_limit {
-                return Err(MempoolError::GasLimitTooHigh);
-            }
-        }
-
-        // 7. Check transaction size (already done, but keep)
-        let tx_size = bincode::serialize(tx).unwrap_or_default().len();
-        if tx_size > self.config.max_tx_size {
-            return Err(MempoolError::TransactionTooLarge(tx_size));
-        }
-
-        Ok(())
-    }
-
-    /// Calculate fee rate (fee per byte).
-    fn calculate_fee_rate(&self, tx: &Transaction) -> u64 {
-        let tx_size = bincode::serialize(tx).unwrap_or_default().len();
-        if tx_size == 0 {
-            return 0;
-        }
-        tx.fee / tx_size as u64
-    }
-
-    /// Evict low fee-rate transactions if mempool is full.
-    fn maybe_evict(&self) -> Result<(), MempoolError> {
-        let total_size = *self.total_size.read();
-        if total_size >= self.config.max_mempool_size {
-            // Evict lowest fee-rate transactions until we're under the limit
-            let mut by_fee_rate = self.by_fee_rate.write();
-            let mut by_hash = self.by_hash.write();
-            let mut total_size = self.total_size.write();
-
-            while *total_size >= self.config.max_mempool_size && !by_fee_rate.is_empty() {
-                // Get the lowest fee rate
-                if let Some(entry) = by_fee_rate.first_entry() {
-                    let (lowest_fee_rate, mut txs) = entry.remove_entry();
-                    if let Some(tx) = txs.pop_front() {
-                        by_hash.remove(&tx.hash);
-                        let tx_size = bincode::serialize(&tx).unwrap_or_default().len();
-                        *total_size = total_size.saturating_sub(tx_size);
-
-                        warn!(
-                            "Evicted transaction {} from mempool (fee_rate={})",
-                            tx.hash, lowest_fee_rate
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.state
+            .lock()
+            .by_hash
+            .values()
+            .filter(|e| e.in_flight_since.is_none())
+            .map(|e| e.tx.clone())
+            .collect()
     }
 
     /// Get mempool statistics.
+    ///
+    /// `fee_rates` covers queued transactions only; `tx_count` and
+    /// `total_size` cover everything tracked (queued and in flight).
     pub fn stats(&self) -> MempoolStats {
-        let by_hash = self.by_hash.read();
-        let by_fee_rate = self.by_fee_rate.read();
-        let total_size = *self.total_size.read();
-
-        let mut fee_rates = Vec::new();
-        for (fee_rate, txs) in by_fee_rate.iter() {
-            fee_rates.push((*fee_rate, txs.len()));
-        }
-
+        let state = self.state.lock();
         MempoolStats {
-            tx_count: by_hash.len(),
-            total_size,
-            fee_rates,
+            tx_count: state.by_hash.len(),
+            total_size: state.total_size,
+            fee_rates: state
+                .by_fee_rate
+                .iter()
+                .map(|(rate, queue)| (*rate, queue.len()))
+                .collect(),
         }
     }
 }
@@ -325,8 +571,21 @@ pub struct MempoolConfig {
     pub max_gas_limit: u64,
     /// Interval for rebroadcasting transactions.
     pub rebroadcast_interval: std::time::Duration,
-    /// Minimum fee rate for transactions (fee per byte).
+    /// Minimum fee rate (fee per serialized byte, integer division) for
+    /// fee-paying transactions. Enforced at admission.
+    ///
+    /// Defaults to `0`: the previous default of `1` was never enforced, and
+    /// enforcing it would reject the CLI's default 1-atom fee. Choosing a
+    /// real fee floor is a fee-policy decision left to the operator.
     pub min_fee_rate: u64,
+    /// Maximum pending (queued + in-flight) transactions per sender.
+    pub max_txs_per_sender: usize,
+    /// Minimum fee increase, in percent, to replace a queued transaction
+    /// with the same sender and nonce.
+    pub replacement_fee_bump_percent: u64,
+    /// How long a proposed transaction may stay in flight without being
+    /// committed before it is queued again.
+    pub in_flight_timeout: Duration,
 }
 
 impl Default for MempoolConfig {
@@ -336,7 +595,10 @@ impl Default for MempoolConfig {
             max_tx_size: 1024 * 1024,            // 1 MB
             max_gas_limit: 10_000_000,
             rebroadcast_interval: std::time::Duration::from_secs(30),
-            min_fee_rate: 1,
+            min_fee_rate: 0,
+            max_txs_per_sender: 64,
+            replacement_fee_bump_percent: 10,
+            in_flight_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -368,6 +630,16 @@ pub enum MempoolError {
     TransactionTooLarge(usize),
     #[error("Mempool is full")]
     Full,
+    #[error("Transaction hash does not match its signing hash")]
+    HashMismatch,
+    #[error("Fee rate {fee_rate} below minimum {min_fee_rate}")]
+    FeeTooLow { fee_rate: u64, min_fee_rate: u64 },
+    #[error("Replacement fee {fee} too low, need at least {min_fee}")]
+    ReplacementUnderpriced { fee: u64, min_fee: u64 },
+    #[error("Nonce {nonce} is already in a proposed block")]
+    NonceInFlight { nonce: u64 },
+    #[error("Too many pending transactions from sender (limit {limit})")]
+    TooManyFromSender { limit: usize },
     #[error("Crypto error: {0}")]
     Crypto(#[from] kvnc_crypto::CryptoError),
     #[error("Storage error: {0}")]
@@ -656,10 +928,11 @@ mod tests {
             "Transaction with nonce too low should be rejected"
         );
 
-        // Test 4: Transaction with wrong nonce (too high) should be rejected
+        // Test 4: Transaction leaving a nonce gap should be rejected
+        // (5 is pending, so the next admissible nonce is 6).
         let high_nonce_tx = build_signed_tx(
             sender,
-            6, // Greater than account nonce (5)
+            7,
             TransactionKind::Transfer {
                 to: Address([2u8; 32]),
                 amount: 100,
@@ -671,20 +944,22 @@ mod tests {
             matches!(
                 pool.add_transaction(high_nonce_tx.clone()),
                 Err(MempoolError::InvalidNonce {
-                    expected: 5,
-                    got: 6
+                    expected: 6,
+                    got: 7
                 })
             ),
-            "Transaction with nonce too high should be rejected"
+            "Transaction with a nonce gap should be rejected"
         );
 
-        // Test 5: Transaction with insufficient balance should be rejected
+        // Test 5: Transaction with insufficient balance should be rejected.
+        // The balance must cover everything pending: (100 + 10) for nonce 5
+        // plus (1000 + 10) for this one = 1120 > 1000.
         let insufficient_balance_tx = build_signed_tx(
             sender,
-            5, // matches account nonce
+            6,
             TransactionKind::Transfer {
                 to: Address([3u8; 32]),
-                amount: 1000, // Would require 1000 + 10 fee = 1010, but balance is only 1000
+                amount: 1000,
             },
             10, // fee
             &signing_key,
@@ -694,7 +969,7 @@ mod tests {
                 pool.add_transaction(insufficient_balance_tx.clone()),
                 Err(MempoolError::InsufficientBalance {
                     balance: 1000,
-                    required: 1010
+                    required: 1120
                 })
             ),
             "Transaction with insufficient balance should be rejected"
@@ -722,7 +997,7 @@ mod tests {
         // Test 7: Stake transaction with zero fee should be allowed
         let stake_tx = build_signed_tx(
             sender,
-            5, // matches account nonce
+            6, // next nonce after the pending transfer
             TransactionKind::Stake { amount: 50 },
             0, // zero fee allowed for stake
             &signing_key,
@@ -736,5 +1011,343 @@ mod tests {
         drop(pool);
         drop(storage);
         let _ = std::fs::remove_file(db_path);
+    }
+
+    // ------------------------------------------------------------------
+    // Admission / lifecycle tests
+    // ------------------------------------------------------------------
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        storage: Arc<Storage>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let storage = Arc::new(Storage::new(dir.path().join("m.redb")).expect("storage"));
+            Self { _dir: dir, storage }
+        }
+
+        fn funded(&self, balance: u64, nonce: u64) -> (SigningKey, Address) {
+            let (sk, pk) = kvnc_crypto::generate_keypair();
+            let sender = Address::from_public_key(&pk);
+            let txn = self.storage.begin_write().unwrap();
+            self.storage
+                .state()
+                .set_account(
+                    &txn,
+                    &sender,
+                    &Account {
+                        balance,
+                        nonce,
+                        code_hash: [0; 32],
+                        code: Vec::new(),
+                    },
+                )
+                .unwrap();
+            txn.commit().unwrap();
+            (sk, sender)
+        }
+
+        fn pool(&self, config: MempoolConfig) -> Mempool {
+            Mempool::new(config, self.storage.clone())
+        }
+    }
+
+    fn transfer(
+        sk: &SigningKey,
+        sender: Address,
+        nonce: u64,
+        amount: u64,
+        fee: u64,
+    ) -> Transaction {
+        build_signed_tx(
+            sender,
+            nonce,
+            TransactionKind::Transfer {
+                to: Address([7u8; 32]),
+                amount,
+            },
+            fee,
+            sk,
+        )
+    }
+
+    fn assert_consistent(pool: &Mempool) {
+        let state = pool.state.lock();
+        let queued: usize = state.by_fee_rate.values().map(|q| q.len()).sum();
+        let in_flight = state
+            .by_hash
+            .values()
+            .filter(|e| e.in_flight_since.is_some())
+            .count();
+        assert_eq!(queued + in_flight, state.by_hash.len(), "queue/index drift");
+        let by_sender: usize = state.by_sender.values().map(|m| m.len()).sum();
+        assert_eq!(by_sender, state.by_hash.len(), "sender index drift");
+        let size: usize = state.by_hash.values().map(|e| e.size).sum();
+        assert_eq!(size, state.total_size, "size accounting drift");
+    }
+
+    #[test]
+    fn hash_must_be_bound_to_signing_hash() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000, 0);
+        let pool = fx.pool(MempoolConfig::default());
+        let mut tx = transfer(&sk, sender, 0, 1, 10);
+        tx.hash = Hash::new(b"attacker chosen");
+        assert!(matches!(
+            pool.add_transaction(tx),
+            Err(MempoolError::HashMismatch)
+        ));
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn min_fee_rate_is_enforced_for_fee_paying_kinds() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig {
+            min_fee_rate: 2,
+            ..MempoolConfig::default()
+        });
+        let cheap = transfer(&sk, sender, 0, 1, 10);
+        assert!(matches!(
+            pool.add_transaction(cheap),
+            Err(MempoolError::FeeTooLow {
+                min_fee_rate: 2,
+                ..
+            })
+        ));
+        let size = bincode::serialized_size(&transfer(&sk, sender, 0, 1, 10)).unwrap();
+        let ok = transfer(&sk, sender, 0, 1, size * 2);
+        pool.add_transaction(ok).expect("fee rate 2 admitted");
+        // Stake stays fee-free by design.
+        let stake = build_signed_tx(sender, 1, TransactionKind::Stake { amount: 1 }, 0, &sk);
+        pool.add_transaction(stake)
+            .expect("zero-fee stake admitted");
+    }
+
+    #[test]
+    fn same_nonce_replacement_requires_fee_bump() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig::default());
+        let first = transfer(&sk, sender, 0, 1, 100);
+        pool.add_transaction(first.clone()).unwrap();
+
+        let underpriced = transfer(&sk, sender, 0, 2, 105);
+        assert!(matches!(
+            pool.add_transaction(underpriced),
+            Err(MempoolError::ReplacementUnderpriced {
+                fee: 105,
+                min_fee: 110
+            })
+        ));
+        let bumped = transfer(&sk, sender, 0, 2, 110);
+        pool.add_transaction(bumped.clone())
+            .expect("10% bump replaces");
+        assert!(!pool.contains(&first.hash));
+        assert!(pool.contains(&bumped.hash));
+        assert_eq!(pool.len(), 1);
+        assert_consistent(&pool);
+    }
+
+    #[test]
+    fn nonces_must_be_contiguous_and_per_sender_limit_holds() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 3);
+        let pool = fx.pool(MempoolConfig {
+            max_txs_per_sender: 2,
+            ..MempoolConfig::default()
+        });
+        assert!(matches!(
+            pool.add_transaction(transfer(&sk, sender, 4, 1, 10)),
+            Err(MempoolError::InvalidNonce {
+                expected: 3,
+                got: 4
+            })
+        ));
+        pool.add_transaction(transfer(&sk, sender, 3, 1, 10))
+            .unwrap();
+        pool.add_transaction(transfer(&sk, sender, 4, 1, 10))
+            .unwrap();
+        assert!(matches!(
+            pool.add_transaction(transfer(&sk, sender, 5, 1, 10)),
+            Err(MempoolError::TooManyFromSender { limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn full_pool_evicts_only_cheaper_transactions_and_keeps_indexes_consistent() {
+        let fx = Fixture::new();
+        let (sk_a, a) = fx.funded(1_000_000, 0);
+        let (sk_b, b) = fx.funded(1_000_000, 0);
+        let (sk_c, c) = fx.funded(1_000_000, 0);
+        let probe = transfer(&sk_a, a, 0, 1, 1);
+        let size = bincode::serialized_size(&probe).unwrap() as usize;
+        // Room for exactly two transactions.
+        let pool = fx.pool(MempoolConfig {
+            max_mempool_size: size * 2,
+            ..MempoolConfig::default()
+        });
+        let a0 = transfer(&sk_a, a, 0, 1, size as u64); // rate 1
+        let a1 = transfer(&sk_a, a, 1, 1, size as u64 * 5); // rate 5
+        pool.add_transaction(a0.clone()).unwrap();
+        pool.add_transaction(a1.clone()).unwrap();
+
+        // Same or lower rate than the cheapest entry: rejected, nothing lost.
+        let b0_cheap = transfer(&sk_b, b, 0, 1, size as u64);
+        assert!(matches!(
+            pool.add_transaction(b0_cheap),
+            Err(MempoolError::Full)
+        ));
+        assert_eq!(pool.len(), 2);
+
+        // Higher rate: evicts a0 *and* a1 (a1 would be unexecutable without
+        // a0), so the pool never holds a nonce gap.
+        let c0 = transfer(&sk_c, c, 0, 1, size as u64 * 3);
+        pool.add_transaction(c0.clone()).unwrap();
+        assert!(!pool.contains(&a0.hash));
+        assert!(!pool.contains(&a1.hash));
+        assert!(pool.contains(&c0.hash));
+        assert_consistent(&pool);
+        let stats = pool.stats();
+        assert_eq!(stats.tx_count, 1);
+        assert_eq!(stats.total_size, size);
+    }
+
+    #[test]
+    fn proposal_keeps_nonce_order_and_loses_nothing() {
+        let fx = Fixture::new();
+        let (sk_a, a) = fx.funded(1_000_000, 0);
+        let (sk_b, b) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig::default());
+        // a: nonce 0 cheap, nonce 1 expensive. b: one mid-priced tx.
+        let a0 = transfer(&sk_a, a, 0, 1, 10);
+        let a1 = transfer(&sk_a, a, 1, 1, 100_000);
+        let b0 = transfer(&sk_b, b, 0, 1, 5_000);
+        for tx in [&a0, &a1, &b0] {
+            pool.add_transaction(tx.clone()).unwrap();
+        }
+
+        let first = pool.get_next_transactions(2);
+        assert_eq!(first.len(), 2);
+        // a1 must never come before a0.
+        let pos = |h: Hash, v: &[Transaction]| v.iter().position(|t| t.hash == h);
+        if let (Some(p0), Some(p1)) = (pos(a0.hash, &first), pos(a1.hash, &first)) {
+            assert!(p0 < p1);
+        }
+        assert!(pos(a1.hash, &first).is_none() || pos(a0.hash, &first).is_some());
+        // Everything is still tracked; the rest is still proposable.
+        assert_eq!(pool.len(), 3);
+        let second = pool.get_next_transactions(10);
+        assert_eq!(first.len() + second.len(), 3);
+        assert!(
+            pool.get_next_transactions(10).is_empty(),
+            "in flight, not re-proposed"
+        );
+        assert_consistent(&pool);
+    }
+
+    #[test]
+    fn uncommitted_in_flight_transactions_are_requeued() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig {
+            in_flight_timeout: Duration::from_millis(0),
+            ..MempoolConfig::default()
+        });
+        let tx = transfer(&sk, sender, 0, 1, 10);
+        pool.add_transaction(tx.clone()).unwrap();
+        assert_eq!(pool.get_next_transactions(10).len(), 1);
+        // Timeout 0: the next proposal re-queues it.
+        assert_eq!(pool.get_next_transactions(10), vec![tx]);
+        assert_consistent(&pool);
+    }
+
+    #[test]
+    fn in_flight_nonce_cannot_be_replaced() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig::default());
+        pool.add_transaction(transfer(&sk, sender, 0, 1, 10))
+            .unwrap();
+        pool.get_next_transactions(10);
+        assert!(matches!(
+            pool.add_transaction(transfer(&sk, sender, 0, 2, 1_000)),
+            Err(MempoolError::NonceInFlight { nonce: 0 })
+        ));
+        // But the sender can keep going with the next nonce.
+        pool.add_transaction(transfer(&sk, sender, 1, 1, 10))
+            .unwrap();
+    }
+
+    #[test]
+    fn committed_transactions_and_stale_nonces_are_removed() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig::default());
+        let t0 = transfer(&sk, sender, 0, 1, 10);
+        let t1 = transfer(&sk, sender, 1, 1, 10);
+        let t2 = transfer(&sk, sender, 2, 1, 10);
+        for tx in [&t0, &t1, &t2] {
+            pool.add_transaction(tx.clone()).unwrap();
+        }
+        pool.get_next_transactions(1);
+        // Another validator committed a *different* tx with nonce 1.
+        let other1 = transfer(&sk, sender, 1, 99, 50);
+        let removed = pool.remove_committed_transactions(&[t0.clone(), other1]);
+        assert_eq!(removed, 2, "t0 committed, t1 made stale");
+        assert!(!pool.contains(&t0.hash));
+        assert!(!pool.contains(&t1.hash));
+        assert!(pool.contains(&t2.hash));
+        assert_consistent(&pool);
+        assert_eq!(
+            pool.stats().total_size,
+            bincode::serialized_size(&t2).unwrap() as usize
+        );
+    }
+
+    #[test]
+    fn concurrent_stats_and_removal_do_not_deadlock() {
+        let fx = Fixture::new();
+        let pool = Arc::new(fx.pool(MempoolConfig::default()));
+        let mut txs = Vec::new();
+        for _ in 0..50 {
+            let (sk, sender) = fx.funded(1_000_000, 0);
+            let tx = transfer(&sk, sender, 0, 1, 10);
+            pool.add_transaction(tx.clone()).unwrap();
+            txs.push(tx);
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let pool = pool.clone();
+            let done_tx = done_tx.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2_000 {
+                    let _ = pool.stats();
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        let writer = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                for tx in txs {
+                    pool.remove_committed(&[tx.hash]);
+                    let _ = pool.get_next_transactions(5);
+                }
+                done_tx.send(()).unwrap();
+            })
+        };
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("no deadlock between stats and removal");
+        }
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert!(pool.is_empty());
     }
 }
