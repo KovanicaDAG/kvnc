@@ -13,8 +13,10 @@ Make the committee epoch real. Today every committee is epoch 0
 - committee (and stake) changes that take effect only at that boundary;
 - votes and signatures from the previous epoch handled explicitly (accepted only
   where the old committee is still authoritative, rejected everywhere else);
-- **Consensus as the single source of the current epoch** for the node and for
-  Network (gossip edge validation).
+- **Consensus as the single source of the current epoch** for the node, Network
+  (gossip edge validation) and Execution (evidence verification). The types and
+  the pure context function live in `kvnc-types` (Foundation); Consensus fills
+  the schedule.
 
 Non-goals: staking/reward logic for choosing the next committee (Execution),
 state sync across epochs (`docs/STATE-SYNC.md`), key rotation inside an epoch.
@@ -54,48 +56,89 @@ replace it, and Network has its own copy of the key map.
   so `(round)` alone still identifies a slot and existing indices
   (`decided`, `prune_boundary`) need no epoch dimension.
 
-### 3.2 Source of truth
+### 3.2 Source of truth: `EpochSchedule` (kvnc-types) filled by Consensus
 
-`CommitteeInfo` becomes epoch-indexed inside Consensus:
+The schedule type and the context derivation are shared, pure and owned by
+Foundation in `kvnc-types`, so every crate computes the same context:
 
 ```text
-EpochSchedule { epochs: BTreeMap<Epoch, (start_round, CommitteeInfo)> }
-committee_for_round(r) -> &CommitteeInfo   // used for leader, quorum, keys
-current_epoch()        -> Epoch            // used for own votes/blocks
+// kvnc-types (Foundation)
+struct EpochEntry   { epoch: u64, start_round: Round, committee: Committee }
+struct EpochSchedule { entries: Vec<EpochEntry> }      // sorted, contiguous
+impl EpochSchedule {
+    fn epoch_for_round(&self, r: Round) -> Option<u64>;
+    fn committee_for_round(&self, r: Round) -> Option<&Committee>;
+}
+/// Pure: no I/O, no clock, no network input.
+fn signing_ctx_for_round(s: &EpochSchedule, chain_id: u64, r: Round)
+    -> Option<SigningContext>;     // None = round outside the schedule
 ```
 
-- The node and Network never compute the epoch themselves; they subscribe to an
-  `EpochChanged { epoch, start_round, committee }` event emitted by the engine
-  after the closing commit has been durably marked
-  (`mark_decided_and_commit_leader`), so restarts replay the same event from
-  durable state.
-- `vote_signing_ctx()` changes from "local committee epoch" to
-  "epoch of `committee_for_round(vote.leader_round)`", still computed only from
-  local state (never from the message), satisfying the v1 rule.
+- **Consensus fills it.** The engine appends `EpochEntry(e+1)` when it commits
+  the closing sub-DAG of epoch `e`. Nothing else writes the schedule.
+- **Durable and part of committed state per height.** The schedule change is
+  written in the **same redb transaction** as the commit closing the epoch
+  (`mark_decided_and_commit_leader` extended, as in #14: both or neither). So
+  for every committed height `h` there is exactly one schedule `S(h)`, and a
+  restart or replay reads the same `S(h)`.
+- **Readers:**
+  - **Consensus** (votes, blocks, quorum): its in-memory copy of the latest
+    committed schedule.
+  - **Gossip edge (Network)**: the node's live `Arc<RwLock<EpochSchedule>>`,
+    updated by the node right after Consensus persists a change (event
+    `EpochChanged { epoch, start_round }`). This edge is a best-effort filter
+    only; Consensus re-verifies.
+  - **Execution** (e.g. `DoubleSignProof` evidence): reads `S(h)` for the
+    **height of the sub-DAG being executed**, never the live copy. That keeps
+    execution deterministic across nodes at different live positions and on
+    replay.
+- `vote_signing_ctx()` and block verification become
+  `signing_ctx_for_round(schedule, local chain_id, round)`. Only local state
+  is used, never the message, so the v1 rule still holds.
 
-### 3.3 Votes/signatures across the boundary
+### 3.3 Context per round: blocks and votes alike
 
-`Vote` carries no epoch, so the verifier derives it: `epoch = epoch_of(leader_round)`.
+For a round `r`, **blocks and votes use the same context**:
+`ctx(r) = signing_ctx_for_round(S, chain_id, r)`. For a vote, `r` is
+`vote.leader_round`; for a block, `r` is `block.round`. `Vote` carries no
+epoch, so the epoch is derived from the round. A signature made for the wrong
+epoch never verifies, because the epoch is in the signed bytes. That is the
+replay protection across epochs.
+
+#### Votes across the boundary
 
 | Vote for leader round in | Accepted? | Key set / ctx |
 |---|---|---|
-| current epoch `e` | yes | `C(e)`, ctx epoch `e` |
-| previous epoch `e-1`, leader round `<= end_round(e-1)` and not yet decided locally | yes (late votes can still finish the closing wave) | `C(e-1)`, ctx epoch `e-1` |
+| current epoch `e` | yes | `C(e)`, ctx(r) |
+| previous epoch `e-1`, round `<= end_round(e-1)`, leader not yet decided locally | yes (late votes can still finish the closing wave) | `C(e-1)`, ctx(r) |
 | `e-1` but already decided / below `last_decided_round` | dropped (no effect, no penalty) | — |
 | `<= e-2` | rejected | — |
-| future epoch (start not yet known locally) | buffered, bounded, re-verified when `EpochChanged` arrives; else dropped | — |
+| outside the schedule (future epoch not yet known locally) | gossip: **Ignore** (no peer penalty); Consensus: bounded buffer, re-checked on `EpochChanged`, else dropped | — |
 
-A vote signed with the wrong epoch for its round never verifies, because the
-epoch is in the signed bytes. That is the intended replay protection: a vote for
-round `r` cannot be replayed into another epoch.
+#### Blocks across the boundary
 
-Blocks: block signatures today sign the digest (`block_manager.rs` `crypto::sign(&signing_key, digest)`);
-`signing_hash(&ctx)` for blocks commits to `chain_id`. Block author keys are taken
-from `committee_for_round(block.round)`. A block from an author not in that
-committee is rejected by `validate_block` exactly as an unknown authority today.
+| Block round `r` in | Accepted? | Key set / ctx |
+|---|---|---|
+| current epoch `e` | yes | `C(e)`, ctx(r) |
+| previous epoch `e-1` (block arrives after the boundary), `r >= prune_boundary` | yes, stored as DAG history (it can be a parent or part of the closing wave's history); it is never a leader for `e` | `C(e-1)`, ctx(r) |
+| `e-1` but `r < prune_boundary` | dropped (already pruned; not needed) | — |
+| `<= e-2` and above the prune boundary | accepted only as history under `C(epoch_of(r))` while that epoch is still in the schedule; otherwise dropped | ctx(r) |
+| outside the schedule (future epoch) | gossip: **Ignore**; Consensus: held in the pending-block buffer, re-validated on `EpochChanged`, else dropped | — |
 
-Transactions: unchanged (epoch not in tx hash), so mempool content survives a
-rotation.
+`validate_block` stays bounded (#4). It checks the author against
+`committee_for_round(block.round)` and parent rounds as today. A parent from
+an earlier epoch is accepted if it is stored or below the prune boundary.
+
+#### Transactions and evidence in execution
+
+- Transaction ctx stays `chain_id` only (epoch not in the tx hash), so mempool
+  content survives a rotation.
+- Evidence (e.g. `DoubleSignProof`) is checked with `ctx(r)` from `S(h)`, where
+  `h` is the height of the executing sub-DAG. If `r` is **outside** `S(h)`, the
+  transaction **fails deterministically**: no state effect from the proof, but
+  the **fee is charged and the nonce is incremented** (same as any other failed
+  transaction). So a node can't make execution diverge by gossiping
+  out-of-schedule evidence.
 
 ### 3.4 Quorum across the boundary
 
@@ -106,35 +149,50 @@ wave belong to the leader's epoch.
 
 ## 4. Interface changes per crate
 
-- **kvnc-types (Foundation)**: `EPOCH_LENGTH_ROUNDS` constant; optional
-  `EpochChange` type for the event payload. No change to `Vote` bytes or v1 format.
-- **kvnc-consensus (Consensus)**: `EpochSchedule`; `ConsensusEngine` stores it
-  instead of a single `committee`; `committee_for_round`, `current_epoch`;
-  `vote_signing_ctx(round)`; epoch event channel; `LeaderSchedule` per epoch;
-  committer quorum lookup per round; remove the `TODO(owner)` at
-  `engine.rs:240` by deriving epoch from the schedule.
-- **kvnc-dag (Consensus)**: `BlockManager` key map becomes per-epoch
-  (`authority_keys_for_round`); `select_parents` filters by the committee of the
-  parent round; persist the epoch schedule in the same redb transaction as the
-  closing commit (new table `DAG_EPOCHS`) so it survives restart.
-- **kvnc-network (Network)**: `AuthorityKeys` + `VoteVerifier` take the epoch
-  from the Consensus event; verify `vote` against `(C(epoch_of(round)), ctx epoch)`;
-  keep `C(e-1)` until `end_round(e-1)` is decided.
-- **kvnc-node (Network)**: wire the event; stop constructing ctx from a static
-  committee (`main.rs:447`); build initial schedule from genesis + durable store.
-- **kvnc-staking / execution (Execution)**: produce `C(e+1)` deterministically
-  from committed state at least one wave before the boundary.
-- **kvnc-mempool (Network)**: none (tx ctx has no epoch); remove the
-  `TODO(owner)` epoch note only.
+- **kvnc-types (Foundation)**: `EpochEntry`, `EpochSchedule` (with
+  `epoch_for_round`, `committee_for_round`) and the pure
+  `signing_ctx_for_round(schedule, chain_id, round) -> Option<SigningContext>`;
+  `EPOCH_LENGTH_ROUNDS`; `EpochChanged` event type. No change to `Vote` bytes
+  or the v1 format.
+- **kvnc-consensus (Consensus)**: fills the schedule; the engine holds the
+  latest committed `EpochSchedule` instead of one `CommitteeInfo`; vote and
+  block ctx via `signing_ctx_for_round`; emits `EpochChanged` after the
+  durable commit; per-epoch leader schedule; committer quorum per round;
+  removes the `TODO(owner)` at `engine.rs:240`; pending buffers for
+  out-of-schedule votes/blocks.
+- **kvnc-dag (Consensus)**: new redb table `DAG_EPOCHS` (height → schedule
+  change). `mark_decided_and_commit_leader` gains an optional
+  `schedule_change` that is written in the **same** transaction. A reader
+  `schedule_at(height)` returns `S(h)`. The `BlockManager` key map and
+  `select_parents` become per-round via `committee_for_round`.
+- **kvnc-network (Network)**: `AuthorityKeys` / `VoteVerifier` read the node's
+  live `Arc<RwLock<EpochSchedule>>` and verify with `ctx(r)`. A round outside
+  the schedule gives `Ignore` (no penalty, no relay). It keeps `C(e-1)` until
+  `end_round(e-1)` is decided.
+- **kvnc-node (Network)**: owns the live `Arc<RwLock<EpochSchedule>>` (built
+  from genesis plus `DAG_EPOCHS` on start), updates it on `EpochChanged`, and
+  stops building ctx from a static committee (`main.rs:447`).
+- **kvnc-execution / staking (Execution)**: produce `C(e+1)` from committed
+  state at least one wave before the boundary. `DoubleSignProof` (and any
+  signed-evidence tx) verifies with `signing_ctx_for_round(S(h), ...)` for
+  the sub-DAG height. Outside the schedule it fails deterministically, but the
+  fee and nonce are still charged.
+- **kvnc-mempool (Network)**: none (tx ctx has no epoch); only remove the
+  `TODO(owner)` epoch note.
 
 ## 5. Migration
 
-1. Ship `EpochSchedule` with a single entry `(0, start_round 0, genesis committee)`.
-   Behaviour is identical to today (all signatures still epoch 0). Tests stay green.
-2. Add durable `DAG_EPOCHS` with `#[serde(default)]`-style back-compat: a DB without
-   the table is read as epoch 0 only.
-3. Wire Network to the epoch event (still only epoch 0).
-4. Enable rotation behind a genesis/config flag with `EPOCH_LENGTH_ROUNDS`; testnet first.
+1. Foundation lands `EpochSchedule` and `signing_ctx_for_round` in kvnc-types.
+   It has a single entry `(epoch 0, start_round 0, genesis committee)`, and
+   `signing_ctx_for_round` returns today's ctx for every round, so behaviour
+   is identical.
+2. Consensus switches vote and block ctx to `signing_ctx_for_round` and adds
+   `DAG_EPOCHS`, written atomically with the commit. A DB without the table is
+   read as the single epoch-0 entry.
+3. Network wires the live `Arc<RwLock<EpochSchedule>>` into the gossip edge
+   (Ignore outside the schedule). Execution reads `S(h)` for evidence.
+4. Enable rotation behind a genesis/config flag (`EPOCH_LENGTH_ROUNDS`),
+   testnet first.
 5. Only then let Execution feed real committee changes.
 
 No change to the v1 byte format, so no new signature version is needed.
@@ -142,28 +200,55 @@ No change to the v1 byte format, so no new signature version is needed.
 ## 6. Risks
 
 - **Non-deterministic boundary**: if `C(e+1)` depends on anything not final
-  before the closing commit, nodes diverge. Mitigation: one-wave lag rule.
-- **Liveness at the boundary**: old committee must finish the closing wave; if
-  `C(e-1)` keys are dropped too early, the last wave stalls. Mitigation: keep
-  `C(e-1)` until `end_round(e-1)` decided.
-- **Crash between commit and epoch persistence**: must be one redb transaction
-  (same lesson as #14 atomic commit).
-- **Leader schedule churn**: `leader_schedule` overrides keyed by round must not
-  leak across epochs.
+  before the closing commit, nodes diverge. Mitigation: the one-wave lag rule.
+- **Execution reading the live schedule** instead of `S(h)` would make
+  evidence results depend on node timing. Mitigation: the API only exposes
+  `schedule_at(height)` to execution.
+- **Liveness at the boundary**: the old committee must finish the closing
+  wave. If `C(e-1)` keys are dropped too early, the last wave stalls.
+  Mitigation: keep `C(e-1)` until `end_round(e-1)` is decided.
+- **Crash between commit and schedule write**: avoided by the single redb
+  transaction (same lesson as #14). A test covers it.
+- **Live copy lagging** (`Arc<RwLock<EpochSchedule>>` updated after the
+  event): the gossip edge may Ignore valid new-epoch messages briefly. That
+  costs latency, not safety, because Consensus re-verifies.
+- **Late blocks from `e-1`** accepted as history could be used to grow the
+  DAG. Bounded by the prune boundary and `MAX_PARENT_ROUND_GAP`.
+- **Leader schedule churn**: `leader_schedule` overrides keyed by round must
+  not leak across epochs.
 - **Pruning**: `prune_waves_before` must not remove the closing wave before the
-  next epoch's first commit (recovery needs it).
-- **Network/Consensus disagreement** while the event is in flight: Network may
-  briefly reject valid new-epoch votes; buffer is bounded so this costs latency,
-  not safety.
+  next epoch's first commit (recovery needs it). `DAG_EPOCHS` is never pruned.
 
 ## 7. Test plan
 
-- Unit (consensus): `committee_for_round` across a boundary; `vote_signing_ctx`
-  derives epoch from round; vote for `e-1` accepted only while undecided; `e-2`
-  rejected; vote with correct key but wrong epoch fails (extends `sig_v1_*`).
-- Unit (dag): durable `DAG_EPOCHS` survives reopen; closing commit and epoch row
-  are atomic (fault injection like `dag_store::fault`).
-- Property: random epoch lengths, no commit uses quorum of the wrong committee.
-- Integration (node, Network-owned): 4 nodes, rotate to a different committee at
-  round N, liveness continues, same committed leaders on all nodes
-  (`sustained_liveness_integration` variant), restart in the middle of a boundary.
+- **Unit (kvnc-types, Foundation):** `signing_ctx_for_round` is pure and total
+  over the schedule. It returns `None` outside the schedule, and boundary
+  rounds map to the right epoch.
+- **Unit (consensus):**
+  - Vote and block for the same round use the identical ctx.
+  - Vote for `e-1` is accepted only while undecided; `e-2` is rejected.
+  - A vote or block with the correct key but the wrong epoch fails (extends
+    the `sig_v1_*` tests).
+  - Out-of-schedule votes and blocks are buffered, then accepted on
+    `EpochChanged`.
+- **Unit (consensus, blocks table):**
+  - A late `e-1` block above the prune boundary is stored as history and is
+    never a leader in `e`.
+  - A late block below the prune boundary is dropped.
+- **Unit (dag):**
+  - The closing commit and the `DAG_EPOCHS` row are atomic (fault injection
+    as in `dag_store::fault`; reopen gives both or neither).
+  - `schedule_at(h)` survives a reopen.
+- **Execution (Execution-owned):**
+  - `DoubleSignProof` verifies against `S(h)`.
+  - A proof for a round outside `S(h)` fails deterministically and still
+    charges the fee and increments the nonce. Replaying it gives the same
+    result.
+- **Network (Network-owned):** the gossip edge gives Ignore (no penalty)
+  outside the live schedule, and Accept after the live schedule updates.
+- **Property:** random epoch lengths; no commit uses the quorum of the wrong
+  committee; the same `S(h)` on every node for every height.
+- **Integration (node, Network-owned):**
+  - 4 nodes rotate to a different committee at round N; liveness continues
+    with the same committed leaders on all nodes.
+  - A restart in the middle of the boundary works.
