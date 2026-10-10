@@ -32,7 +32,7 @@
 mod common;
 
 use common::{block_ref, committee, genesis, make_block, make_engine, MockBlockManager, MockDag};
-use kvnc_consensus::{ConsensusConfig, ConsensusEngine};
+use kvnc_consensus::{ConsensusConfig, ConsensusEngine, ConsensusError, VoteRejection};
 use kvnc_types::block::StatementBlock;
 use kvnc_types::hash::Hash;
 use kvnc_types::{AuthorityIndex, CommittedSubDag, Round};
@@ -112,10 +112,16 @@ fn deliver(nodes: &mut [Node], targets: &[usize], wire: &Wire) {
                 leader_round,
                 voter,
                 leader_hash,
-            } => nodes[target]
-                .engine
-                .process_vote(*leader_round, *voter, *leader_hash)
-                .expect("vote accepted"),
+            } => match nodes[target].engine.process_vote(&common::signed_vote(
+                *leader_round,
+                *voter,
+                *leader_hash,
+            )) {
+                // Healing re-delivers votes a node already holds; the consensus
+                // boundary rejects those as duplicates and counts them once.
+                Ok(()) | Err(ConsensusError::VoteRejected(VoteRejection::Duplicate { .. })) => {}
+                Err(e) => panic!("vote rejected: {e:?}"),
+            },
         }
     }
 }

@@ -25,6 +25,9 @@ use serde_json::{json, Value};
 /// Default number of rounds returned by `kvnc_getLeaderSchedule` when the
 /// caller does not specify a count.
 const DEFAULT_LEADER_SCHEDULE_LEN: u64 = 16;
+/// Largest `count` accepted by `kvnc_getLeaderSchedule`; larger requests
+/// would let one call allocate and serialize an arbitrarily long schedule.
+pub const MAX_LEADER_SCHEDULE_LEN: u64 = 1024;
 
 /// Default suggested fee rate (atoms per byte) when the mempool is empty.
 const DEFAULT_FEE_RATE: u64 = 1;
@@ -534,6 +537,11 @@ pub async fn handle_get_leader_schedule(params: Value, state: RpcState) -> Resul
         Some(value) => parse_u64(value, "count")?,
         None => DEFAULT_LEADER_SCHEDULE_LEN,
     };
+    if count > MAX_LEADER_SCHEDULE_LEN {
+        return Err(RpcError::InvalidParams(format!(
+            "count: at most {MAX_LEADER_SCHEDULE_LEN}, got {count}"
+        )));
+    }
 
     let start = {
         let txn = state.storage.begin_read().map_err(internal)?;
@@ -738,6 +746,17 @@ mod tests {
             schedule.as_array().unwrap().len(),
             DEFAULT_LEADER_SCHEDULE_LEN as usize
         );
+        let max = handle_get_leader_schedule(json!([MAX_LEADER_SCHEDULE_LEN]), state.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            max.as_array().unwrap().len(),
+            MAX_LEADER_SCHEDULE_LEN as usize
+        );
+        assert!(matches!(
+            handle_get_leader_schedule(json!([MAX_LEADER_SCHEDULE_LEN + 1]), state.clone()).await,
+            Err(RpcError::InvalidParams(_))
+        ));
 
         let validators = handle_get_validators(Value::Null, state.clone())
             .await

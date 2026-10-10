@@ -513,7 +513,9 @@ async fn cmd_stake(client: &RpcClient, args: AmountArgs, json_output: bool) -> R
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Stake { amount: args.amount },
+        TransactionKind::Stake {
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -540,7 +542,9 @@ async fn cmd_unstake(client: &RpcClient, args: AmountArgs, json_output: bool) ->
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Unstake { amount: args.amount },
+        TransactionKind::Unstake {
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -568,7 +572,10 @@ async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool)
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
-        TransactionKind::Delegate { validator, amount: args.amount },
+        TransactionKind::Delegate {
+            validator,
+            amount: args.amount,
+        },
         args.fee,
     )
     .await?;
@@ -593,8 +600,15 @@ async fn cmd_delegate(client: &RpcClient, args: DelegateArgs, json_output: bool)
     Ok(())
 }
 
-async fn cmd_claim_rewards(client: &RpcClient, args: ClaimRewardsArgs, json_output: bool) -> Result<()> {
-    let validator = args.validator.map(|v| v.parse::<kvnc_types::Address>()).transpose()?;
+async fn cmd_claim_rewards(
+    client: &RpcClient,
+    args: ClaimRewardsArgs,
+    json_output: bool,
+) -> Result<()> {
+    let validator = args
+        .validator
+        .map(|v| v.parse::<kvnc_types::Address>())
+        .transpose()?;
     let (tx_hash, sender, nonce) = sign_and_submit_self(
         client,
         &args.keystore,
@@ -698,7 +712,7 @@ fn cmd_migrate(args: MigrateArgs, json_output: bool) -> Result<()> {
 /// `kvnc address --key-file <FILE>` — offline derivation of the canonical
 /// address and public key from a raw 32-byte hex seed. Prints only public
 /// identity material; the seed is never echoed.
-/// 
+///
 /// Security: requires `--allow-raw-hex` flag and key file must have 0600 permissions.
 fn cmd_address(args: AddressArgs, json_output: bool) -> Result<()> {
     if !args.allow_raw_hex {
@@ -861,7 +875,14 @@ mod wallet_cli_security_tests {
         )
         .is_ok());
         std::fs::write(&key_path, "00").unwrap();
-        assert!(cmd_address(AddressArgs { key_file: key_path, allow_raw_hex: true }, false).is_err());
+        assert!(cmd_address(
+            AddressArgs {
+                key_file: key_path,
+                allow_raw_hex: true
+            },
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -917,7 +938,14 @@ mod wallet_cli_security_tests {
     #[test]
     fn stake_and_unstake_accept_keystore_and_fee() {
         let cli = Cli::try_parse_from([
-            "kvnc", "stake", "--amount", "42", "--fee", "3", "--keystore", "wallet.json",
+            "kvnc",
+            "stake",
+            "--amount",
+            "42",
+            "--fee",
+            "3",
+            "--keystore",
+            "wallet.json",
         ])
         .unwrap();
         match cli.command {
