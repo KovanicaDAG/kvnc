@@ -351,7 +351,21 @@ pub async fn handle_get_transaction_by_hash(
         .get_block_for_transaction(&txn, &hash)
         .map_err(internal)?
     else {
-        return Ok(Value::Null);
+        // Not in a blue block yet: a pooled tx (fresh, or returned from a
+        // non-blue block, #13) is reported as pending, without block context.
+        return Ok(match state.mempool.get(&hash) {
+            Some(tx) => {
+                let mut value = transaction_to_json(&tx);
+                if let Value::Object(ref mut map) = value {
+                    map.insert("blockHash".into(), Value::Null);
+                    map.insert("blockNumber".into(), Value::Null);
+                    map.insert("transactionIndex".into(), Value::Null);
+                    map.insert("status".into(), json!("pending"));
+                }
+                value
+            }
+            None => Value::Null,
+        });
     };
 
     let block = state
@@ -927,5 +941,66 @@ mod tests {
             gossip_rx.try_recv().is_err(),
             "duplicate must not be re-gossiped"
         );
+    }
+
+    #[tokio::test]
+    async fn returned_transaction_is_pending_without_receipt() {
+        use kvnc_storage::state_store::Account;
+        use kvnc_types::crypto::Signature;
+
+        let (_dir, storage) = open_storage();
+        let state = test_state(storage.clone());
+        let (sk, pk) = kvnc_crypto::generate_keypair();
+        let sender = Address::from_public_key(&pk);
+        let txn = storage.begin_write().unwrap();
+        storage
+            .state()
+            .set_account(
+                &txn,
+                &sender,
+                &Account {
+                    balance: 1_000_000,
+                    nonce: 0,
+                    code_hash: [0; 32],
+                    code: Vec::new(),
+                },
+            )
+            .unwrap();
+        txn.commit().unwrap();
+        let mut tx = Transaction {
+            sender,
+            nonce: 0,
+            kind: TransactionKind::Transfer {
+                to: Address([3u8; 32]),
+                amount: 1,
+            },
+            fee: 10_000,
+            signature: Signature([0; 64]),
+            hash: Hash::zero(),
+        };
+        let h = tx.signing_hash(&state.mempool.signing_context());
+        tx.signature = kvnc_crypto::sign(&sk, h.as_ref());
+        tx.hash = h;
+
+        // Returned from a non-blue block (#13).
+        let report = state.mempool.reinsert_returned(vec![tx.clone()]);
+        assert_eq!(report[0].outcome, kvnc_mempool::ReinsertOutcome::Accepted);
+
+        let hash = json!([to_hex(&tx.hash.0)]);
+        let receipt = handle_get_transaction_receipt(hash.clone(), state.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt, Value::Null, "no receipt until in a blue block");
+        let by_hash = handle_get_transaction_by_hash(hash, state.clone())
+            .await
+            .unwrap();
+        assert_eq!(by_hash["status"], json!("pending"));
+        assert_eq!(by_hash["blockHash"], Value::Null);
+
+        // Unknown hash stays null.
+        let unknown = handle_get_transaction_by_hash(json!([hex32(0x44)]), state)
+            .await
+            .unwrap();
+        assert_eq!(unknown, Value::Null);
     }
 }

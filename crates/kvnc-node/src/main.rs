@@ -20,6 +20,7 @@
 #![allow(clippy::large_enum_variant)]
 
 mod config;
+mod non_blue;
 mod orphans;
 
 use std::future::Future;
@@ -674,7 +675,14 @@ where
         exec_rx,
         state_storage.clone(),
         events.clone(),
-        Some(mempool.clone()),
+        Some(non_blue::ExecPool {
+            mempool: mempool.clone(),
+            // #13 adapter: swap `LocalNonBlue` for Consensus's helper (non_blue.rs).
+            returned: Some(non_blue::ReturnedTxs {
+                dag: dag_store.clone(),
+                source: Arc::new(non_blue::LocalNonBlue),
+            }),
+        }),
         signing_ctx,
         shutdown_rx.clone(),
         node_health.clone(),
@@ -1182,7 +1190,7 @@ async fn run_execution(
     mut subdags: mpsc::UnboundedReceiver<kvnc_consensus::CommittedSubDag>,
     state_storage: Arc<Storage>,
     events: EventBus,
-    mempool: Option<Arc<Mempool>>,
+    pool: Option<non_blue::ExecPool>,
     signing_ctx: kvnc_types::SigningContext,
     mut shutdown: watch::Receiver<bool>,
     health: NodeHealth,
@@ -1208,7 +1216,7 @@ async fn run_execution(
                             txs = result.txs_applied,
                             "executed committed sub-DAG"
                         );
-                        if let Some(mempool) = &mempool {
+                        if let Some(non_blue::ExecPool { mempool, returned }) = &pool {
                             let committed: Vec<_> = subdag
                                 .blocks
                                 .iter()
@@ -1216,6 +1224,11 @@ async fn run_execution(
                                 .collect();
                             let removed = mempool.remove_committed_transactions(&committed);
                             debug!(removed, "pruned committed transactions from mempool");
+                            // #13: state for this sub-DAG is durable now; hand
+                            // the red blocks' transactions back to the pool.
+                            if let Some(returned) = &returned {
+                                returned.reinsert(mempool, &subdag);
+                            }
                         }
                         events.publish_committed_leader(&subdag);
                         health.execution_progress(subdag.leader_round);
@@ -2421,6 +2434,85 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         execution.await.unwrap();
+    }
+
+    /// Adapter double: returns a fixed list, whatever the sub-DAG.
+    struct FixedNonBlue(Vec<Transaction>);
+    impl non_blue::NonBlueSource for FixedNonBlue {
+        fn non_blue_transactions(
+            &self,
+            _dag: &DagStore,
+            _subdag: &kvnc_consensus::CommittedSubDag,
+        ) -> Vec<Transaction> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_hands_non_blue_transactions_to_mempool_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_storage = Arc::new(Storage::new(dir.path().join("state.redb")).unwrap());
+        let dag =
+            Arc::new(DagStore::new(Storage::new(dir.path().join("dag.redb")).unwrap()).unwrap());
+        let validator_address = Address([0x22; 32]);
+        let mut staking = StakingState::new();
+        staking
+            .join_validator(
+                validator_address,
+                MIN_VALIDATOR_STAKE,
+                0,
+                Some(Address([0xa1; 32])),
+                Some(PublicKey([0x22; 32])),
+            )
+            .unwrap();
+        let txn = state_storage.begin_write().unwrap();
+        state_storage
+            .state()
+            .save_staking_state(&txn, &staking)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let returned_tx = non_blue::test_support::funded_tx(&state_storage, 0);
+        let leader = non_blue::test_support::block(0, 1, Vec::new());
+        let subdag = kvnc_consensus::CommittedSubDag {
+            blocks: vec![leader.clone()],
+            leader,
+            leader_round: 1,
+            leader_author: 0,
+            non_blue: Vec::new(),
+        };
+        let mempool = Arc::new(Mempool::new(
+            MempoolConfig::default(),
+            state_storage.clone(),
+            non_blue::test_support::CTX,
+        ));
+        let (exec_tx, exec_rx) = mpsc::unbounded_channel();
+        exec_tx.send(subdag).unwrap();
+        drop(exec_tx);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let health = NodeHealth::new();
+        run_execution(
+            exec_rx,
+            state_storage.clone(),
+            EventBus::new(),
+            Some(non_blue::ExecPool {
+                mempool: mempool.clone(),
+                returned: Some(non_blue::ReturnedTxs {
+                    dag,
+                    source: Arc::new(FixedNonBlue(vec![returned_tx.clone()])),
+                }),
+            }),
+            non_blue::test_support::CTX,
+            shutdown_rx,
+            health.clone(),
+        )
+        .await;
+        assert_ne!(health.execution_state(), kvnc_rpc::ComponentState::Failed);
+        assert!(
+            mempool.contains(&returned_tx.hash),
+            "returned tx back in the pool"
+        );
+        assert!(mempool.get_pending_propagation().is_empty(), "no gossip");
     }
 
     #[tokio::test]

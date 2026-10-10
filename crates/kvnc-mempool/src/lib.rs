@@ -65,6 +65,9 @@ struct Entry {
     fee_rate: u64,
     /// `Some(t)` once handed out for a block proposal at `t`.
     in_flight_since: Option<Instant>,
+    /// `false` for transactions returned from non-blue blocks: they were
+    /// already gossiped once and must not be re-broadcast from this pool.
+    gossip: bool,
 }
 
 /// Everything mutable about the pool, guarded by one lock.
@@ -107,7 +110,9 @@ impl PoolState {
             .or_default()
             .insert(entry.tx.nonce, hash);
         self.total_size += entry.size;
-        self.pending_propagation.push_back(hash);
+        if entry.gossip {
+            self.pending_propagation.push_back(hash);
+        }
         while self.pending_propagation.len() > MAX_PENDING_PROPAGATION {
             self.pending_propagation.pop_front();
         }
@@ -258,6 +263,83 @@ impl Mempool {
 
     /// Add a transaction to the mempool. See the module docs for the rules.
     pub fn add_transaction(&self, tx: Transaction) -> Result<(), MempoolError> {
+        self.admit(tx, true)
+    }
+
+    /// Re-admit transactions from non-blue (red) blocks of a committed
+    /// sub-DAG (#13). Every transaction goes through the full v1 admission
+    /// path of [`Mempool::add_transaction`] (size, fee, hash binding,
+    /// signature, nonce, balance, per-sender and total pool limits), but is
+    /// never queued for gossip or re-broadcast, and the caller must not
+    /// penalise any peer for a rejection (there is no peer here).
+    ///
+    /// Transactions are processed in `(sender, nonce)` order so a returned
+    /// nonce chain re-enters gap-free. One report entry per input, in input
+    /// order.
+    pub fn reinsert_returned(&self, txs: Vec<Transaction>) -> Vec<ReinsertReport> {
+        let mut order: Vec<usize> = (0..txs.len()).collect();
+        order.sort_by_key(|&i| (txs[i].sender.0, txs[i].nonce));
+        let mut outcomes: Vec<Option<ReinsertOutcome>> = vec![None; txs.len()];
+        for i in order {
+            let tx = txs[i].clone();
+            let outcome = if self.is_committed(&tx) {
+                ReinsertOutcome::AlreadyCommitted
+            } else {
+                match self.admit(tx, false) {
+                    Ok(()) => ReinsertOutcome::Accepted,
+                    Err(MempoolError::AlreadyExists) => ReinsertOutcome::Duplicate,
+                    // Nonce consumed by a committed tx (this or a competing one).
+                    Err(MempoolError::InvalidNonce { expected, got })
+                        if got < expected && self.account_nonce(&txs[i]) > got =>
+                    {
+                        ReinsertOutcome::AlreadyCommitted
+                    }
+                    Err(e) => ReinsertOutcome::Invalid(e.to_string()),
+                }
+            };
+            outcomes[i] = Some(outcome);
+        }
+        txs.iter()
+            .zip(outcomes)
+            .map(|(tx, outcome)| ReinsertReport {
+                hash: tx.hash,
+                outcome: outcome.unwrap_or_else(|| ReinsertOutcome::Invalid("unprocessed".into())),
+            })
+            .collect()
+    }
+
+    /// Whether `tx` (by hash) is already in a committed block, or its nonce
+    /// is below the committed account nonce.
+    fn is_committed(&self, tx: &Transaction) -> bool {
+        let Ok(txn) = self.storage.begin_read() else {
+            return false;
+        };
+        if matches!(
+            self.storage
+                .blocks()
+                .get_block_for_transaction(&txn, &tx.hash),
+            Ok(Some(_))
+        ) {
+            return true;
+        }
+        self.account_nonce(tx) > tx.nonce
+    }
+
+    fn account_nonce(&self, tx: &Transaction) -> u64 {
+        self.storage
+            .begin_read()
+            .ok()
+            .and_then(|txn| {
+                self.storage
+                    .state()
+                    .get_account_or_default(&txn, &tx.sender)
+                    .ok()
+            })
+            .map_or(0, |a| a.nonce)
+    }
+
+    /// Shared admission path; `gossip == false` keeps the tx local.
+    fn admit(&self, tx: Transaction, gossip: bool) -> Result<(), MempoolError> {
         // --- 1. cheap stateless checks ---------------------------------
         let size = bincode::serialized_size(&tx)? as usize;
         if size > self.config.max_tx_size {
@@ -406,8 +488,9 @@ impl Mempool {
             size,
             fee_rate,
             in_flight_since: None,
+            gossip,
         });
-        info!(%hash, fee_rate, size, "added transaction to mempool");
+        info!(%hash, fee_rate, size, gossip, "added transaction to mempool");
         Ok(())
     }
 
@@ -550,7 +633,7 @@ impl Mempool {
             .lock()
             .by_hash
             .values()
-            .filter(|e| e.in_flight_since.is_none())
+            .filter(|e| e.in_flight_since.is_none() && e.gossip)
             .map(|e| e.tx.clone())
             .collect()
     }
@@ -622,6 +705,26 @@ pub struct MempoolStats {
     pub tx_count: usize,
     pub total_size: usize,
     pub fee_rates: Vec<(u64, usize)>, // (fee_rate, count)
+}
+
+/// Per-transaction result of [`Mempool::reinsert_returned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReinsertOutcome {
+    /// Admitted back into the pool (local only, not gossiped).
+    Accepted,
+    /// Already pending in the pool.
+    Duplicate,
+    /// Already in a committed block, or its nonce was consumed.
+    AlreadyCommitted,
+    /// Failed validation or a pool limit; the reason is the mempool error.
+    Invalid(String),
+}
+
+/// Report entry for one returned transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReinsertReport {
+    pub hash: Hash,
+    pub outcome: ReinsertOutcome,
 }
 
 /// Errors that can occur in mempool operations.
@@ -1364,5 +1467,106 @@ mod tests {
         reader.join().unwrap();
         writer.join().unwrap();
         assert!(pool.is_empty());
+    }
+
+    // --- #13 reinsert_returned ----------------------------------------
+
+    #[test]
+    fn reinsert_reports_each_case_in_input_order() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 3);
+        let pool = fx.pool(MempoolConfig::default());
+        let pooled = transfer(&sk, sender, 3, 1, 1_000);
+        pool.add_transaction(pooled.clone()).unwrap();
+        let next = transfer(&sk, sender, 4, 1, 1_000);
+        let committed = transfer(&sk, sender, 2, 1, 1_000); // nonce < account nonce
+        let mut forged = transfer(&sk, sender, 5, 1, 1_000);
+        forged.signature = kvnc_types::Signature([9; 64]);
+
+        let report = pool.reinsert_returned(vec![
+            forged.clone(),
+            next.clone(),
+            pooled.clone(),
+            committed.clone(),
+        ]);
+        let outcomes: Vec<_> = report.iter().map(|r| r.outcome.clone()).collect();
+        assert_eq!(report[0].hash, forged.hash);
+        assert!(matches!(&outcomes[0], ReinsertOutcome::Invalid(r) if r.contains("signature")));
+        assert_eq!(outcomes[1], ReinsertOutcome::Accepted);
+        assert_eq!(outcomes[2], ReinsertOutcome::Duplicate);
+        assert_eq!(outcomes[3], ReinsertOutcome::AlreadyCommitted);
+        assert!(pool.contains(&next.hash));
+    }
+
+    #[test]
+    fn reinsert_orders_nonce_chain_and_never_gossips() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig {
+            rebroadcast_interval: Duration::ZERO,
+            ..MempoolConfig::default()
+        });
+        // Reversed nonce order on input: still all accepted.
+        let txs: Vec<_> = (0..3)
+            .rev()
+            .map(|n| transfer(&sk, sender, n, 1, 1_000))
+            .collect();
+        let report = pool.reinsert_returned(txs);
+        assert!(
+            report
+                .iter()
+                .all(|r| r.outcome == ReinsertOutcome::Accepted),
+            "{report:?}"
+        );
+        assert_eq!(pool.len(), 3);
+        assert!(
+            pool.get_pending_propagation().is_empty(),
+            "returned txs must not be gossiped"
+        );
+        assert!(
+            pool.rebroadcast().is_empty(),
+            "returned txs must not be re-broadcast"
+        );
+        // A normally submitted tx is still gossiped.
+        let (sk2, sender2) = fx.funded(1_000_000, 0);
+        pool.add_transaction(transfer(&sk2, sender2, 0, 1, 1_000))
+            .unwrap();
+        assert_eq!(pool.get_pending_propagation().len(), 1);
+    }
+
+    #[test]
+    fn reinsert_respects_per_sender_and_total_limits() {
+        let fx = Fixture::new();
+        let (sk, sender) = fx.funded(1_000_000, 0);
+        let pool = fx.pool(MempoolConfig {
+            max_txs_per_sender: 2,
+            ..MempoolConfig::default()
+        });
+        let txs: Vec<_> = (0..3).map(|n| transfer(&sk, sender, n, 1, 1_000)).collect();
+        let report = pool.reinsert_returned(txs);
+        assert_eq!(report[0].outcome, ReinsertOutcome::Accepted);
+        assert_eq!(report[1].outcome, ReinsertOutcome::Accepted);
+        assert!(
+            matches!(&report[2].outcome, ReinsertOutcome::Invalid(r) if r.contains("Too many"))
+        );
+
+        // Total pool limit: room for exactly one transaction.
+        let (sk_a, a) = fx.funded(1_000_000, 0);
+        let (sk_b, b) = fx.funded(1_000_000, 0);
+        let first = transfer(&sk_a, a, 0, 1, 1_000);
+        let size = bincode::serialized_size(&first).unwrap() as usize;
+        let small = fx.pool(MempoolConfig {
+            max_mempool_size: size,
+            ..MempoolConfig::default()
+        });
+        let report = small.reinsert_returned(vec![first, transfer(&sk_b, b, 0, 1, 1_000)]);
+        let accepted = report
+            .iter()
+            .filter(|r| r.outcome == ReinsertOutcome::Accepted)
+            .count();
+        assert_eq!(accepted, 1, "{report:?}");
+        assert!(report
+            .iter()
+            .any(|r| matches!(&r.outcome, ReinsertOutcome::Invalid(m) if m.contains("full"))));
     }
 }
