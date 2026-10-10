@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Human-readable prefix of a canonical KVNC address string.
+/// Human-readable prefix of a canonical Kovanica address string.
 pub const ADDRESS_PREFIX: &str = "kvnc";
-/// Human-readable suffix of a canonical KVNC address string.
+/// Human-readable suffix of a canonical Kovanica address string.
 pub const ADDRESS_SUFFIX: &str = "dag";
 /// Size of the address payload in bytes (raw public key).
 const ADDRESS_PAYLOAD_LEN: usize = 32;
@@ -39,7 +39,7 @@ pub struct Address(pub [u8; 32]);
 impl Address {
     /// Derive address from a public key.
     ///
-    /// KVNC uses the raw 32-byte Ed25519 public key as the account address so
+    /// Kovanica uses the raw 32-byte Ed25519 public key as the account address so
     /// that [`crate::transaction::Transaction::verify_signature`] can verify the
     /// signature directly against `sender` (which it treats as the public key).
     pub fn from_public_key(pk: &PublicKey) -> Self {

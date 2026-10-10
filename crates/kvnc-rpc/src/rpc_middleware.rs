@@ -1,20 +1,26 @@
 //! Rate limiting and authentication middleware for the RPC server.
 
+//!
+//! * Rate limiting is per client IP (from axum's `ConnectInfo`), not per
+//!   socket address: a fresh TCP connection (new source port) does not get a
+//!   fresh bucket, and all clients no longer share one bucket.
+//! * Write authorisation is decided per JSON-RPC *method* (see
+//!   [`AuthConfig::authorize`]), called by the RPC handler once the request
+//!   body has been parsed. The old middleware looked at the URL path, which
+//!   is always `/rpc`, so it never matched a write method.
+
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Extension, Request},
+    extract::{ConnectInfo, Extension, Request},
     http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
-use parking_lot::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::num::NonZeroU32;
-use tokio::sync::RwLock as TokioRwLock;
+use parking_lot::{Mutex, RwLock};
 
 /// Rate limiter configuration
 ///
@@ -23,7 +29,7 @@ use tokio::sync::RwLock as TokioRwLock;
 /// escape hatch for tests and trusted local tooling.
 #[derive(Clone, Debug)]
 pub struct RateLimitConfig {
-    /// Requests per minute per IP. `0` disables rate limiting.
+    /// Requests per minute per client IP. `0` disables rate limiting.
     pub requests_per_minute: u32,
     /// Burst allowance (token-bucket capacity)
     pub burst: u32,
@@ -108,19 +114,23 @@ impl TokenBucket {
     }
 }
 
-/// Per-IP rate limiter state
-struct IpRateLimiter {
+/// Per-client rate limiter state
+struct ClientRateLimiter {
     bucket: TokenBucket,
     last_seen: Instant,
 }
 
-use parking_lot::Mutex;
+/// How often idle client buckets are swept.
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
+/// A client bucket idle this long is dropped.
+const IDLE_EXPIRY: Duration = Duration::from_secs(600);
+/// Hard cap on tracked clients; beyond it idle buckets are swept early.
+const MAX_TRACKED_CLIENTS: usize = 100_000;
 
-/// Global rate limiter state
+/// Global rate limiter state: one token bucket per client IP.
 pub struct RateLimiterState {
-    limiters: RwLock<HashMap<SocketAddr, IpRateLimiter>>,
+    limiters: RwLock<HashMap<IpAddr, ClientRateLimiter>>,
     config: RateLimitConfig,
-    cleanup_interval: Duration,
     last_cleanup: Mutex<Instant>,
 }
 
@@ -129,13 +139,13 @@ impl RateLimiterState {
         Self {
             limiters: RwLock::new(HashMap::new()),
             config,
-            cleanup_interval: Duration::from_secs(300), // 5 minutes
             last_cleanup: Mutex::new(Instant::now()),
         }
     }
 
-    /// Check if request is allowed, returns (allowed, retry_after_secs)
-    pub fn check_limit(&self, addr: SocketAddr) -> (bool, Option<u64>) {
+    /// Check if a request from `client` is allowed; returns
+    /// `(allowed, retry_after_secs)`.
+    pub fn check_limit(&self, client: IpAddr) -> (bool, Option<u64>) {
         // A configured rate of 0 disables rate limiting (admit everything).
         if self.config.is_disabled() {
             return (true, None);
@@ -143,30 +153,37 @@ impl RateLimiterState {
 
         let mut limiters = self.limiters.write();
 
-        // Cleanup old entries periodically
         let now = Instant::now();
         let mut last_cleanup = self.last_cleanup.lock();
-        if now.duration_since(*last_cleanup) > Duration::from_secs(300) {
-            limiters.retain(|_, v| now.duration_since(v.last_seen) < Duration::from_secs(600));
+        if now.duration_since(*last_cleanup) > CLEANUP_INTERVAL
+            || limiters.len() >= MAX_TRACKED_CLIENTS
+        {
+            limiters.retain(|_, v| now.duration_since(v.last_seen) < IDLE_EXPIRY);
             *last_cleanup = now;
         }
         drop(last_cleanup);
 
         let refill_rate = self.config.requests_per_minute as f64 / 60.0;
-        let limiter = limiters.entry(addr).or_insert_with(|| IpRateLimiter {
+        let limiter = limiters.entry(client).or_insert_with(|| ClientRateLimiter {
             bucket: TokenBucket::new(self.config.burst, refill_rate),
-            last_seen: Instant::now(),
+            last_seen: now,
         });
 
-        limiter.last_seen = Instant::now();
+        limiter.last_seen = now;
         let allowed = limiter.bucket.consume(1);
         let retry_after = limiter.bucket.retry_after();
         (allowed, retry_after)
     }
+
+    /// Number of client buckets currently tracked.
+    pub fn tracked_clients(&self) -> usize {
+        self.limiters.read().len()
+    }
 }
 
-/// List of write methods that require authentication
-const WRITE_METHODS: &[&str] = &[
+/// JSON-RPC methods that require a bearer token when
+/// [`AuthConfig::require_auth_for_writes`] is set (see `docs/SECURITY.md`).
+pub const WRITE_METHODS: &[&str] = &[
     "kvnc_sendRawTransaction",
     "htlc_create",
     "htlc_claim",
@@ -202,134 +219,175 @@ impl Default for AuthConfig {
     }
 }
 
-/// Rate limiting middleware
+/// Why a request was not authorised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthError {
+    /// Write method called without an `Authorization: Bearer` header.
+    MissingToken,
+    /// The bearer token is not one of the configured write tokens.
+    InvalidToken,
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthError::MissingToken => write!(f, "authentication required for write method"),
+            AuthError::InvalidToken => write!(f, "invalid authentication token"),
+        }
+    }
+}
+
+/// Constant-time byte comparison, so token checks do not leak how many
+/// leading bytes matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+impl AuthConfig {
+    /// Whether `method` is a write method.
+    pub fn is_write_method(method: &str) -> bool {
+        WRITE_METHODS.contains(&method)
+    }
+
+    /// Authorise a JSON-RPC call to `method` given the request headers.
+    pub fn authorize(&self, method: &str, headers: &HeaderMap) -> Result<(), AuthError> {
+        if !self.require_auth_for_writes || !Self::is_write_method(method) {
+            return Ok(());
+        }
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or(AuthError::MissingToken)?;
+        let mut ok = false;
+        for candidate in &self.write_tokens {
+            // No early exit: every configured token is compared.
+            ok |= constant_time_eq(candidate.as_bytes(), token.as_bytes());
+        }
+        if ok && !token.is_empty() {
+            Ok(())
+        } else {
+            Err(AuthError::InvalidToken)
+        }
+    }
+}
+
+/// Client IP for rate limiting. Falls back to `0.0.0.0` (one shared bucket)
+/// when the server was not started with connect info, e.g. in unit tests.
+fn client_ip(request: &Request) -> IpAddr {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
+/// Per-client-IP rate limiting middleware.
 pub async fn rate_limit_middleware(
     Extension(rate_limiter): Extension<Arc<RateLimiterState>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let addr = request
-        .extensions()
-        .get::<SocketAddr>()
-        .copied()
-        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-    let (allowed, retry_after) = rate_limiter.check_limit(addr);
-
+    let (allowed, retry_after) = rate_limiter.check_limit(client_ip(&request));
     if !allowed {
         let mut response = Response::new("Rate limit exceeded".into());
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
+            if let Ok(value) = seconds.to_string().parse() {
+                response.headers_mut().insert("Retry-After", value);
+            }
         }
         return response;
     }
-
     next.run(request).await
 }
 
-/// Authentication middleware
-pub async fn auth_middleware(
-    Extension(auth_config): Extension<Arc<AuthConfig>>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Response {
-    let addr = request
-        .extensions()
-        .get::<SocketAddr>()
-        .copied()
-        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Check if this is a write method
-    let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
 
-    if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-
-        let token = match auth_header {
-            Some(t) => t,
-            None => {
-                let mut response = Response::new("Authentication required for write operations".into());
-                *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
-                return response;
-            }
+    #[test]
+    fn write_methods_need_a_valid_token_reads_do_not() {
+        let auth = AuthConfig {
+            write_tokens: vec!["s3cret".into()],
+            require_auth_for_writes: true,
         };
-
-        if !auth_config.write_tokens.contains(&token.to_string()) {
-            let mut response = Response::new("Invalid authentication token".into());
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            return response;
-        }
+        assert_eq!(
+            auth.authorize("kvnc_sendRawTransaction", &HeaderMap::new()),
+            Err(AuthError::MissingToken)
+        );
+        assert_eq!(
+            auth.authorize("kvnc_sendRawTransaction", &bearer("wrong")),
+            Err(AuthError::InvalidToken)
+        );
+        assert_eq!(
+            auth.authorize("kvnc_sendRawTransaction", &bearer("s3cret")),
+            Ok(())
+        );
+        assert_eq!(auth.authorize("kvnc_getBalance", &HeaderMap::new()), Ok(()));
     }
 
-    next.run(request).await
-}
-
-/// Combined middleware: rate limiting + auth
-pub async fn combined_middleware(
-    Extension(rate_limiter): Extension<Arc<RateLimiterState>>,
-    Extension(auth_config): Extension<Arc<AuthConfig>>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Response {
-    // Rate limiting
-    let addr = request
-        .extensions()
-        .get::<SocketAddr>()
-        .copied()
-        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-    let (allowed, retry_after) = rate_limiter.check_limit(addr);
-    if !allowed {
-        let mut response = Response::new("Rate limit exceeded".into());
-        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        if let Some(seconds) = retry_after {
-            response.headers_mut().insert(
-                "Retry-After",
-                seconds.to_string().parse().unwrap(),
-            );
-        }
-        return response;
-    }
-
-    // Authentication for write methods
-    let method = request.uri().path().strip_prefix("/rpc").unwrap_or(request.uri().path());
-    let is_write = WRITE_METHODS.iter().any(|m| method.contains(m));
-
-    if is_write && auth_config.require_auth_for_writes {
-        let auth_header = headers.get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-
-        let token = match auth_header {
-            Some(t) => t,
-            None => {
-                let mut response = Response::new("Authentication required for write operations".into());
-                *response.status_mut() = StatusCode::UNAUTHORIZED;
-                response.headers_mut().insert(
-                    "WWW-Authenticate",
-                    "Bearer".parse().unwrap(),
-                );
-                return response;
-            }
+    #[test]
+    fn default_config_rejects_every_write_and_empty_token() {
+        let auth = AuthConfig::default();
+        assert_eq!(
+            auth.authorize("token_mint", &bearer("")),
+            Err(AuthError::InvalidToken)
+        );
+        let auth = AuthConfig {
+            write_tokens: vec![String::new()],
+            require_auth_for_writes: true,
         };
-
-        if !auth_config.write_tokens.contains(&token.to_string()) {
-            let mut response = Response::new("Invalid authentication token".into());
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            return response;
-        }
+        assert_eq!(
+            auth.authorize("token_mint", &bearer("")),
+            Err(AuthError::InvalidToken)
+        );
     }
 
-    next.run(request).await
+    #[test]
+    fn disabled_auth_admits_writes() {
+        let auth = AuthConfig {
+            write_tokens: Vec::new(),
+            require_auth_for_writes: false,
+        };
+        assert_eq!(auth.authorize("htlc_create", &HeaderMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn rate_limit_is_per_client_ip() {
+        let limiter = RateLimiterState::new(RateLimitConfig {
+            requests_per_minute: 60,
+            burst: 2,
+        });
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        assert!(limiter.check_limit(a).0);
+        assert!(limiter.check_limit(a).0);
+        let (allowed, retry) = limiter.check_limit(a);
+        assert!(!allowed, "a exhausted its own burst");
+        assert!(retry.is_some());
+        assert!(limiter.check_limit(b).0, "b has its own bucket");
+        assert_eq!(limiter.tracked_clients(), 2);
+    }
+
+    #[test]
+    fn zero_rate_disables_limiting() {
+        let limiter = RateLimiterState::new(RateLimitConfig::from_requests_per_minute(0));
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        for _ in 0..1000 {
+            assert!(limiter.check_limit(a).0);
+        }
+    }
 }

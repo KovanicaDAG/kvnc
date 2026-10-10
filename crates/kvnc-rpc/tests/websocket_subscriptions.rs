@@ -39,6 +39,7 @@ fn test_state(storage: Arc<Storage>, events: EventBus) -> RpcState {
         network_address: "127.0.0.1:9000".to_string(),
     };
     RpcState {
+        health: kvnc_rpc::NodeHealth::new(),
         consensus_store: Arc::new(DagStore::from_storage(storage.clone())),
         mempool: Arc::new(Mempool::new(MempoolConfig::default(), storage.clone())),
         storage,

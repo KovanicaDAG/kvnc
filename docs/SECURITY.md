@@ -1,11 +1,11 @@
-# KVNC Security — Threat Model (v1, Phase 20)
+# KUNA Security — Threat Model (v1, Phase 20)
 
 > Deterministic, auditable, no `kovanica-protocol` mix.
 
 ## Scope
 - Consensus (Mysticeti DAG, k=3, wave=3)
 - Execution (Wasmi, deterministic WASM)
-- Staking / validator set (15–21, min 50k KVNC)
+- Staking / validator set (15–21, min 50k KUNA)
 - P2P (plaintext TCP:8000, DNS seed only)
 - Keystore (client-side only — node never receives seed)
 
@@ -34,7 +34,7 @@
 - [ ] Node env never contains `KVNC_SEED` or `PRIVATE_KEY`.
 
 ## Tokenomics (locked — never edited without approval)
-- Total: 90.2M KVNC (`9_020_000_000_000_000` atoms)
+- Total: 90.2M KUNA (`9_020_000_000_000_000` atoms)
 - Decimals: 9
-- Founder premine: 200k KVNC; Treasury: 8M MVNC (linear 8yr)
-- Subsidy: 10 KVNC / 2.05M blocks; decay ×3/4; reward only on committed leader.
+- Founder premine: 200k KUNA; Treasury: 8M KUNA (linear 8yr)
+- Subsidy: 10 KUNA / 2.05M blocks; decay ×3/4; reward only on committed leader.
