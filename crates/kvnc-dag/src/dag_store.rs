@@ -778,26 +778,6 @@ pub(crate) mod fault {
     }
 }
 
-/// Test-only fault injection: simulate a process crash between the
-/// decided-round mark and the committed-leader update.
-#[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::Cell;
-
-    thread_local! {
-        static CRASH_BETWEEN_STEPS: Cell<bool> = const { Cell::new(false) };
-    }
-
-    pub(crate) fn arm() {
-        CRASH_BETWEEN_STEPS.with(|c| c.set(true));
-    }
-
-    /// Returns true (once) when a crash was armed.
-    pub(crate) fn crash_between_steps() -> bool {
-        CRASH_BETWEEN_STEPS.with(|c| c.replace(false))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
