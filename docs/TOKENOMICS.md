@@ -1,4 +1,4 @@
-# KVNC Tokenomics Specification
+# KUNA Tokenomics Specification
 
 **Version:** 0.1.0  
 **Status:** Locked for implementation
@@ -7,20 +7,20 @@
 
 ## 1. Supply Overview
 
-| Allocation              | Amount (KVNC)   | % of Total | Notes                                      |
+| Allocation              | Amount (KUNA)   | % of Total | Notes                                      |
 |-------------------------|-----------------|------------|--------------------------------------------|
 | Mining subsidy          | ≈ 82 000 000    | ~90.9 %    | Emitted via block rewards                  |
 | Treasury                | 8 000 000       | ~8.9 %     | 1 M / year × 8 years, linear vesting       |
 | Founder premine         | 200 000         | ~0.2 %     | Unlocked at genesis                        |
 | **Total supply**        | **90 200 000**  | 100 %      | Hard cap                                   |
 
-Decimals: **9** (1 KVNC = 1 000 000 000 base units).
+Decimals: **9** (1 KUNA = 1 000 000 000 base units).
 
 ---
 
 ## 2. Block Reward Schedule
 
-- **Initial reward:** 10 KVNC  
+- **Initial reward:** 10 KUNA  
 - **Decay:** × ¾ every **2 050 000** committed leader blocks  
 - Reward is paid **only** to the author of a **committed leader block** in the DAG.
 
@@ -28,9 +28,9 @@ Decimals: **9** (1 KVNC = 1 000 000 000 base units).
 
 | Era | Reward     | Era issuance | Cumulative mining |
 |-----|------------|--------------|-------------------|
-| 0   | 10 KVNC    | 20.50 M      | 20.50 M           |
-| 1   | 7.5 KVNC   | 15.375 M     | 35.875 M          |
-| 2   | 5.625 KVNC | 11.531 M     | 47.406 M          |
+| 0   | 10 KUNA    | 20.50 M      | 20.50 M           |
+| 1   | 7.5 KUNA   | 15.375 M     | 35.875 M          |
+| 2   | 5.625 KUNA | 11.531 M     | 47.406 M          |
 | 3   | 4.21875    | 8.648 M      | 56.055 M          |
 | …   | …          | …            | → ≈ 82 M          |
 
@@ -54,8 +54,8 @@ This guarantees that only **finalized, ordered leader blocks** mint new tokens.
 
 ## 4. Treasury Vesting
 
-- Total: **8 000 000 KVNC**
-- Schedule: **1 000 000 KVNC per year** for 8 years
+- Total: **8 000 000 KUNA**
+- Schedule: **1 000 000 KUNA per year** for 8 years
 - Conversion: `BLOCKS_PER_YEAR = 15_768_000` (≈ 1 block / 2 s)
 - Vesting is advanced automatically on every committed leader.
 - The treasury address can `claim()` only the already-vested portion.
@@ -63,7 +63,7 @@ This guarantees that only **finalized, ordered leader blocks** mint new tokens.
 ```text
 year 0          year 1          year 2          …          year 8
 |---------------|---------------|---------------|-----------|
-0 KVNC          1 M             2 M             …          8 M (capped)
+0 KUNA          1 M             2 M             …          8 M (capped)
 ```
 
 ---
@@ -73,7 +73,7 @@ year 0          year 1          year 2          …          year 8
 | Parameter                | Value                  |
 |--------------------------|------------------------|
 | Active validators        | 15 – 21                |
-| Min stake to join        | 50 000 KVNC            |
+| Min stake to join        | 50 000 KUNA            |
 | Unbonding period         | 100 000 rounds         |
 | Commission               | set by validator (bps) |
 
@@ -107,16 +107,16 @@ Capped at `TOTAL_SUPPLY`.
 
 | Constant | Canonical value |
 |----------|-----------------|
-| `DECIMALS` / `ONE_KVNC` | 9 decimals, 1 KVNC = 1 000 000 000 base units |
-| `TOTAL_SUPPLY` | 90 200 000 KVNC (hard cap) |
-| `FOUNDER_PREMINE` | 200 000 KVNC |
-| `TREASURY_TOTAL` / `TREASURY_ANNUAL` / `TREASURY_YEARS` | 8 000 000 KVNC / 1 000 000 KVNC per year / 8 years (linear) |
-| `MINING_SUBSIDY_BUDGET` | 82 000 000 KVNC |
-| `INITIAL_BLOCK_REWARD` (s₀) | 10 KVNC per committed leader |
+| `DECIMALS` / `ONE_KVNC` | 9 decimals, 1 KUNA = 1 000 000 000 base units |
+| `TOTAL_SUPPLY` | 90 200 000 KUNA (hard cap) |
+| `FOUNDER_PREMINE` | 200 000 KUNA |
+| `TREASURY_TOTAL` / `TREASURY_ANNUAL` / `TREASURY_YEARS` | 8 000 000 KUNA / 1 000 000 KUNA per year / 8 years (linear) |
+| `MINING_SUBSIDY_BUDGET` | 82 000 000 KUNA |
+| `INITIAL_BLOCK_REWARD` (s₀) | 10 KUNA per committed leader |
 | `SUBSIDY_ERA_BLOCKS` | 2 050 000 committed leaders per era |
 | `DECAY_NUM` / `DECAY_DEN` | × ¾ per era |
 | `BLOCKS_PER_YEAR` | 15 768 000 (treasury vesting conversion only) |
-| `MIN_VALIDATOR_STAKE` | 50 000 KVNC |
+| `MIN_VALIDATOR_STAKE` | 50 000 KUNA |
 | `MIN_ACTIVE_VALIDATORS` / `MAX_ACTIVE_VALIDATORS` | 15 / 21 |
 | `UNBONDING_ROUNDS` | 100 000 rounds |
 

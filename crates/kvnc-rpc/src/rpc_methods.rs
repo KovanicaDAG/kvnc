@@ -5,7 +5,6 @@ use kvnc_common::{Address, Amount, Hash, Height, Timestamp};
 use kvnc_vault::VestingSchedule;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::warn;
 
 // ============================================================================
 // HTLC Methods
@@ -489,10 +488,9 @@ pub async fn handle_token_balance(params: Value, _state: RpcState) -> Result<Val
     let _height: Height = 0;
     let _timestamp: Timestamp = 0;
 
-    // Note: token_balance is not in the 16 ENTRY_POINTS - it's a view call
-    // For now we'll return a placeholder. In production this would be a read-only call.
-    // TODO: Implement view calls (read-only, no state changes)
-    warn!("token_balance is a view call - not yet implemented in dispatcher");
-
-    Ok(json!({ "amount": 0u128 }))
+    // token_balance is a view call that the dispatcher does not support yet.
+    // It used to answer a fake `amount: 0`; fail explicitly instead.
+    Err(RpcError::NotImplemented(
+        "token_balance: view calls are not implemented".into(),
+    ))
 }

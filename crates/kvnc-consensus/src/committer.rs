@@ -4,7 +4,7 @@
 //! Implements Mysticeti-style committer with direct/indirect commit rules
 //! for wave-based uncertified DAG consensus.
 
-use crate::engine::DagStoreTrait;
+use crate::engine::{DagStoreTrait, VoteRejection};
 use crate::ghostdag_scoped::ColouringResult;
 use crate::metrics::{record_pruned_blocks, record_pruned_waves};
 use crate::mysticghost::{order_committed_wave, MysticGhostConfig, MysticGhostOrder};
@@ -179,9 +179,7 @@ impl UniversalCommitter {
         // timeout can fire after the round was durably committed and must not
         // rewrite history to `Skip`.
         let mut decided = self.decided_leaders.write();
-        if !decided.contains_key(&round) {
-            decided.insert(round, info);
-        }
+        decided.entry(round).or_insert(info);
     }
 
     /// Update leader information for a round.
@@ -275,6 +273,42 @@ impl UniversalCommitter {
         false
     }
 
+    /// Record an already-authenticated vote, rejecting it if no leader block
+    /// is registered for `leader_round`, if `vote_hash` does not match that
+    /// block, or if `voter` has already voted for the round. The checks and
+    /// the insert happen under one write lock, so concurrent duplicates are
+    /// counted at most once. Returns whether the leader now has a quorum.
+    pub fn add_verified_vote(
+        &self,
+        leader_round: Round,
+        voter: AuthorityIndex,
+        vote_hash: Hash,
+    ) -> Result<bool, VoteRejection> {
+        let mut leaders = self.leaders.write();
+        let leader_info = leaders
+            .get_mut(&leader_round)
+            .ok_or(VoteRejection::UnknownLeaderRound(leader_round))?;
+        if leader_info.block_hash != Some(vote_hash) {
+            return Err(VoteRejection::LeaderHashMismatch(leader_round));
+        }
+        if leader_info.votes.contains_key(&voter) {
+            return Err(VoteRejection::Duplicate {
+                round: leader_round,
+                voter,
+            });
+        }
+        leader_info.votes.insert(voter, vote_hash);
+        if self
+            .base
+            .committee
+            .has_quorum(&leader_info.votes, leader_info.block_hash.as_ref())
+        {
+            leader_info.status = LeaderStatus::Commit;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Decide (commit or skip) any still-undecided leaders *earlier in the
     /// same wave* as `commit_round`, using the indirect rule.
     ///
@@ -356,7 +390,7 @@ impl UniversalCommitter {
         let mut candidate_rounds: Vec<Round> = leaders
             .keys()
             .copied()
-            .filter(|round| *round >= last_decided + 1)
+            .filter(|round| *round > last_decided)
             .collect();
         candidate_rounds.sort_unstable();
 
@@ -401,7 +435,9 @@ impl UniversalCommitter {
             }
 
             // Try indirect decision
-            let indirect_status = self.base.try_indirect_decide(dag_store, leader_info, &decided);
+            let indirect_status = self
+                .base
+                .try_indirect_decide(dag_store, leader_info, &decided);
             if indirect_status == LeaderStatus::Commit {
                 // Construct only; candidate-only callers do not publish it.
                 return self
@@ -655,8 +691,10 @@ impl UniversalCommitter {
         dag_store: &D,
         leader_hash: &Hash,
     ) -> Result<Vec<Hash>, kvnc_dag::DagStoreError> {
-        let ancestors: HashSet<Hash> =
-            dag_store.get_ancestors(leader_hash, 0)?.into_iter().collect();
+        let ancestors: HashSet<Hash> = dag_store
+            .get_ancestors(leader_hash, 0)?
+            .into_iter()
+            .collect();
         let decided_rounds = dag_store.get_decided_rounds(u64::MAX)?;
         let mut tips = Vec::new();
 

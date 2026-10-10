@@ -55,7 +55,7 @@ pub struct Keystore {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct V1Keystore {
+pub struct V1Keystore {
     version: u32,
     address: String,
     public_key: String,
@@ -66,7 +66,7 @@ pub(crate) struct V1Keystore {
 }
 
 impl V1Keystore {
-    pub(crate) fn is_encrypted(&self) -> bool {
+    pub fn is_encrypted(&self) -> bool {
         self.encrypted
     }
 }

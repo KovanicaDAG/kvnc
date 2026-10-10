@@ -47,11 +47,14 @@ pub(crate) fn message_id(data: &[u8]) -> gossipsub::MessageId {
 /// Gossipsub configuration: signed messages, strict validation and
 /// deterministic message ids.
 ///
-/// `validate_messages` is deliberately left off - received payloads are
-/// handled directly from [`gossipsub::Event::Message`] instead.
-fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
+/// `validate_messages` is on: gossipsub holds every received message until
+/// the service reports a [`gossipsub::MessageAcceptance`] for it, so nothing
+/// is forwarded to the mesh before it passed the edge checks in
+/// [`crate::validation`].
+pub(crate) fn gossipsub_config() -> Result<gossipsub::Config, NetworkError> {
     gossipsub::ConfigBuilder::default()
         .validation_mode(gossipsub::ValidationMode::Strict)
+        .validate_messages()
         .message_id_fn(|message| message_id(&message.data))
         .max_transmit_size(MAX_TRANSMIT_SIZE)
         .build()
@@ -99,7 +102,12 @@ pub(crate) fn build_swarm(config: &NetworkConfig) -> Result<Swarm<Behaviour>, Ne
     // timeout (5s) would otherwise drop peers between pings.
     let idle_timeout = std::cmp::max(ping_interval * 4, Duration::from_secs(60));
 
-    let swarm = SwarmBuilder::with_new_identity()
+    let identity = match &config.node_key_path {
+        Some(path) => crate::identity::load_or_create_node_identity(path)?,
+        None => libp2p::identity::Keypair::generate_ed25519(),
+    };
+
+    let swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -204,6 +212,12 @@ mod tests {
     }
 
     #[test]
+    fn gossip_forwarding_waits_for_validation() {
+        let config = gossipsub_config().expect("config builds");
+        assert!(config.validate_messages());
+    }
+
+    #[test]
     fn build_swarm_subscribes_to_every_topic() {
         let swarm = build_swarm(&NetworkConfig::default()).expect("swarm builds");
         let subscribed: Vec<String> = swarm
@@ -219,5 +233,22 @@ mod tests {
             );
         }
         assert!(!swarm.local_peer_id().to_string().is_empty());
+    }
+
+    #[test]
+    fn build_swarm_reuses_persistent_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NetworkConfig {
+            node_key_path: Some(dir.path().join("p2p_node.key")),
+            ..NetworkConfig::default()
+        };
+        let first = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        let second = *build_swarm(&config).expect("swarm builds").local_peer_id();
+        assert_eq!(first, second, "peer id must survive restarts");
+
+        let ephemeral = *build_swarm(&NetworkConfig::default())
+            .expect("swarm builds")
+            .local_peer_id();
+        assert_ne!(first, ephemeral);
     }
 }
