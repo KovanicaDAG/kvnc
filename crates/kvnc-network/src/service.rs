@@ -7,7 +7,7 @@ use crate::{
     state_sync::{StateSyncRequest, StateSyncResponse},
     sync::SyncRequest,
     topics,
-    validation::{AuthorityKeys, GossipValidator, Rejection},
+    validation::{AuthorityKeys, GossipValidator, Rejection, VoteVerifier},
     NetworkConfig, NetworkEvent,
 };
 use futures::StreamExt;
@@ -370,6 +370,13 @@ impl NetworkService {
             "gossip validator committee keys set"
         );
         self.validator.set_keys(keys);
+    }
+
+    /// Inject the vote signature verifier used at the gossip edge.
+    ///
+    /// Defaults to [`crate::Ed25519VoteVerifier`]; the node sets it explicitly.
+    pub fn set_vote_verifier(&self, verifier: Arc<dyn VoteVerifier>) {
+        self.validator.set_vote_verifier(verifier);
     }
 
     /// Get connected peers.

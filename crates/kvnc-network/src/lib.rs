@@ -27,7 +27,7 @@ pub use error::NetworkError;
 pub use service::NetworkService;
 pub use state_sync::{StateSyncCodec, StateSyncRequest, StateSyncResponse, STATE_SYNC_PROTOCOL};
 pub use sync::SyncRequest;
-pub use validation::{AuthorityKeys, Rejection};
+pub use validation::{AuthorityKeys, Ed25519VoteVerifier, Rejection, SigError, VoteVerifier};
 
 use kvnc_types::{block::StatementBlock, transaction::Transaction, Round, Vote};
 use std::time::Duration;
