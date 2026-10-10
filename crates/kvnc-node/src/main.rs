@@ -1537,10 +1537,22 @@ struct GenesisValidatorEntry {
 }
 
 /// Top-level shape of `genesis_validators.toml` (`[[validator]]` array of tables).
+///
+/// Example:
+///
+/// ```toml
+/// chain_id = 2            # mandatory for 1 (mainnet) and 2 (testnet)
+///
+/// [[validator]]
+/// address = "<32-byte hex>"
+/// stake = 50000000000000
+/// public_key = "<32-byte hex>"
+/// ```
 #[derive(Debug, Deserialize)]
 struct GenesisValidatorsFile {
-    /// Chain id of this genesis (optional for backwards compatibility; when
-    /// present it must equal the node's configured `chain_id`).
+    /// Chain id of this genesis. Mandatory when the node is configured for
+    /// mainnet (1) or testnet (2); optional for devnet (3) / local (1337).
+    /// When present it must equal the node's configured `chain_id`.
     #[serde(default)]
     chain_id: Option<u64>,
     validator: Vec<GenesisValidatorEntry>,
@@ -1552,7 +1564,10 @@ const CHAIN_ID_MARKER: &str = "chain_id";
 
 /// Verify `config.chain_id` against the genesis and the data directory.
 ///
-/// * `genesis_validators.toml` may carry `chain_id = N`; it must match.
+/// * `genesis_validators.toml` may carry `chain_id = N`; it must match. For
+///   mainnet (1) and testnet (2) it is **mandatory**: without it (or without
+///   the genesis file) the node refuses to start. Devnet (3) and local (1337)
+///   accept a genesis without `chain_id`.
 /// * `<data_dir>/chain_id` records the chain id the data dir was created for;
 ///   it must match on every later start. Written on first start.
 ///
@@ -1560,12 +1575,28 @@ const CHAIN_ID_MARKER: &str = "chain_id";
 /// produce votes/transactions no other node accepts (or replayable ones).
 fn check_chain_id(config: &NodeConfig) -> Result<()> {
     let configured = config.chain_id;
+    let genesis_required = matches!(
+        configured,
+        kvnc_types::signing::chain_id::MAINNET | kvnc_types::signing::chain_id::TESTNET
+    );
     let genesis_path = config.data_dir.join("genesis_validators.toml");
+    if genesis_required && !genesis_path.exists() {
+        anyhow::bail!(
+            "chain_id {configured} requires {} with an explicit chain_id; refusing to start",
+            genesis_path.display()
+        );
+    }
     if genesis_path.exists() {
         let text = std::fs::read_to_string(&genesis_path)
             .with_context(|| format!("reading genesis validators {}", genesis_path.display()))?;
         let genesis: GenesisValidatorsFile = toml::from_str(&text)
             .with_context(|| format!("parsing genesis validators {}", genesis_path.display()))?;
+        if genesis.chain_id.is_none() && genesis_required {
+            anyhow::bail!(
+                "chain_id {configured} requires an explicit chain_id in genesis {}; refusing to start",
+                genesis_path.display()
+            );
+        }
         if let Some(genesis_id) = genesis.chain_id {
             if genesis_id != configured {
                 anyhow::bail!(
@@ -1763,19 +1794,68 @@ mod tests {
             "3"
         );
         check_chain_id(&chain_id_config(dir.path(), 3)).expect("same chain id restarts");
-        let err = check_chain_id(&chain_id_config(dir.path(), 1)).unwrap_err();
+        let err = check_chain_id(&chain_id_config(dir.path(), 1337)).unwrap_err();
         assert!(err.to_string().contains("chain_id mismatch"), "{err:#}");
     }
 
     #[test]
-    fn genesis_without_chain_id_is_accepted() {
+    fn genesis_chain_id_optional_only_for_devnet_and_local() {
+        for id in [3, 1337] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("genesis_validators.toml"),
+                "validator = []\n",
+            )
+            .unwrap();
+            check_chain_id(&chain_id_config(dir.path(), id))
+                .unwrap_or_else(|e| panic!("chain {id} without genesis chain_id: {e:#}"));
+            // No genesis file at all is fine too.
+            let dir = tempfile::tempdir().unwrap();
+            check_chain_id(&chain_id_config(dir.path(), id)).expect("no genesis file");
+        }
+    }
+
+    #[test]
+    fn mainnet_and_testnet_require_genesis_chain_id() {
+        for id in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("genesis_validators.toml"),
+                "validator = []\n",
+            )
+            .unwrap();
+            let err = check_chain_id(&chain_id_config(dir.path(), id)).unwrap_err();
+            assert!(
+                err.to_string().contains("requires an explicit chain_id"),
+                "{err:#}"
+            );
+            assert!(!dir.path().join(CHAIN_ID_MARKER).exists());
+
+            let dir = tempfile::tempdir().unwrap();
+            let err = check_chain_id(&chain_id_config(dir.path(), id)).unwrap_err();
+            assert!(err.to_string().contains("requires"), "{err:#}");
+
+            let dir = tempfile::tempdir().unwrap();
+            write_genesis_chain_id(dir.path(), id);
+            check_chain_id(&chain_id_config(dir.path(), id)).expect("explicit chain_id");
+        }
+    }
+
+    #[tokio::test]
+    async fn node_refuses_to_start_on_mainnet_without_genesis_chain_id() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("genesis_validators.toml"),
             "validator = []\n",
         )
         .unwrap();
-        check_chain_id(&chain_id_config(dir.path(), 1337)).expect("legacy genesis");
+        let err = run_node(chain_id_config(dir.path(), 1), std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires an explicit chain_id"),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

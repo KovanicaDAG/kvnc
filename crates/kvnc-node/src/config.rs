@@ -43,8 +43,9 @@ pub struct NodeConfig {
     pub rpc_rate_limit_per_min: u32,
     /// Chain id bound into every v1 signature (see `docs/SIGNATURE_FORMAT.md`):
     /// 1 mainnet, 2 testnet, 3 devnet, 1337 local. Must match the genesis
-    /// chain id; the node refuses to start otherwise. Overridable with
-    /// `KVNC_CHAIN_ID`.
+    /// chain id; the node refuses to start otherwise. For mainnet and testnet
+    /// `genesis_validators.toml` must declare `chain_id` explicitly; for
+    /// devnet and local it is optional. Overridable with `KVNC_CHAIN_ID`.
     pub chain_id: u64,
 }
 
